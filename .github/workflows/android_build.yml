@@ -20,10 +20,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
+      # 禁用 Android 平台解析 + 链接选项（解决 JNI_OnLoad 问题）
       BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
-      # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API 可取消注释
+      # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
 
     steps:
       - name: Checkout repository
@@ -109,7 +110,7 @@ jobs:
             grep -n "api_level" WORKSPACE
           fi
 
-      # 移除脚本中可能导致问题的 SSE 标志（这些是 x86 专用的禁用标志）
+      # 移除脚本中可能导致问题的 SSE 标志（它们是 x86 专用的）
       - name: Remove unsupported SSE flags from build script
         run: |
           cp ci/build_android_package.sh ci/build_android_package.sh.bak
@@ -117,32 +118,50 @@ jobs:
           echo "Patched script after removing SSE flags:"
           grep -n -- '--copt' ci/build_android_package.sh || echo "No --copt flags left"
 
-      # 增强的修补步骤：拉取所有关键外部仓库，并彻底移除所有 -msse 标志（包括 .bzl 文件）
-      - name: Fetch and patch external repositories (remove all -msse flags from BUILD and .bzl files)
+      # 关键修复：拉取 libwebp 并删除其 BUILD 文件中的 -msse4.1 选项
+      - name: Fetch libwebp and remove -msse4.1 flag from its BUILD
         run: |
-          # 显式拉取已知可能包含 SSE 标志的仓库
-          bazel fetch @libwebp//... || true
-          bazel fetch @xla//... || true
-
+          bazel fetch @libwebp//...
           OUTPUT_BASE=$(bazel info output_base)
-          EXTERNAL_DIR="$OUTPUT_BASE/external"
-
-          if [ -d "$EXTERNAL_DIR" ]; then
-            echo "Patching BUILD and .bzl files in $EXTERNAL_DIR to remove any '-msse' flags..."
-
-            # 删除包含 -msse 的整行（适用于标志单独成行，覆盖 BUILD 和 .bzl 文件）
-            find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i '/-msse/d' {} \;
-
-            # 删除列表中的 "-msse*" 字符串（适用于内联标志）
-            find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/"-msse[^"]*"//g' {} \;
-
-            # 清理因删除标志留下的多余逗号和空格
-            find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' {} \;
-
-            echo "Patching completed."
+          WEBP_PATH="${OUTPUT_BASE}/external/libwebp"
+          if [ -d "$WEBP_PATH" ]; then
+            echo "Found libwebp at $WEBP_PATH"
+            cp "$WEBP_PATH/BUILD.bazel" "$WEBP_PATH/BUILD.bazel.bak"
+            sed -i '/"-msse4\.1"/d' "$WEBP_PATH/BUILD.bazel"
+            echo "Patched libwebp BUILD: removed -msse4.1"
+            if grep -q -- '-msse4' "$WEBP_PATH/BUILD.bazel"; then
+              echo "ERROR: SSE flags still present!"
+              grep -n -- '-msse4' "$WEBP_PATH/BUILD.bazel"
+              exit 1
+            else
+              echo "SSE flags successfully removed."
+            fi
           else
-            echo "External directory not found!"
+            echo "Error: libwebp not found at $WEBP_PATH"
             exit 1
+          fi
+
+      # 新增修复：拉取 xla 仓库并删除 tsl.bzl 中的 -msse3 标志
+      - name: Fetch xla and remove -msse3 flag from tsl.bzl
+        run: |
+          bazel fetch @xla//... || true
+          OUTPUT_BASE=$(bazel info output_base)
+          TSL_BZL_PATH="${OUTPUT_BASE}/external/xla/xla/tsl/tsl.bzl"
+          if [ -f "$TSL_BZL_PATH" ]; then
+            echo "Found tsl.bzl at $TSL_BZL_PATH"
+            cp "$TSL_BZL_PATH" "$TSL_BZL_PATH.bak"
+            # 删除包含 if_linux_x86_64 和 -msse3 的行
+            sed -i '/if_linux_x86_64.*-msse3/d' "$TSL_BZL_PATH"
+            echo "Patched tsl.bzl: removed -msse3 flag"
+            if grep -q -- '-msse3' "$TSL_BZL_PATH"; then
+              echo "ERROR: -msse3 flag still present in tsl.bzl!"
+              grep -n -- '-msse3' "$TSL_BZL_PATH"
+              exit 1
+            else
+              echo "-msse3 flag successfully removed from tsl.bzl."
+            fi
+          else
+            echo "Warning: tsl.bzl not found at $TSL_BZL_PATH, xla may not be fully fetched."
           fi
 
       - name: Run build_android_package.sh
