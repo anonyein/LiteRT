@@ -1,4 +1,4 @@
-name: Build and Upload Android AAR Packages (Platform Mapping)
+name: Build and Upload Android AAR Packages (No Script Modification)
 
 on:
   push:
@@ -16,10 +16,12 @@ concurrency:
 
 jobs:
   build-and-package:
-    name: "Build AARs with Bazel (Platform Mapping)"
+    name: "Build AARs with Bazel"
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
+      # Disable Bazel's Android platform resolution to use legacy flags
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false"
       # BUILD_LITERT_KOTLIN_API: "true"   # Uncomment if needed
 
     steps:
@@ -29,20 +31,20 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      # Install Bazel (respect .bazelversion if present)
+      # Install Bazel (will respect .bazelversion if present)
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
         with:
-          bazel-version: 7.0.0  # or omit to auto-detect
+          bazel-version: 7.0.0  # or omit to auto-detect from .bazelversion
 
       # Install system dependencies: Python and JDK 17
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y python3 openjdk-17-jdk
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
 
-      # Set up Android SDK
+      # Set up Android SDK (provides ANDROID_HOME)
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
@@ -51,78 +53,47 @@ jobs:
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r25
+          ndk-version: r25  # Adjust to match your project's requirements
           local-cache: true
 
-      # Export Android environment variables
+      # Export Android environment variables for Bazel
       - name: Export Android environment
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
-      # Create a simple platform definition for Android arm64
-      - name: Create Android platform definition
+      # Run TensorFlow configure script to set up Android workspace (if exists)
+      - name: Configure TensorFlow for Android
         run: |
-          mkdir -p platform
-          cat > platform/BUILD <<EOF
-          platform(
-              name = "android_arm64",
-              constraint_values = [
-                  "@platforms//os:android",
-                  "@platforms//cpu:arm64",
-              ],
-          )
-          EOF
+          # The TF_SET_ANDROID_WORKSPACE=1 tells configure to set up Android repositories.
+          export TF_SET_ANDROID_WORKSPACE=1
+          if [ -f ./configure.py ]; then
+            # Run configure.py non-interactively by answering 'y' to any prompt
+            python3 ./configure.py <<< "y"
+          else
+            echo "No configure.py found; assuming WORKSPACE is already configured."
+          fi
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+          TF_SET_ANDROID_WORKSPACE: 1
 
-      # Create platform_mappings file for backward compatibility
-      - name: Create platform_mappings
-        run: |
-          cat > platform_mappings <<EOF
-          platforms:
-            //platform:android_arm64
-              --android_crosstool_top=@androidndk//:toolchain-linux-x86_64-arm64-v8a
-              --android_cpu=arm64-v8a
-              --fat_apk_cpu=arm64-v8a
-
-          flags:
-            --android_cpu=arm64-v8a
-              //platform:android_arm64
-            --fat_apk_cpu=arm64-v8a
-              //platform:android_arm64
-          EOF
-
-      # Modify build_android_package.sh to use --platforms instead of legacy flags
-      - name: Patch build script to use platforms
-        run: |
-          # Backup original script
-          cp ci/build_android_package.sh ci/build_android_package.sh.bak
-          
-          # Remove legacy flags and add --platforms=//platform:android_arm64 to all bazel build commands
-          sed -i 's/--config=android_arm64//g' ci/build_android_package.sh
-          sed -i 's/--fat_apk_cpu=[^ ]*//g' ci/build_android_package.sh
-          # Insert --platforms before each bazel build command
-          sed -i '/bazel build/ s/$/ --platforms=\/\/platform:android_arm64/' ci/build_android_package.sh
-          
-          # Remove the line that adds BAZEL_CONFIG_FLAGS (since we no longer need it)
-          sed -i '/BUILD_FLAGS+=(\${BAZEL_CONFIG_FLAGS})/d' ci/build_android_package.sh
-          
-          echo "Patched script:"
-          cat ci/build_android_package.sh
-
-      # Run the packaging script
+      # Execute the packaging script
       - name: Run build_android_package.sh
         run: |
           chmod +x ./ci/build_android_package.sh
+          echo "BAZEL_CONFIG_FLAGS = $BAZEL_CONFIG_FLAGS"
           ./ci/build_android_package.sh
         env:
           RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
+          BAZEL_CONFIG_FLAGS: ${{ env.BAZEL_CONFIG_FLAGS }}
           # BUILD_LITERT_KOTLIN_API: ${{ env.BUILD_LITERT_KOTLIN_API }}
 
-      # List generated files
+      # List generated files (for debugging)
       - name: List generated files
         run: find ./ci/gen -type f
 
-      # Upload all AAR packages
+      # Upload all AAR packages and associated files
       - name: Upload AAR artifacts
         uses: actions/upload-artifact@v4
         with:
