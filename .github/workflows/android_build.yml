@@ -21,6 +21,8 @@ jobs:
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
       BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false"
+      # Set Android API level to 36 (integer) to avoid float issue
+      ANDROID_API_LEVEL: "36"
       # BUILD_LITERT_KOTLIN_API: "true"
 
     steps:
@@ -65,6 +67,7 @@ jobs:
           ls -la $ANDROID_HOME/platforms || true
           ls -la $ANDROID_NDK_HOME || true
 
+      # Run TensorFlow configure script with ANDROID_API_LEVEL set
       - name: Configure TensorFlow for Android
         run: |
           export TF_NEED_ANDROID=1
@@ -78,20 +81,31 @@ jobs:
           ANDROID_HOME: ${{ env.ANDROID_HOME }}
           ANDROID_SDK_HOME: ${{ env.ANDROID_SDK_HOME }}
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+          ANDROID_API_LEVEL: ${{ env.ANDROID_API_LEVEL }}
           TF_NEED_ANDROID: 1
           TF_SET_ANDROID_WORKSPACE: 1
 
-      # Fix the api_level in WORKSPACE: change from float (e.g., 36.1) to integer (36)
-      - name: Fix WORKSPACE api_level
+      # Debug: Show current api_level lines in WORKSPACE
+      - name: Show api_level before fix
         run: |
-          # Backup WORKSPACE
+          echo "=== Before fix ==="
+          grep -n "api_level" WORKSPACE || echo "No api_level found"
+
+      # Forcefully replace any floating point api_level with integer 36
+      - name: Fix WORKSPACE api_level (float to int)
+        run: |
+          # Backup original
           cp WORKSPACE WORKSPACE.bak
-          # Replace api_level = 36.1 with api_level = 36 (assume .1 is a typo)
-          sed -i 's/api_level = [0-9]\+\.[0-9]\+/api_level = 36/g' WORKSPACE
-          # Also ensure any other floating point numbers are converted (e.g., 30.0 -> 30)
-          sed -i 's/\(api_level = \)[0-9]\+\.0/\136/g' WORKSPACE
-          echo "WORKSPACE after fix:"
-          grep -n "api_level" WORKSPACE || true
+          # Replace patterns like api_level = 36.1 or api_level=36.1 with api_level = 36
+          sed -i 's/\(api_level\s*=\s*\)[0-9]\+\.[0-9]\+/\136/g' WORKSPACE
+          echo "=== After fix ==="
+          grep -n "api_level" WORKSPACE || echo "No api_level found"
+          # If there are still floats, try more aggressive patterns
+          if grep -q "api_level.*\.[0-9]" WORKSPACE; then
+            echo "Warning: Floating api_level still present, applying additional fix"
+            sed -i 's/\(api_level\s*=\s*\)[0-9]*\.[0-9]*/\136/g' WORKSPACE
+            grep -n "api_level" WORKSPACE
+          fi
 
       - name: Run build_android_package.sh
         run: |
