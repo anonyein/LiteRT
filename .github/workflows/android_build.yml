@@ -20,11 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
-      # 禁用 Android 平台解析 + 链接选项（解决 JNI_OnLoad 问题）
       BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
-      # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
+      # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API 可取消注释
 
     steps:
       - name: Checkout repository
@@ -110,7 +109,7 @@ jobs:
             grep -n "api_level" WORKSPACE
           fi
 
-      # 移除脚本中可能导致问题的 SSE 标志（它们是 x86 专用的）
+      # 移除脚本中可能导致问题的 SSE 标志（这些是 x86 专用的禁用标志）
       - name: Remove unsupported SSE flags from build script
         run: |
           cp ci/build_android_package.sh ci/build_android_package.sh.bak
@@ -118,26 +117,34 @@ jobs:
           echo "Patched script after removing SSE flags:"
           grep -n -- '--copt' ci/build_android_package.sh || echo "No --copt flags left"
 
-      # 通用修复：从所有外部仓库的 BUILD 文件中移除所有 -msse* 标志（避免在 ARM 上无效）
-      - name: Remove SSE flags from external repository BUILD files
+      # 增强的修补步骤：拉取所有关键外部仓库，并彻底移除所有 -msse 标志
+      - name: Fetch and patch external repositories (remove all -msse flags)
         run: |
-          # 先获取所有外部依赖（不构建）
-          bazel fetch //... || true
+          # 显式拉取已知可能包含 SSE 标志的仓库
+          bazel fetch @libwebp//... || true
+          bazel fetch @xla//... || true
+          # 拉取构建目标的所有依赖（确保所有外部仓库都被下载）
+          bazel fetch //tflite/java:tensorflow-lite-select-tf-ops || true
+
           OUTPUT_BASE=$(bazel info output_base)
           EXTERNAL_DIR="$OUTPUT_BASE/external"
+
           if [ -d "$EXTERNAL_DIR" ]; then
-            echo "Scanning $EXTERNAL_DIR for BUILD files with -msse flags..."
-            # 查找所有 BUILD 或 BUILD.bazel 文件，并删除包含 -msse 的行
-            find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" \) -exec grep -l -- '-msse' {} \; | while read build_file; do
-              echo "Patching $build_file"
-              # 备份
-              cp "$build_file" "$build_file.bak"
-              # 删除包含 -msse 的行
-              sed -i '/-msse/d' "$build_file"
-            done
-            echo "SSE flag removal completed."
+            echo "Patching all BUILD files in $EXTERNAL_DIR to remove any '-msse' flags..."
+
+            # 方法1：删除包含 -msse 的整行（适用于标志单独成行）
+            find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" \) -exec sed -i '/-msse/d' {} \;
+
+            # 方法2：删除列表中的 "-msse*" 字符串（适用于内联标志）
+            find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" \) -exec sed -i 's/"-msse[^"]*"//g' {} \;
+
+            # 清理因删除标志留下的多余逗号和空格
+            find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" \) -exec sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' {} \;
+
+            echo "Patching completed."
           else
-            echo "External directory not found, skipping."
+            echo "External directory not found!"
+            exit 1
           fi
 
       - name: Run build_android_package.sh
