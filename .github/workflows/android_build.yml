@@ -21,8 +21,8 @@ jobs:
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
       BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false"
-      # Set Android API level to 36 (integer) to avoid float issue
       ANDROID_API_LEVEL: "36"
+      NDK_VERSION: "r27"                    # 改为 r27
       # BUILD_LITERT_KOTLIN_API: "true"
 
     steps:
@@ -46,18 +46,29 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Set up Android NDK
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r25
-          local-cache: true
+      # 安装 Android NDK r27
+      - name: Install Android NDK r27
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
+          unzip -q android-ndk-${NDK_VERSION}-linux.zip -d /tmp
+          NDK_PATH=/tmp/android-ndk-${NDK_VERSION}
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
+          # 验证 clang 是否存在
+          ls -la $NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/clang* || exit 1
+        env:
+          NDK_VERSION: ${{ env.NDK_VERSION }}
 
       - name: Export Android environment
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
+
+      # 将 NDK 路径写入 .bazelrc 确保 Bazel 能访问
+      - name: Configure .bazelrc for NDK
+        run: |
+          echo "build --repo_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
+          echo "build --action_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
 
       - name: Verify Android paths
         run: |
@@ -65,9 +76,8 @@ jobs:
           echo "ANDROID_SDK_HOME=$ANDROID_SDK_HOME"
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
           ls -la $ANDROID_HOME/platforms || true
-          ls -la $ANDROID_NDK_HOME || true
+          ls -la $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang* || true
 
-      # Run TensorFlow configure script with ANDROID_API_LEVEL set
       - name: Configure TensorFlow for Android
         run: |
           export TF_NEED_ANDROID=1
@@ -85,22 +95,17 @@ jobs:
           TF_NEED_ANDROID: 1
           TF_SET_ANDROID_WORKSPACE: 1
 
-      # Debug: Show current api_level lines in WORKSPACE
       - name: Show api_level before fix
         run: |
           echo "=== Before fix ==="
           grep -n "api_level" WORKSPACE || echo "No api_level found"
 
-      # Forcefully replace any floating point api_level with integer 36
       - name: Fix WORKSPACE api_level (float to int)
         run: |
-          # Backup original
           cp WORKSPACE WORKSPACE.bak
-          # Replace patterns like api_level = 36.1 or api_level=36.1 with api_level = 36
           sed -i 's/\(api_level\s*=\s*\)[0-9]\+\.[0-9]\+/\136/g' WORKSPACE
           echo "=== After fix ==="
           grep -n "api_level" WORKSPACE || echo "No api_level found"
-          # If there are still floats, try more aggressive patterns
           if grep -q "api_level.*\.[0-9]" WORKSPACE; then
             echo "Warning: Floating api_level still present, applying additional fix"
             sed -i 's/\(api_level\s*=\s*\)[0-9]*\.[0-9]*/\136/g' WORKSPACE
