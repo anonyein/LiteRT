@@ -109,7 +109,7 @@ jobs:
             grep -n "api_level" WORKSPACE
           fi
 
-      # 移除脚本中可能导致问题的 SSE 标志（这些是 x86 专用的禁用标志）
+      # 移除脚本中可能导致问题的 SSE 标志
       - name: Remove unsupported SSE flags from build script
         run: |
           cp ci/build_android_package.sh ci/build_android_package.sh.bak
@@ -117,8 +117,8 @@ jobs:
           echo "Patched script after removing SSE flags:"
           grep -n -- '--copt' ci/build_android_package.sh || echo "No --copt flags left"
 
-      # 增强的修补步骤：拉取所有关键外部仓库，并彻底移除所有 -msse 标志
-      - name: Fetch and patch external repositories (remove all -msse flags)
+      # 关键修复：拉取所有关键外部仓库，并彻底移除所有 -msse 标志（包括 .bzl 文件）
+      - name: Fetch and patch external repositories (remove all -msse flags from BUILD and .bzl files)
         run: |
           # 显式拉取已知可能包含 SSE 标志的仓库
           bazel fetch @libwebp//... || true
@@ -130,16 +130,16 @@ jobs:
           EXTERNAL_DIR="$OUTPUT_BASE/external"
 
           if [ -d "$EXTERNAL_DIR" ]; then
-            echo "Patching all BUILD files in $EXTERNAL_DIR to remove any '-msse' flags..."
+            echo "Patching BUILD and .bzl files in $EXTERNAL_DIR to remove any '-msse' flags..."
 
-            # 方法1：删除包含 -msse 的整行（适用于标志单独成行）
-            find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" \) -exec sed -i '/-msse/d' {} \;
+            # 方法1：删除包含 -msse 的整行（适用于标志单独成行，包括 .bzl 中的函数定义）
+            find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i '/-msse/d' {} \;
 
-            # 方法2：删除列表中的 "-msse*" 字符串（适用于内联标志）
-            find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" \) -exec sed -i 's/"-msse[^"]*"//g' {} \;
+            # 方法2：删除列表中的 "-msse*" 字符串（适用于内联标志，如 copts = ["-msse3"]）
+            find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/"-msse[^"]*"//g' {} \;
 
-            # 清理因删除标志留下的多余逗号和空格
-            find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" \) -exec sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' {} \;
+            # 清理因删除标志留下的多余逗号和空格（例如 ["-msse4.1", "-other"] -> ["-other"]）
+            find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' {} \;
 
             echo "Patching completed."
           else
