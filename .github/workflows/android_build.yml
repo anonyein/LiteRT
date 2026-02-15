@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
-      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false"
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"                    # 改为 r27
       # BUILD_LITERT_KOTLIN_API: "true"
