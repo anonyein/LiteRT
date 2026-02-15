@@ -1,4 +1,4 @@
-name: Build and Upload Android AAR Packages (No Script Modification)
+name: Build and Upload Android AAR Packages
 
 on:
   push:
@@ -35,7 +35,7 @@ jobs:
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
         with:
-          bazel-version: 7.0.0  # or omit to auto-detect from .bazelversion
+          bazel-version: 7.0.0
 
       # Install system dependencies: Python and JDK 17
       - name: Install system dependencies
@@ -56,26 +56,40 @@ jobs:
           ndk-version: r25  # Adjust to match your project's requirements
           local-cache: true
 
-      # Export Android environment variables for Bazel
+      # Export Android environment variables for Bazel and configure.py
       - name: Export Android environment
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+
+      # Verify Android paths (optional, for debugging)
+      - name: Verify Android SDK/NDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_HOME=$ANDROID_SDK_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          ls -la $ANDROID_HOME/platforms || true
+          ls -la $ANDROID_NDK_HOME || true
 
       # Run TensorFlow configure script to set up Android workspace (if exists)
       - name: Configure TensorFlow for Android
         run: |
-          # The TF_SET_ANDROID_WORKSPACE=1 tells configure to set up Android repositories.
+          # Set required environment variables for configure.py
+          export TF_NEED_ANDROID=1
           export TF_SET_ANDROID_WORKSPACE=1
           if [ -f ./configure.py ]; then
-            # Run configure.py non-interactively by answering 'y' to any prompt
-            python3 ./configure.py <<< "y"
+            # Run configure.py non-interactively by accepting all defaults.
+            # The 'yes' command will answer 'y' to any prompt.
+            yes "" | python3 ./configure.py
           else
             echo "No configure.py found; assuming WORKSPACE is already configured."
           fi
         env:
           ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          ANDROID_SDK_HOME: ${{ env.ANDROID_SDK_HOME }}
           ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+          TF_NEED_ANDROID: 1
           TF_SET_ANDROID_WORKSPACE: 1
 
       # Execute the packaging script
