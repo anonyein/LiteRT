@@ -20,9 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
-      # Disable Bazel's Android platform resolution to use legacy flags
       BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false"
-      # BUILD_LITERT_KOTLIN_API: "true"   # Uncomment if needed
+      # BUILD_LITERT_KOTLIN_API: "true"
 
     steps:
       - name: Checkout repository
@@ -31,40 +30,34 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      # Install Bazel (will respect .bazelversion if present)
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
         with:
           bazel-version: 7.0.0
 
-      # Install system dependencies: Python and JDK 17
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y python3 openjdk-17-jdk
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
 
-      # Set up Android SDK (provides ANDROID_HOME)
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      # Set up Android NDK
       - name: Set up Android NDK
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r25  # Adjust to match your project's requirements
+          ndk-version: r25
           local-cache: true
 
-      # Export Android environment variables for Bazel and configure.py
       - name: Export Android environment
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
-      # Verify Android paths (optional, for debugging)
-      - name: Verify Android SDK/NDK
+      - name: Verify Android paths
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"
           echo "ANDROID_SDK_HOME=$ANDROID_SDK_HOME"
@@ -72,15 +65,11 @@ jobs:
           ls -la $ANDROID_HOME/platforms || true
           ls -la $ANDROID_NDK_HOME || true
 
-      # Run TensorFlow configure script to set up Android workspace (if exists)
       - name: Configure TensorFlow for Android
         run: |
-          # Set required environment variables for configure.py
           export TF_NEED_ANDROID=1
           export TF_SET_ANDROID_WORKSPACE=1
           if [ -f ./configure.py ]; then
-            # Run configure.py non-interactively by accepting all defaults.
-            # The 'yes' command will answer 'y' to any prompt.
             yes "" | python3 ./configure.py
           else
             echo "No configure.py found; assuming WORKSPACE is already configured."
@@ -92,7 +81,18 @@ jobs:
           TF_NEED_ANDROID: 1
           TF_SET_ANDROID_WORKSPACE: 1
 
-      # Execute the packaging script
+      # Fix the api_level in WORKSPACE: change from float (e.g., 36.1) to integer (36)
+      - name: Fix WORKSPACE api_level
+        run: |
+          # Backup WORKSPACE
+          cp WORKSPACE WORKSPACE.bak
+          # Replace api_level = 36.1 with api_level = 36 (assume .1 is a typo)
+          sed -i 's/api_level = [0-9]\+\.[0-9]\+/api_level = 36/g' WORKSPACE
+          # Also ensure any other floating point numbers are converted (e.g., 30.0 -> 30)
+          sed -i 's/\(api_level = \)[0-9]\+\.0/\136/g' WORKSPACE
+          echo "WORKSPACE after fix:"
+          grep -n "api_level" WORKSPACE || true
+
       - name: Run build_android_package.sh
         run: |
           chmod +x ./ci/build_android_package.sh
@@ -103,11 +103,9 @@ jobs:
           BAZEL_CONFIG_FLAGS: ${{ env.BAZEL_CONFIG_FLAGS }}
           # BUILD_LITERT_KOTLIN_API: ${{ env.BUILD_LITERT_KOTLIN_API }}
 
-      # List generated files (for debugging)
       - name: List generated files
         run: find ./ci/gen -type f
 
-      # Upload all AAR packages and associated files
       - name: Upload AAR artifacts
         uses: actions/upload-artifact@v4
         with:
