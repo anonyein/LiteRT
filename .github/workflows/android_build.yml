@@ -109,7 +109,7 @@ jobs:
             grep -n "api_level" WORKSPACE
           fi
 
-      # 移除脚本中可能导致问题的 SSE 标志
+      # 移除脚本中可能导致问题的 SSE 标志（这些是 x86 专用的禁用标志）
       - name: Remove unsupported SSE flags from build script
         run: |
           cp ci/build_android_package.sh ci/build_android_package.sh.bak
@@ -117,13 +117,12 @@ jobs:
           echo "Patched script after removing SSE flags:"
           grep -n -- '--copt' ci/build_android_package.sh || echo "No --copt flags left"
 
-      # 通用修补：拉取所有关键外部仓库，并彻底移除所有 -msse 标志（包括 .bzl 文件）
-      - name: Fetch and patch external repositories (remove -msse flags)
+      # 增强的修补步骤：拉取所有关键外部仓库，并彻底移除所有 -msse 标志（包括 .bzl 文件）
+      - name: Fetch and patch external repositories (remove all -msse flags from BUILD and .bzl files)
         run: |
-          # 显式拉取关键仓库
+          # 显式拉取已知可能包含 SSE 标志的仓库
           bazel fetch @libwebp//... || true
           bazel fetch @xla//... || true
-          bazel fetch //tflite/java:tensorflow-lite-select-tf-ops || true
 
           OUTPUT_BASE=$(bazel info output_base)
           EXTERNAL_DIR="$OUTPUT_BASE/external"
@@ -131,20 +130,21 @@ jobs:
           if [ -d "$EXTERNAL_DIR" ]; then
             echo "Patching BUILD and .bzl files in $EXTERNAL_DIR to remove any '-msse' flags..."
 
-            # 删除包含 -msse 的整行
+            # 删除包含 -msse 的整行（适用于标志单独成行，覆盖 BUILD 和 .bzl 文件）
             find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i '/-msse/d' {} \;
 
-            # 删除列表中的 "-msse*" 字符串
+            # 删除列表中的 "-msse*" 字符串（适用于内联标志）
             find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/"-msse[^"]*"//g' {} \;
 
-            # 清理多余的逗号和空格
+            # 清理因删除标志留下的多余逗号和空格
             find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' {} \;
 
-            echo "General SSE patching completed."
+            echo "Patching completed."
           else
             echo "External directory not found!"
             exit 1
           fi
+
       - name: Run build_android_package.sh
         run: |
           chmod +x ./ci/build_android_package.sh
