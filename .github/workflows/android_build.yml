@@ -20,13 +20,14 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
-      # 禁用 Android 平台解析 + 链接选项 + 为 hwloc 禁用 pthread affinity
-      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --copt=-DHAVE_PTHREAD_SETAFFINITY_NP=0 --copt=-DHAVE_PTHREAD_GETAFFINITY_NP=0"
+      # 关键修复：添加 -D_GNU_SOURCE 使 pthread_setaffinity_np 等函数在 NDK 中可见
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --copt=-DHAVE_PTHREAD_SETAFFINITY_NP=0 --copt=-D_GNU_SOURCE"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
-      # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
+      # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API 可取消注释
 
     steps:
+      # 以下所有步骤与之前完全一致，无需改动
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -141,7 +142,7 @@ jobs:
             exit 1
           fi
 
-      # 新增修复：拉取 xla 仓库并删除 tsl.bzl 中的 -msse3 标志
+      # 修复 xla 的 tsl.bzl：移除 -msse3 标志
       - name: Fetch xla and remove -msse3 flag from tsl.bzl
         run: |
           bazel fetch @xla//... || true
