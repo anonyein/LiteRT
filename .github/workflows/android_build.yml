@@ -117,13 +117,12 @@ jobs:
           echo "Patched script after removing SSE flags:"
           grep -n -- '--copt' ci/build_android_package.sh || echo "No --copt flags left"
 
-      # 关键修复：拉取所有关键外部仓库，并彻底移除所有 -msse 标志（包括 .bzl 文件）
-      - name: Fetch and patch external repositories (remove all -msse flags from BUILD and .bzl files)
+      # 通用修补：拉取所有关键外部仓库，并彻底移除所有 -msse 标志（包括 .bzl 文件）
+      - name: Fetch and patch external repositories (remove -msse flags)
         run: |
-          # 显式拉取已知可能包含 SSE 标志的仓库
+          # 显式拉取关键仓库
           bazel fetch @libwebp//... || true
           bazel fetch @xla//... || true
-          # 拉取构建目标的所有依赖（确保所有外部仓库都被下载）
           bazel fetch //tflite/java:tensorflow-lite-select-tf-ops || true
 
           OUTPUT_BASE=$(bazel info output_base)
@@ -132,19 +131,37 @@ jobs:
           if [ -d "$EXTERNAL_DIR" ]; then
             echo "Patching BUILD and .bzl files in $EXTERNAL_DIR to remove any '-msse' flags..."
 
-            # 方法1：删除包含 -msse 的整行（适用于标志单独成行，包括 .bzl 中的函数定义）
+            # 删除包含 -msse 的整行
             find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i '/-msse/d' {} \;
 
-            # 方法2：删除列表中的 "-msse*" 字符串（适用于内联标志，如 copts = ["-msse3"]）
+            # 删除列表中的 "-msse*" 字符串
             find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/"-msse[^"]*"//g' {} \;
 
-            # 清理因删除标志留下的多余逗号和空格（例如 ["-msse4.1", "-other"] -> ["-other"]）
+            # 清理多余的逗号和空格
             find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' {} \;
 
-            echo "Patching completed."
+            echo "General SSE patching completed."
           else
             echo "External directory not found!"
             exit 1
+          fi
+
+      # 专门修复 XNNPACK 的 linkopts 歧义
+      - name: Fix XNNPACK linkopts ambiguity
+        run: |
+          OUTPUT_BASE=$(bazel info output_base)
+          XNNPACK_BUILD="$OUTPUT_BASE/external/XNNPACK/BUILD.bazel"
+          if [ -f "$XNNPACK_BUILD" ]; then
+            echo "Patching XNNPACK/BUILD.bazel to resolve linkopts ambiguity..."
+            cp "$XNNPACK_BUILD" "$XNNPACK_BUILD.bak"
+            # 删除包含 "//build_config:linux_k8" 的行（假设这就是歧义来源）
+            sed -i '/"@@XNNPACK\/\/build_config:linux_k8"/d' "$XNNPACK_BUILD"
+            # 清理可能残留的空行和逗号
+            sed -i '/^\s*,\s*$/d' "$XNNPACK_BUILD"
+            sed -i 's/,\s*}/}/g' "$XNNPACK_BUILD"
+            echo "XNNPACK patched."
+          else
+            echo "XNNPACK BUILD file not found, skipping."
           fi
 
       - name: Run build_android_package.sh
