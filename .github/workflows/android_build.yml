@@ -20,9 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
+      # 传递兼容性标志和链接选项（解决 JNI 符号未定义错误）
       BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version"
       ANDROID_API_LEVEL: "36"
-      NDK_VERSION: "r27"                    # 改为 r27
+      NDK_VERSION: "r27"
       # BUILD_LITERT_KOTLIN_API: "true"
 
     steps:
@@ -46,14 +47,14 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      # 安装 Android NDK r27
+      # 手动安装 Android NDK r27（确保路径和权限正确）
       - name: Install Android NDK r27
         run: |
           wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
           unzip -q android-ndk-${NDK_VERSION}-linux.zip -d /tmp
           NDK_PATH=/tmp/android-ndk-${NDK_VERSION}
           echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
-          # 验证 clang 是否存在
+          # 验证 clang 是否存在（若不存在则直接失败）
           ls -la $NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/clang* || exit 1
         env:
           NDK_VERSION: ${{ env.NDK_VERSION }}
@@ -64,7 +65,7 @@ jobs:
           echo "ANDROID_SDK_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
 
-      # 将 NDK 路径写入 .bazelrc 确保 Bazel 能访问
+      # 将 NDK 路径写入 .bazelrc，确保在仓库获取阶段可用
       - name: Configure .bazelrc for NDK
         run: |
           echo "build --repo_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
@@ -111,6 +112,16 @@ jobs:
             sed -i 's/\(api_level\s*=\s*\)[0-9]*\.[0-9]*/\136/g' WORKSPACE
             grep -n "api_level" WORKSPACE
           fi
+
+      # 移除导致 ARM64 编译失败的 SSE 标志（它们是 x86 专用的）
+      - name: Remove unsupported SSE flags from build script
+        run: |
+          # 备份原始脚本
+          cp ci/build_android_package.sh ci/build_android_package.sh.bak
+          # 删除包含 --copt=-mno-sse4 的行（这些标志在 ARM 上不支持）
+          sed -i '/--copt=-mno-sse4/d' ci/build_android_package.sh
+          echo "Patched script after removing SSE flags:"
+          grep -n -- '--copt' ci/build_android_package.sh || echo "No --copt flags left"
 
       - name: Run build_android_package.sh
         run: |
