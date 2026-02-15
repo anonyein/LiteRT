@@ -20,8 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
-      # 禁用 Android 平台解析 + 链接选项（解决 JNI_OnLoad 问题）
-      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version"
+      # 禁用 Android 平台解析 + 链接选项 + 为 hwloc 禁用 pthread affinity
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --copt=-DHAVE_PTHREAD_SETAFFINITY_NP=0 --copt=-DHAVE_PTHREAD_GETAFFINITY_NP=0"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
       # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
@@ -150,7 +150,6 @@ jobs:
           if [ -f "$TSL_BZL_PATH" ]; then
             echo "Found tsl.bzl at $TSL_BZL_PATH"
             cp "$TSL_BZL_PATH" "$TSL_BZL_PATH.bak"
-            # 删除包含 if_linux_x86_64 和 -msse3 的行
             sed -i '/if_linux_x86_64.*-msse3/d' "$TSL_BZL_PATH"
             echo "Patched tsl.bzl: removed -msse3 flag"
             if grep -q -- '-msse3' "$TSL_BZL_PATH"; then
