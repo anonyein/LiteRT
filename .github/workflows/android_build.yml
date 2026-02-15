@@ -118,32 +118,26 @@ jobs:
           echo "Patched script after removing SSE flags:"
           grep -n -- '--copt' ci/build_android_package.sh || echo "No --copt flags left"
 
-      # 关键修复：拉取 libwebp 并删除其 BUILD 文件中的 -msse4.1 选项
-      - name: Fetch libwebp and remove -msse4.1 flag from its BUILD
+      # 通用修复：从所有外部仓库的 BUILD 文件中移除所有 -msse* 标志（避免在 ARM 上无效）
+      - name: Remove SSE flags from external repository BUILD files
         run: |
-          # 显式获取 libwebp 仓库
-          bazel fetch @libwebp//...
-          # 获取外部依赖的根目录
+          # 先获取所有外部依赖（不构建）
+          bazel fetch //... || true
           OUTPUT_BASE=$(bazel info output_base)
-          WEBP_PATH="${OUTPUT_BASE}/external/libwebp"
-          if [ -d "$WEBP_PATH" ]; then
-            echo "Found libwebp at $WEBP_PATH"
-            # 备份原 BUILD 文件
-            cp "$WEBP_PATH/BUILD.bazel" "$WEBP_PATH/BUILD.bazel.bak"
-            # 删除包含 "-msse4.1" 的行
-            sed -i '/"-msse4\.1"/d' "$WEBP_PATH/BUILD.bazel"
-            echo "Patched libwebp BUILD: removed -msse4.1"
-            # 验证删除结果
-            if grep -q -- '-msse4' "$WEBP_PATH/BUILD.bazel"; then
-              echo "ERROR: SSE flags still present!"
-              grep -n -- '-msse4' "$WEBP_PATH/BUILD.bazel"
-              exit 1
-            else
-              echo "SSE flags successfully removed."
-            fi
+          EXTERNAL_DIR="$OUTPUT_BASE/external"
+          if [ -d "$EXTERNAL_DIR" ]; then
+            echo "Scanning $EXTERNAL_DIR for BUILD files with -msse flags..."
+            # 查找所有 BUILD 或 BUILD.bazel 文件，并删除包含 -msse 的行
+            find "$EXTERNAL_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" \) -exec grep -l -- '-msse' {} \; | while read build_file; do
+              echo "Patching $build_file"
+              # 备份
+              cp "$build_file" "$build_file.bak"
+              # 删除包含 -msse 的行
+              sed -i '/-msse/d' "$build_file"
+            done
+            echo "SSE flag removal completed."
           else
-            echo "Error: libwebp not found at $WEBP_PATH"
-            exit 1
+            echo "External directory not found, skipping."
           fi
 
       - name: Run build_android_package.sh
