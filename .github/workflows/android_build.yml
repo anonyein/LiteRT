@@ -145,25 +145,6 @@ jobs:
             echo "External directory not found!"
             exit 1
           fi
-
-      # 专门修复 XNNPACK 的 linkopts 歧义
-      - name: Fix XNNPACK linkopts ambiguity
-        run: |
-          OUTPUT_BASE=$(bazel info output_base)
-          XNNPACK_BUILD="$OUTPUT_BASE/external/XNNPACK/BUILD.bazel"
-          if [ -f "$XNNPACK_BUILD" ]; then
-            echo "Patching XNNPACK/BUILD.bazel to resolve linkopts ambiguity..."
-            cp "$XNNPACK_BUILD" "$XNNPACK_BUILD.bak"
-            # 删除包含 "//build_config:linux_k8" 的行（假设这就是歧义来源）
-            sed -i '/"@@XNNPACK\/\/build_config:linux_k8"/d' "$XNNPACK_BUILD"
-            # 清理可能残留的空行和逗号
-            sed -i '/^\s*,\s*$/d' "$XNNPACK_BUILD"
-            sed -i 's/,\s*}/}/g' "$XNNPACK_BUILD"
-            echo "XNNPACK patched."
-          else
-            echo "XNNPACK BUILD file not found, skipping."
-          fi
-
       - name: Run build_android_package.sh
         run: |
           chmod +x ./ci/build_android_package.sh
