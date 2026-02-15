@@ -241,11 +241,11 @@ if [[ "$VERSION" == "0.0.0-nightly-SNAPSHOT" ]]; then
 fi
 
 # No need to build select-tf-ops for now.
-# bazel build "${BUILD_FLAGS[@]}" \
-#     --config=monolithic --define=TENSORFLOW_PROTOS=lite \
-#     --copt=-mno-sse4 --copt=-mno-sse4a --copt=-mno-sse4.1 --copt=-mno-sse4.2 \
-#     //tflite/java:tensorflow-lite-select-tf-ops
+bazel build "${BUILD_FLAGS[@]}" \
+    --config=monolithic --define=TENSORFLOW_PROTOS=lite \
+    --copt=-mno-sse4 --copt=-mno-sse4a --copt=-mno-sse4.1 --copt=-mno-sse4.2 \
+    //tflite/java:tensorflow-lite-select-tf-ops
 
-# prepare_pom_and_artifact "litert-select-tf-ops" "LiteRT with selected TF Ops" \
-#     "bazel-bin/tflite/java/tensorflow-lite-select-tf-ops.aar" \
-#     "${VERSION}"
+prepare_pom_and_artifact "litert-select-tf-ops" "LiteRT with selected TF Ops" \
+    "bazel-bin/tflite/java/tensorflow-lite-select-tf-ops.aar" \
+    "${VERSION}"
