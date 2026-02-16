@@ -185,21 +185,19 @@ jobs:
             echo "TensorFlow directory not found, skipping"
           fi
 
-      # 删除 ZenDNN 相关文件，避免未声明的依赖错误
-      - name: Remove ZenDNN files causing undeclared inclusion
+      # 删除 ZenDNN 和 MKL 相关文件，避免未声明的依赖和缺失的头文件错误
+      - name: Remove ZenDNN and MKL files causing dependency issues
         run: |
           OUTPUT_BASE=$(bazel info output_base)
           TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
-          ZEN_FILES=(
-            "$TF_DIR/tensorflow/core/common_runtime/eager/zen_eager_op_rewrite.cc"
-            "$TF_DIR/tensorflow/core/graph/zen_graph_util.h"
-            # 可根据需要添加更多 ZenDNN 文件
-          )
-          for file in "${ZEN_FILES[@]}"; do
-            if [ -f "$file" ]; then
-              rm -v "$file"
-            fi
-          done
+          # 删除 ZenDNN 相关文件
+          rm -vf "$TF_DIR/tensorflow/core/common_runtime/eager/zen_eager_op_rewrite.cc"
+          rm -vf "$TF_DIR/tensorflow/core/graph/zen_graph_util.h"
+          # 删除 MKL 相关文件
+          rm -vf "$TF_DIR/tensorflow/core/common_runtime/eager/mkl_eager_op_rewrite.cc"
+          rm -vf "$TF_DIR/tensorflow/core/util/mkl_util.h"
+          # 可选：删除其他可能引起问题的 MKL 文件（如需要可取消注释）
+          # find "$TF_DIR" -name "*mkl*" -type f -delete
 
       # 修复 hwloc：1. 删除 x86 源文件引用；2. 禁用 pthread affinity 函数
       - name: Fetch hwloc and apply fixes
