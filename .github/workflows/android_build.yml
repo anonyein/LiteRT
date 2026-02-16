@@ -20,8 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
-      # 基础配置：禁用 Android 平台解析、链接选项、强制定义 Android 相关宏
-      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --copt=-D__ANDROID__ --copt=-DHAVE_DECL_PTHREAD_SETAFFINITY_NP=0 --copt=-DHAVE_DECL_PTHREAD_GETAFFINITY_NP=0"
+      # 基础配置：禁用 Android 平台解析、链接选项、强制定义 __ANDROID__
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --copt=-D__ANDROID__"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
       # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
@@ -162,9 +162,9 @@ jobs:
           else
             echo "Warning: tsl.bzl not found at $TSL_BZL_PATH, xla may not be fully fetched."
           fi
-
-      # 修复 hwloc：安全删除 x86 源文件（后备方案）
-      - name: Fetch hwloc and remove x86-specific source files
+          
+      # 修复 hwloc：1. 删除 x86 源文件引用；2. 禁用 pthread affinity 函数
+      - name: Fetch hwloc and apply fixes
         run: |
           bazel fetch @hwloc//... || true
           OUTPUT_BASE=$(bazel info output_base)
@@ -176,13 +176,26 @@ jobs:
               cp "$BUILD_FILE" "$BUILD_FILE.bak"
               echo "Before patching BUILD file (x86 sources):"
               grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  No x86 source found"
+              # 删除包含 topology-x86.c 和 topology-x86_64.c 的行
               grep -v 'topology-x86.*\.c' "$BUILD_FILE" > "$BUILD_FILE.tmp"
               mv "$BUILD_FILE.tmp" "$BUILD_FILE"
+              # 清理可能遗留的逗号
               sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' "$BUILD_FILE"
               echo "After patching BUILD file:"
               grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  Success: no x86 source remaining"
             else
               echo "BUILD.bazel not found, skipping"
+            fi
+
+            # 修改 topology-linux.c 强制禁用 pthread affinity 函数
+            LINUX_SRC="$HWLOC_DIR/hwloc/topology-linux.c"
+            if [ -f "$LINUX_SRC" ]; then
+              cp "$LINUX_SRC" "$LINUX_SRC.bak"
+              echo "Patching $LINUX_SRC to disable pthread affinity..."
+              sed -i '/#include "private\/autogen\/config.h"/a #undef HAVE_DECL_PTHREAD_SETAFFINITY_NP\n#define HAVE_DECL_PTHREAD_SETAFFINITY_NP 0\n#undef HAVE_DECL_PTHREAD_GETAFFINITY_NP\n#define HAVE_DECL_PTHREAD_GETAFFINITY_NP 0' "$LINUX_SRC"
+              echo "Patched topology-linux.c"
+            else
+              echo "topology-linux.c not found, skipping"
             fi
           else
             echo "hwloc directory not found, skipping"
