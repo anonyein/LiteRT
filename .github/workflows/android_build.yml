@@ -163,17 +163,18 @@ jobs:
             echo "Warning: tsl.bzl not found at $TSL_BZL_PATH, xla may not be fully fetched."
           fi
 
-      # 通用修复：在 org_tensorflow 中递归删除所有 BUILD 文件中的 -msse3 标志
-      - name: Remove -msse3 flags from all TensorFlow BUILD files
+      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 标志（包括 BUILD、bzl、.cc 等）
+      - name: Remove all -msse3 flags from TensorFlow source tree
         run: |
           OUTPUT_BASE=$(bazel info output_base)
           TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
           if [ -d "$TF_DIR" ]; then
-            echo "Scanning $TF_DIR for BUILD files with -msse3 flags..."
-            find "$TF_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" \) -exec grep -l -- '-msse3' {} \; | while read build_file; do
-              echo "Patching $build_file"
-              cp "$build_file" "$build_file.bak"
-              sed -i '/-msse3/d' "$build_file"
+            echo "Scanning $TF_DIR for files containing -msse3..."
+            # 查找所有普通文件（排除二进制文件），删除包含 -msse3 的行
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" -exec grep -l -- '-msse3' {} \; | while read file; do
+              echo "Patching $file"
+              cp "$file" "$file.bak"
+              sed -i '/-msse3/d' "$file"
             done
             echo "Patching completed."
           else
