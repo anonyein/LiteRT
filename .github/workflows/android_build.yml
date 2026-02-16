@@ -164,7 +164,7 @@ jobs:
           fi
 
       # 修复 hwloc：
-      #   1. 删除 x86 特定源文件
+      #   1. 删除 x86 特定源文件（修正正则匹配路径）
       #   2. 在 copts 中添加 -D__ANDROID__ 激活 Android 条件编译
       #   3. 直接修改 topology-linux.c 插入宏定义（后备方案）
       - name: Fetch hwloc and apply comprehensive fixes
@@ -176,13 +176,15 @@ jobs:
           if [ -d "$HWLOC_DIR" ]; then
             echo "Found hwloc at $HWLOC_DIR"
 
-            # 1. 删除 x86 源文件引用
+            # 1. 删除 x86 源文件引用（修正后的正则）
             BUILD_FILE="$HWLOC_DIR/BUILD.bazel"
             if [ -f "$BUILD_FILE" ]; then
               cp "$BUILD_FILE" "$BUILD_FILE.bak"
               echo "Before patching BUILD file (x86 sources):"
               grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  No x86 source found"
-              sed -i '/"topology-x86[^"]*\.c"/d' "$BUILD_FILE"
+              # 匹配任何包含 topology-x86 的 .c 文件行（带路径或不带路径）
+              sed -i '/topology-x86.*\.c/d' "$BUILD_FILE"
+              # 清理可能遗留的逗号和括号
               sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' "$BUILD_FILE"
               echo "After patching BUILD file:"
               grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  Success: no x86 source remaining"
@@ -191,16 +193,16 @@ jobs:
             fi
 
             # 2. 添加 -D__ANDROID__ 到 copts（确保 Android 检测生效）
-            #    在 BUILD 文件中找到类似 "copts = [...]" 的行并插入该宏
             if [ -f "$BUILD_FILE" ]; then
-              # 如果已经有 copts 行，在末尾添加 __ANDROID__；否则插入一个新行
+              # 如果已经有 copts 行，在末尾添加 __ANDROID__
               if grep -q 'copts *= *\[' "$BUILD_FILE"; then
                 sed -i '/copts *= *\[/ s/\]/, "-D__ANDROID__"\]/' "$BUILD_FILE"
+                echo "Added -D__ANDROID__ to copts in BUILD file."
               else
-                # 简单处理：在文件末尾附近插入一个 copts 属性（可能需要更精确的位置，但作为示例）
+                # 如果没有 copts，在适当位置插入（这里简单地在文件末尾添加）
                 echo 'copts = ["-D__ANDROID__"],' >> "$BUILD_FILE"
+                echo "Created copts with -D__ANDROID__ in BUILD file."
               fi
-              echo "Added -D__ANDROID__ to copts in BUILD file."
             fi
 
             # 3. 后备：直接修改 topology-linux.c 插入宏定义
