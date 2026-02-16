@@ -20,8 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
-      # 基础配置：禁用 Android 平台解析、链接选项、强制定义 __ANDROID__
-      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --copt=-D__ANDROID__"
+      # 基础配置：禁用 Android 平台解析、链接选项、强制定义 __ANDROID__ 并取消定义 INTEL_MKL
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --copt=-D__ANDROID__ --copt=-UINTEL_MKL"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
       # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
@@ -185,19 +185,26 @@ jobs:
             echo "TensorFlow directory not found, skipping"
           fi
 
-      # 删除 ZenDNN 和 MKL 相关文件，避免未声明的依赖和缺失的头文件错误
-      - name: Remove ZenDNN and MKL files causing dependency issues
+      # 处理 ZenDNN 和 MKL 相关文件：删除有问题的源文件，并替换 mkl_util.h 为空文件
+      - name: Handle MKL and ZenDNN files
         run: |
           OUTPUT_BASE=$(bazel info output_base)
           TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
           # 删除 ZenDNN 相关文件
           rm -vf "$TF_DIR/tensorflow/core/common_runtime/eager/zen_eager_op_rewrite.cc"
           rm -vf "$TF_DIR/tensorflow/core/graph/zen_graph_util.h"
-          # 删除 MKL 相关文件
+          # 删除 MKL 源文件
           rm -vf "$TF_DIR/tensorflow/core/common_runtime/eager/mkl_eager_op_rewrite.cc"
-          rm -vf "$TF_DIR/tensorflow/core/util/mkl_util.h"
-          # 可选：删除其他可能引起问题的 MKL 文件（如需要可取消注释）
-          # find "$TF_DIR" -name "*mkl*" -type f -delete
+          # 删除原 mkl_util.h 并创建空文件
+          MKL_UTIL_H="$TF_DIR/tensorflow/core/util/mkl_util.h"
+          rm -vf "$MKL_UTIL_H"
+          mkdir -p "$(dirname "$MKL_UTIL_H")"
+          # 使用 printf 写入文件，避免 heredoc 缩进问题
+          printf '%s\n' '#ifndef TENSORFLOW_CORE_UTIL_MKL_UTIL_H_' \
+                        '#define TENSORFLOW_CORE_UTIL_MKL_UTIL_H_' \
+                        '// Empty file for Android build to satisfy dependencies.' \
+                        '#endif' > "$MKL_UTIL_H"
+          echo "Created empty $MKL_UTIL_H"
 
       # 修复 hwloc：1. 删除 x86 源文件引用；2. 禁用 pthread affinity 函数
       - name: Fetch hwloc and apply fixes
