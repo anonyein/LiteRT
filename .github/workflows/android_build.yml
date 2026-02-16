@@ -177,8 +177,8 @@ jobs:
               cp "$BUILD_FILE" "$BUILD_FILE.bak"
               echo "Before patching:"
               grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  No x86 source found"
-              # 删除包含 topology-x86.c 和 topology-x86_64.c 的行
-              sed -i '/"topology-x86[^"]*\.c"/d' "$BUILD_FILE"
+              # 删除包含 topology-x86 且以 .c 结尾的行（无论是否有目录前缀）
+              sed -i '/topology-x86.*\.c/d' "$BUILD_FILE"
               # 清理因删除导致的语法问题（如多余的逗号、空列表）
               sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' "$BUILD_FILE"
               echo "After patching:"
