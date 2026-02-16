@@ -20,8 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
-      # 基础配置：禁用 Android 平台解析、链接选项
-      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version"
+      # 基础配置：禁用 Android 平台解析、链接选项、强制定义 __ANDROID__ 和后备宏
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --copt=-D__ANDROID__ --copt=-DHAVE_PTHREAD_SETAFFINITY_NP=0 --copt=-DHAVE_PTHREAD_GETAFFINITY_NP=0"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
       # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
@@ -164,10 +164,10 @@ jobs:
           fi
 
       # 修复 hwloc：
-      #   1. 删除 x86 特定源文件（修正正则匹配路径）
-      #   2. 在 copts 中添加 -D__ANDROID__ 激活 Android 条件编译
+      #   1. 安全删除 x86 源文件引用（使用 grep -v 避免 sed 匹配问题）
+      #   2. 清理可能遗留的逗号
       #   3. 直接修改 topology-linux.c 插入宏定义（后备方案）
-      - name: Fetch hwloc and apply comprehensive fixes
+      - name: Fetch hwloc and apply fixes
         run: |
           bazel fetch @hwloc//... || true
           OUTPUT_BASE=$(bazel info output_base)
@@ -176,15 +176,16 @@ jobs:
           if [ -d "$HWLOC_DIR" ]; then
             echo "Found hwloc at $HWLOC_DIR"
 
-            # 1. 删除 x86 源文件引用（修正后的正则）
+            # 1. 删除 x86 源文件引用（使用 grep -v 安全删除）
             BUILD_FILE="$HWLOC_DIR/BUILD.bazel"
             if [ -f "$BUILD_FILE" ]; then
               cp "$BUILD_FILE" "$BUILD_FILE.bak"
               echo "Before patching BUILD file (x86 sources):"
               grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  No x86 source found"
-              # 匹配任何包含 topology-x86 的 .c 文件行（带路径或不带路径）
-              sed -i '/topology-x86.*\.c/d' "$BUILD_FILE"
-              # 清理可能遗留的逗号和括号
+              # 使用 grep -v 删除包含 x86 源文件的行，写回临时文件
+              grep -v 'topology-x86.*\.c' "$BUILD_FILE" > "$BUILD_FILE.tmp"
+              mv "$BUILD_FILE.tmp" "$BUILD_FILE"
+              # 清理可能遗留的逗号（例如列表末尾多出的逗号）
               sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' "$BUILD_FILE"
               echo "After patching BUILD file:"
               grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  Success: no x86 source remaining"
@@ -192,20 +193,7 @@ jobs:
               echo "BUILD.bazel not found, skipping"
             fi
 
-            # 2. 添加 -D__ANDROID__ 到 copts（确保 Android 检测生效）
-            if [ -f "$BUILD_FILE" ]; then
-              # 如果已经有 copts 行，在末尾添加 __ANDROID__
-              if grep -q 'copts *= *\[' "$BUILD_FILE"; then
-                sed -i '/copts *= *\[/ s/\]/, "-D__ANDROID__"\]/' "$BUILD_FILE"
-                echo "Added -D__ANDROID__ to copts in BUILD file."
-              else
-                # 如果没有 copts，在适当位置插入（这里简单地在文件末尾添加）
-                echo 'copts = ["-D__ANDROID__"],' >> "$BUILD_FILE"
-                echo "Created copts with -D__ANDROID__ in BUILD file."
-              fi
-            fi
-
-            # 3. 后备：直接修改 topology-linux.c 插入宏定义
+            # 2. 后备：直接修改 topology-linux.c 插入宏定义
             LINUX_SRC="$HWLOC_DIR/hwloc/topology-linux.c"
             if [ -f "$LINUX_SRC" ]; then
               cp "$LINUX_SRC" "$LINUX_SRC.bak"
