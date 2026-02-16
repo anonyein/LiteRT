@@ -20,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
+      # 基础配置：禁用 Android 平台解析、链接选项、强制定义 __ANDROID__
       BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --copt=-D__ANDROID__"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
@@ -162,6 +163,23 @@ jobs:
             echo "Warning: tsl.bzl not found at $TSL_BZL_PATH, xla may not be fully fetched."
           fi
 
+      # 通用修复：在 org_tensorflow 中递归删除所有 BUILD 文件中的 -msse3 标志
+      - name: Remove -msse3 flags from all TensorFlow BUILD files
+        run: |
+          OUTPUT_BASE=$(bazel info output_base)
+          TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
+          if [ -d "$TF_DIR" ]; then
+            echo "Scanning $TF_DIR for BUILD files with -msse3 flags..."
+            find "$TF_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" \) -exec grep -l -- '-msse3' {} \; | while read build_file; do
+              echo "Patching $build_file"
+              cp "$build_file" "$build_file.bak"
+              sed -i '/-msse3/d' "$build_file"
+            done
+            echo "Patching completed."
+          else
+            echo "TensorFlow directory not found, skipping"
+          fi
+
       # 修复 hwloc：1. 删除 x86 源文件引用；2. 禁用 pthread affinity 函数
       - name: Fetch hwloc and apply fixes
         run: |
@@ -175,8 +193,10 @@ jobs:
               cp "$BUILD_FILE" "$BUILD_FILE.bak"
               echo "Before patching BUILD file (x86 sources):"
               grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  No x86 source found"
+              # 删除包含 topology-x86.c 和 topology-x86_64.c 的行
               grep -v 'topology-x86.*\.c' "$BUILD_FILE" > "$BUILD_FILE.tmp"
               mv "$BUILD_FILE.tmp" "$BUILD_FILE"
+              # 清理可能遗留的逗号
               sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' "$BUILD_FILE"
               echo "After patching BUILD file:"
               grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  Success: no x86 source remaining"
@@ -184,6 +204,7 @@ jobs:
               echo "BUILD.bazel not found, skipping"
             fi
 
+            # 修改 topology-linux.c 强制禁用 pthread affinity 函数
             LINUX_SRC="$HWLOC_DIR/hwloc/topology-linux.c"
             if [ -f "$LINUX_SRC" ]; then
               cp "$LINUX_SRC" "$LINUX_SRC.bak"
@@ -195,23 +216,6 @@ jobs:
             fi
           else
             echo "hwloc directory not found, skipping"
-          fi
-
-      # 通用修复：扫描 TensorFlow 中的所有 BUILD 文件，移除 -msse3 标志
-      - name: Remove -msse3 flags from all TensorFlow BUILD files
-        run: |
-          OUTPUT_BASE=$(bazel info output_base)
-          TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
-          if [ -d "$TF_DIR" ]; then
-            echo "Scanning $TF_DIR for BUILD files with -msse3 flags..."
-            find "$TF_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" \) -exec grep -l -- '-msse3' {} \; | while read build_file; do
-              echo "Patching $build_file"
-              cp "$build_file" "$build_file.bak"
-              sed -i '/-msse3/d' "$build_file"
-            done
-            echo "TensorFlow SSE flag removal completed."
-          else
-            echo "TensorFlow directory not found, skipping."
           fi
 
       - name: Run build_android_package.sh
