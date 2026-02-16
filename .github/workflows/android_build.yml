@@ -162,7 +162,7 @@ jobs:
           else
             echo "Warning: tsl.bzl not found at $TSL_BZL_PATH, xla may not be fully fetched."
           fi
-          
+
       # 修复 hwloc：1. 删除 x86 源文件引用；2. 禁用 pthread affinity 函数
       - name: Fetch hwloc and apply fixes
         run: |
@@ -199,6 +199,28 @@ jobs:
             fi
           else
             echo "hwloc directory not found, skipping"
+          fi
+
+      # 修复 tensorflow jpeg 库中的 -msse3 标志
+      - name: Fetch tensorflow and remove -msse3 flag from jpeg BUILD
+        run: |
+          OUTPUT_BASE=$(bazel info output_base)
+          JPEG_BUILD="${OUTPUT_BASE}/external/org_tensorflow/tensorflow/core/lib/jpeg/BUILD"
+          if [ -f "$JPEG_BUILD" ]; then
+            echo "Found jpeg BUILD at $JPEG_BUILD"
+            cp "$JPEG_BUILD" "$JPEG_BUILD.bak"
+            sed -i '/-msse3/d' "$JPEG_BUILD"
+            echo "Patched jpeg BUILD: removed -msse3"
+          else
+            echo "jpeg BUILD not found, trying BUILD.bazel"
+            JPEG_BUILD="${OUTPUT_BASE}/external/org_tensorflow/tensorflow/core/lib/jpeg/BUILD.bazel"
+            if [ -f "$JPEG_BUILD" ]; then
+              cp "$JPEG_BUILD" "$JPEG_BUILD.bak"
+              sed -i '/-msse3/d' "$JPEG_BUILD"
+              echo "Patched jpeg BUILD: removed -msse3"
+            else
+              echo "jpeg BUILD not found, skipping"
+            fi
           fi
 
       - name: Run build_android_package.sh
