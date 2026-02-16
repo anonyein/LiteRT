@@ -142,7 +142,7 @@ jobs:
             exit 1
           fi
 
-      # 修复 xla 的 tsl.bzl：移除 -msse3 标志
+      # 修复 xla 中的 tsl.bzl，移除 -msse3 标志
       - name: Fetch xla and remove -msse3 flag from tsl.bzl
         run: |
           bazel fetch @xla//... || true
@@ -162,6 +162,32 @@ jobs:
             fi
           else
             echo "Warning: tsl.bzl not found at $TSL_BZL_PATH, xla may not be fully fetched."
+          fi
+
+      # 修复 hwloc：删除 x86 特定源文件，避免 ARM 编译内联汇编错误
+      - name: Fetch hwloc and remove x86-specific source files
+        run: |
+          bazel fetch @hwloc//... || true
+          OUTPUT_BASE=$(bazel info output_base)
+          HWLOC_DIR="${OUTPUT_BASE}/external/hwloc"
+          if [ -d "$HWLOC_DIR" ]; then
+            echo "Found hwloc at $HWLOC_DIR"
+            BUILD_FILE="$HWLOC_DIR/BUILD.bazel"
+            if [ -f "$BUILD_FILE" ]; then
+              cp "$BUILD_FILE" "$BUILD_FILE.bak"
+              echo "Before patching:"
+              grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  No x86 source found"
+              # 删除包含 topology-x86.c 和 topology-x86_64.c 的行
+              sed -i '/"topology-x86[^"]*\.c"/d' "$BUILD_FILE"
+              # 清理因删除导致的语法问题（如多余的逗号、空列表）
+              sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' "$BUILD_FILE"
+              echo "After patching:"
+              grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  Success: no x86 source remaining"
+            else
+              echo "BUILD.bazel not found, skipping"
+            fi
+          else
+            echo "hwloc directory not found, skipping"
           fi
 
       - name: Run build_android_package.sh
