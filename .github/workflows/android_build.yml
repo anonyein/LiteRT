@@ -163,14 +163,18 @@ jobs:
             echo "Warning: tsl.bzl not found at $TSL_BZL_PATH, xla may not be fully fetched."
           fi
 
-      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 标志（包括 BUILD、bzl、.cc 等）
+      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 标志，并打印被删除的行
       - name: Remove all -msse3 flags from TensorFlow source tree
         run: |
           OUTPUT_BASE=$(bazel info output_base)
           TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
           if [ -d "$TF_DIR" ]; then
             echo "Scanning $TF_DIR for files containing -msse3..."
-            # 查找所有普通文件（排除二进制文件），删除包含 -msse3 的行
+            # 先列出所有包含 -msse3 的行
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" -exec grep -Hn -- '-msse3' {} \; | while IFS=: read file line_num line_content; do
+              echo "Found in $file:$line_num: $line_content"
+            done
+            # 然后执行删除操作
             find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" -exec grep -l -- '-msse3' {} \; | while read file; do
               echo "Patching $file"
               cp "$file" "$file.bak"
@@ -180,6 +184,22 @@ jobs:
           else
             echo "TensorFlow directory not found, skipping"
           fi
+
+      # 删除 ZenDNN 相关文件，避免未声明的依赖错误
+      - name: Remove ZenDNN files causing undeclared inclusion
+        run: |
+          OUTPUT_BASE=$(bazel info output_base)
+          TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
+          ZEN_FILES=(
+            "$TF_DIR/tensorflow/core/common_runtime/eager/zen_eager_op_rewrite.cc"
+            "$TF_DIR/tensorflow/core/graph/zen_graph_util.h"
+            # 可根据需要添加更多 ZenDNN 文件
+          )
+          for file in "${ZEN_FILES[@]}"; do
+            if [ -f "$file" ]; then
+              rm -v "$file"
+            fi
+          done
 
       # 修复 hwloc：1. 删除 x86 源文件引用；2. 禁用 pthread affinity 函数
       - name: Fetch hwloc and apply fixes
