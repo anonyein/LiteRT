@@ -20,7 +20,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
-      # 基础配置：禁用 Android 平台解析、链接选项、强制定义 __ANDROID__
       BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --copt=-D__ANDROID__"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
@@ -176,10 +175,8 @@ jobs:
               cp "$BUILD_FILE" "$BUILD_FILE.bak"
               echo "Before patching BUILD file (x86 sources):"
               grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  No x86 source found"
-              # 删除包含 topology-x86.c 和 topology-x86_64.c 的行
               grep -v 'topology-x86.*\.c' "$BUILD_FILE" > "$BUILD_FILE.tmp"
               mv "$BUILD_FILE.tmp" "$BUILD_FILE"
-              # 清理可能遗留的逗号
               sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' "$BUILD_FILE"
               echo "After patching BUILD file:"
               grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  Success: no x86 source remaining"
@@ -187,7 +184,6 @@ jobs:
               echo "BUILD.bazel not found, skipping"
             fi
 
-            # 修改 topology-linux.c 强制禁用 pthread affinity 函数
             LINUX_SRC="$HWLOC_DIR/hwloc/topology-linux.c"
             if [ -f "$LINUX_SRC" ]; then
               cp "$LINUX_SRC" "$LINUX_SRC.bak"
@@ -201,26 +197,21 @@ jobs:
             echo "hwloc directory not found, skipping"
           fi
 
-      # 修复 tensorflow jpeg 库中的 -msse3 标志
-      - name: Fetch tensorflow and remove -msse3 flag from jpeg BUILD
+      # 通用修复：扫描 TensorFlow 中的所有 BUILD 文件，移除 -msse3 标志
+      - name: Remove -msse3 flags from all TensorFlow BUILD files
         run: |
           OUTPUT_BASE=$(bazel info output_base)
-          JPEG_BUILD="${OUTPUT_BASE}/external/org_tensorflow/tensorflow/core/lib/jpeg/BUILD"
-          if [ -f "$JPEG_BUILD" ]; then
-            echo "Found jpeg BUILD at $JPEG_BUILD"
-            cp "$JPEG_BUILD" "$JPEG_BUILD.bak"
-            sed -i '/-msse3/d' "$JPEG_BUILD"
-            echo "Patched jpeg BUILD: removed -msse3"
+          TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
+          if [ -d "$TF_DIR" ]; then
+            echo "Scanning $TF_DIR for BUILD files with -msse3 flags..."
+            find "$TF_DIR" -type f \( -name "BUILD" -o -name "BUILD.bazel" \) -exec grep -l -- '-msse3' {} \; | while read build_file; do
+              echo "Patching $build_file"
+              cp "$build_file" "$build_file.bak"
+              sed -i '/-msse3/d' "$build_file"
+            done
+            echo "TensorFlow SSE flag removal completed."
           else
-            echo "jpeg BUILD not found, trying BUILD.bazel"
-            JPEG_BUILD="${OUTPUT_BASE}/external/org_tensorflow/tensorflow/core/lib/jpeg/BUILD.bazel"
-            if [ -f "$JPEG_BUILD" ]; then
-              cp "$JPEG_BUILD" "$JPEG_BUILD.bak"
-              sed -i '/-msse3/d' "$JPEG_BUILD"
-              echo "Patched jpeg BUILD: removed -msse3"
-            else
-              echo "jpeg BUILD not found, skipping"
-            fi
+            echo "TensorFlow directory not found, skipping."
           fi
 
       - name: Run build_android_package.sh
