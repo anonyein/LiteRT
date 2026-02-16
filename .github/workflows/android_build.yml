@@ -20,8 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
-      # 基础配置：禁用 Android 平台解析、链接选项、强制定义 __ANDROID__ 并取消定义 INTEL_MKL
-      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --copt=-D__ANDROID__ --copt=-UINTEL_MKL"
+      # 基础配置：禁用 Android 平台解析、链接选项、强制定义 __ANDROID__、取消定义 INTEL_MKL、允许重复符号
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
       # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
@@ -195,15 +195,14 @@ jobs:
           rm -vf "$TF_DIR/tensorflow/core/graph/zen_graph_util.h"
           # 删除 MKL 源文件
           rm -vf "$TF_DIR/tensorflow/core/common_runtime/eager/mkl_eager_op_rewrite.cc"
-          # 删除原 mkl_util.h 并创建空文件
+          # 删除原 mkl_util.h 并创建空文件（使用 printf 避免 EOF 缩进问题）
           MKL_UTIL_H="$TF_DIR/tensorflow/core/util/mkl_util.h"
           rm -vf "$MKL_UTIL_H"
           mkdir -p "$(dirname "$MKL_UTIL_H")"
-          # 使用 printf 写入文件，避免 heredoc 缩进问题
-          printf '%s\n' '#ifndef TENSORFLOW_CORE_UTIL_MKL_UTIL_H_' \
-                        '#define TENSORFLOW_CORE_UTIL_MKL_UTIL_H_' \
-                        '// Empty file for Android build to satisfy dependencies.' \
-                        '#endif' > "$MKL_UTIL_H"
+          printf '%s\n' "#ifndef TENSORFLOW_CORE_UTIL_MKL_UTIL_H_" \
+                       "#define TENSORFLOW_CORE_UTIL_MKL_UTIL_H_" \
+                       "// Empty file for Android build to satisfy dependencies." \
+                       "#endif" > "$MKL_UTIL_H"
           echo "Created empty $MKL_UTIL_H"
 
       # 修复 hwloc：1. 删除 x86 源文件引用；2. 禁用 pthread affinity 函数
