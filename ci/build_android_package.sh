@@ -201,44 +201,44 @@ else
   echo "Skipping building Litert Kotlin API."
 fi
 
-bazel build "${BUILD_FLAGS[@]}" \
-    //tflite/java:tensorflow-lite-api \
-    //tflite/java:tensorflow-lite \
-    //tflite/java:tensorflow-lite-gpu-api \
-    //tflite/java:tensorflow-lite-gpu \
-    //tflite/acceleration/configuration:gpu_plugin \
-    //tflite/acceleration/configuration:nnapi_plugin
-    # //tflite/delegates/hexagon/java:tensorflow-lite-hexagon
+# bazel build "${BUILD_FLAGS[@]}" \
+#     //tflite/java:tensorflow-lite-api \
+#     //tflite/java:tensorflow-lite \
+#     //tflite/java:tensorflow-lite-gpu-api \
+#     //tflite/java:tensorflow-lite-gpu \
+#     //tflite/acceleration/configuration:gpu_plugin \
+#     //tflite/acceleration/configuration:nnapi_plugin
+#     # //tflite/delegates/hexagon/java:tensorflow-lite-hexagon
 
 export VERSION="${RELEASE_VERSION:-0.0.0-nightly-SNAPSHOT}"
 
-prepare_pom_and_artifact "litert-api" "LiteRT API" \
-    "bazel-bin/tflite/java/tensorflow-lite-api.aar" "${VERSION}"
-prepare_pom_and_artifact "litert" "LiteRT implementation" \
-    "bazel-bin/tflite/java/tensorflow-lite.aar" "${VERSION}" \
-    --depends-api
-prepare_pom_and_artifact "litert-gpu-api" "LiteRT GPU API" \
-    "bazel-bin/tflite/java/tensorflow-lite-gpu-api.aar" "${VERSION}"
-prepare_pom_and_artifact "litert-gpu" "LiteRT GPU implementation" \
-    "bazel-bin/tflite/java/tensorflow-lite-gpu.aar" "${VERSION}" \
-    --depends-api --depends-gpu-api
-# prepare_pom_and_artifact "litert-hexagon" "LiteRT Hexagon" \
-#     "bazel-bin/tflite/delegates/hexagon/java/tensorflow-lite-hexagon.aar" \
-#     "${VERSION}"
+# prepare_pom_and_artifact "litert-api" "LiteRT API" \
+#     "bazel-bin/tflite/java/tensorflow-lite-api.aar" "${VERSION}"
+# prepare_pom_and_artifact "litert" "LiteRT implementation" \
+#     "bazel-bin/tflite/java/tensorflow-lite.aar" "${VERSION}" \
+#     --depends-api
+# prepare_pom_and_artifact "litert-gpu-api" "LiteRT GPU API" \
+#     "bazel-bin/tflite/java/tensorflow-lite-gpu-api.aar" "${VERSION}"
+# prepare_pom_and_artifact "litert-gpu" "LiteRT GPU implementation" \
+#     "bazel-bin/tflite/java/tensorflow-lite-gpu.aar" "${VERSION}" \
+#     --depends-api --depends-gpu-api
+# # prepare_pom_and_artifact "litert-hexagon" "LiteRT Hexagon" \
+# #     "bazel-bin/tflite/delegates/hexagon/java/tensorflow-lite-hexagon.aar" \
+# #     "${VERSION}"
 
-if [[ "$VERSION" == "0.0.0-nightly-SNAPSHOT" ]]; then
-  # Build debug version of litert, litert-gpu
-  bazel build "${BUILD_FLAGS[@]}" \
-      --define=tflite_keep_symbols=true \
-      //tflite/java:tensorflow-lite \
-      //tflite/java:tensorflow-lite-gpu
-  prepare_pom_and_artifact "litert" "LiteRT implementation" \
-      "bazel-bin/tflite/java/tensorflow-lite.aar" \
-      "0.0.0-nightly-debug-SNAPSHOT" --depends-api
-  prepare_pom_and_artifact "litert-gpu" "LiteRT GPU implementation" \
-      "bazel-bin/tflite/java/tensorflow-lite-gpu.aar" \
-      "0.0.0-nightly-debug-SNAPSHOT" --depends-api
-fi
+# if [[ "$VERSION" == "0.0.0-nightly-SNAPSHOT" ]]; then
+#   # Build debug version of litert, litert-gpu
+#   bazel build "${BUILD_FLAGS[@]}" \
+#       --define=tflite_keep_symbols=true \
+#       //tflite/java:tensorflow-lite \
+#       //tflite/java:tensorflow-lite-gpu
+#   prepare_pom_and_artifact "litert" "LiteRT implementation" \
+#       "bazel-bin/tflite/java/tensorflow-lite.aar" \
+#       "0.0.0-nightly-debug-SNAPSHOT" --depends-api
+#   prepare_pom_and_artifact "litert-gpu" "LiteRT GPU implementation" \
+#       "bazel-bin/tflite/java/tensorflow-lite-gpu.aar" \
+#       "0.0.0-nightly-debug-SNAPSHOT" --depends-api
+# fi
 
 # No need to build select-tf-ops for now.
 bazel build "${BUILD_FLAGS[@]}" \
