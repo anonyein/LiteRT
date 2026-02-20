@@ -684,6 +684,7 @@ cc_test(
         "//litert/cc:litert_macros",
         "//litert/core:environment",
         "//litert/test:matchers",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/types:span",
     ] + gtest_main_no_heapcheck_deps() + select({
         "@org_tensorflow//tensorflow:android": [
@@ -753,8 +754,27 @@ cc_library(
 
 cc_library(
     name = "litert_runtime_options",
+    srcs = ["litert_runtime_options.cc"],
     hdrs = ["litert_runtime_options.h"],
-    deps = ["//litert/c:litert_common"],
+    deps = [
+        "//litert/c:litert_common",
+        "//litert/cc:litert_expected",
+        "//litert/cc:litert_macros",
+        "//litert/core:litert_toml_parser",
+        "@com_google_absl//absl/strings:string_view",
+    ],
+)
+
+cc_test(
+    name = "litert_runtime_options_test",
+    srcs = ["litert_runtime_options_test.cc"],
+    tags = ["no_oss"],
+    deps = [
+        ":litert_runtime_options",
+        "//litert/c:litert_common",
+        "//third_party/tomlplusplus",
+        "@com_google_googletest//:gtest_main",
+    ],
 )
 
 cc_library(
