@@ -1,0 +1,264 @@
+name: Build and Upload Android AAR Packages 2
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-package:
+    name: "Build AARs with Bazel"
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
+      # 基础配置：禁用 Android 平台解析、链接选项、强制定义 __ANDROID__、取消定义 INTEL_MKL、允许重复符号
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL"
+      ANDROID_API_LEVEL: "36"
+      NDK_VERSION: "r27"
+      # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Bazel
+        uses: bazel-contrib/setup-bazel@0.9.0
+        with:
+          bazel-version: 7.0.0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 openjdk-17-jdk
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK r27
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
+          unzip -q android-ndk-${NDK_VERSION}-linux.zip -d /tmp
+          NDK_PATH=/tmp/android-ndk-${NDK_VERSION}
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
+          ls -la $NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/clang* || exit 1
+        env:
+          NDK_VERSION: ${{ env.NDK_VERSION }}
+
+      - name: Export Android environment
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
+
+      - name: Configure .bazelrc for NDK
+        run: |
+          echo "build --repo_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
+          echo "build --action_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
+
+      - name: Verify Android paths
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_HOME=$ANDROID_SDK_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          ls -la $ANDROID_HOME/platforms || true
+          ls -la $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang* || true
+
+      - name: Configure TensorFlow for Android
+        run: |
+          export TF_NEED_ANDROID=1
+          export TF_SET_ANDROID_WORKSPACE=1
+          if [ -f ./configure.py ]; then
+            yes "" | python3 ./configure.py
+          else
+            echo "No configure.py found; assuming WORKSPACE is already configured."
+          fi
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          ANDROID_SDK_HOME: ${{ env.ANDROID_SDK_HOME }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+          ANDROID_API_LEVEL: ${{ env.ANDROID_API_LEVEL }}
+          TF_NEED_ANDROID: 1
+          TF_SET_ANDROID_WORKSPACE: 1
+
+      - name: Show api_level before fix
+        run: |
+          echo "=== Before fix ==="
+          grep -n "api_level" WORKSPACE || echo "No api_level found"
+
+      - name: Fix WORKSPACE api_level (float to int)
+        run: |
+          cp WORKSPACE WORKSPACE.bak
+          sed -i 's/\(api_level\s*=\s*\)[0-9]\+\.[0-9]\+/\136/g' WORKSPACE
+          echo "=== After fix ==="
+          grep -n "api_level" WORKSPACE || echo "No api_level found"
+          if grep -q "api_level.*\.[0-9]" WORKSPACE; then
+            echo "Warning: Floating api_level still present, applying additional fix"
+            sed -i 's/\(api_level\s*=\s*\)[0-9]*\.[0-9]*/\136/g' WORKSPACE
+            grep -n "api_level" WORKSPACE
+          fi
+
+      # 移除脚本中可能导致问题的 SSE 标志（它们是 x86 专用的禁用标志）
+      - name: Remove unsupported SSE flags from build script
+        run: |
+          cp ci/build_android_package.sh ci/build_android_package.sh.bak
+          sed -i '/--copt=-mno-sse4/d' ci/build_android_package.sh
+          echo "Patched script after removing SSE flags:"
+          grep -n -- '--copt' ci/build_android_package.sh || echo "No --copt flags left"
+
+      # 修复 libwebp：删除其 BUILD 文件中的 -msse4.1 选项
+      - name: Fetch libwebp and remove -msse4.1 flag from its BUILD
+        run: |
+          bazel fetch @libwebp//...
+          OUTPUT_BASE=$(bazel info output_base)
+          WEBP_PATH="${OUTPUT_BASE}/external/libwebp"
+          if [ -d "$WEBP_PATH" ]; then
+            echo "Found libwebp at $WEBP_PATH"
+            cp "$WEBP_PATH/BUILD.bazel" "$WEBP_PATH/BUILD.bazel.bak"
+            sed -i '/"-msse4\.1"/d' "$WEBP_PATH/BUILD.bazel"
+            echo "Patched libwebp BUILD: removed -msse4.1"
+            if grep -q -- '-msse4' "$WEBP_PATH/BUILD.bazel"; then
+              echo "ERROR: SSE flags still present!"
+              grep -n -- '-msse4' "$WEBP_PATH/BUILD.bazel"
+              exit 1
+            else
+              echo "SSE flags successfully removed."
+            fi
+          else
+            echo "Error: libwebp not found at $WEBP_PATH"
+            exit 1
+          fi
+
+      # 修复 xla 中的 tsl.bzl：删除 if_linux_x86_64(["-msse3"]) 行
+      - name: Fetch xla and remove -msse3 flag from tsl.bzl
+        run: |
+          bazel fetch @xla//... || true
+          OUTPUT_BASE=$(bazel info output_base)
+          TSL_BZL_PATH="${OUTPUT_BASE}/external/xla/xla/tsl/tsl.bzl"
+          if [ -f "$TSL_BZL_PATH" ]; then
+            echo "Found tsl.bzl at $TSL_BZL_PATH"
+            cp "$TSL_BZL_PATH" "$TSL_BZL_PATH.bak"
+            sed -i '/if_linux_x86_64.*-msse3/d' "$TSL_BZL_PATH"
+            echo "Patched tsl.bzl: removed -msse3 flag"
+            if grep -q -- '-msse3' "$TSL_BZL_PATH"; then
+              echo "ERROR: -msse3 flag still present in tsl.bzl!"
+              grep -n -- '-msse3' "$TSL_BZL_PATH"
+              exit 1
+            else
+              echo "-msse3 flag successfully removed from tsl.bzl."
+            fi
+          else
+            echo "Warning: tsl.bzl not found at $TSL_BZL_PATH, xla may not be fully fetched."
+          fi
+
+      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 标志，并打印被删除的行
+      - name: Remove all -msse3 flags from TensorFlow source tree
+        run: |
+          OUTPUT_BASE=$(bazel info output_base)
+          TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
+          if [ -d "$TF_DIR" ]; then
+            echo "Scanning $TF_DIR for files containing -msse3..."
+            # 先列出所有包含 -msse3 的行
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" -exec grep -Hn -- '-msse3' {} \; | while IFS=: read file line_num line_content; do
+              echo "Found in $file:$line_num: $line_content"
+            done
+            # 然后执行删除操作
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" -exec grep -l -- '-msse3' {} \; | while read file; do
+              echo "Patching $file"
+              cp "$file" "$file.bak"
+              sed -i '/-msse3/d' "$file"
+            done
+            echo "Patching completed."
+          else
+            echo "TensorFlow directory not found, skipping"
+          fi
+
+      # 处理 ZenDNN 和 MKL 相关文件：删除有问题的源文件，并替换 mkl_util.h 为空文件
+      - name: Handle MKL and ZenDNN files
+        run: |
+          OUTPUT_BASE=$(bazel info output_base)
+          TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
+          # 删除 ZenDNN 相关文件
+          rm -vf "$TF_DIR/tensorflow/core/common_runtime/eager/zen_eager_op_rewrite.cc"
+          rm -vf "$TF_DIR/tensorflow/core/graph/zen_graph_util.h"
+          # 删除 MKL 源文件
+          rm -vf "$TF_DIR/tensorflow/core/common_runtime/eager/mkl_eager_op_rewrite.cc"
+          # 删除原 mkl_util.h 并创建空文件（使用 printf 避免 EOF 缩进问题）
+          MKL_UTIL_H="$TF_DIR/tensorflow/core/util/mkl_util.h"
+          rm -vf "$MKL_UTIL_H"
+          mkdir -p "$(dirname "$MKL_UTIL_H")"
+          printf '%s\n' "#ifndef TENSORFLOW_CORE_UTIL_MKL_UTIL_H_" \
+                       "#define TENSORFLOW_CORE_UTIL_MKL_UTIL_H_" \
+                       "// Empty file for Android build to satisfy dependencies." \
+                       "#endif" > "$MKL_UTIL_H"
+          echo "Created empty $MKL_UTIL_H"
+
+      # 修复 hwloc：1. 删除 x86 源文件引用；2. 禁用 pthread affinity 函数
+      - name: Fetch hwloc and apply fixes
+        run: |
+          bazel fetch @hwloc//... || true
+          OUTPUT_BASE=$(bazel info output_base)
+          HWLOC_DIR="${OUTPUT_BASE}/external/hwloc"
+          if [ -d "$HWLOC_DIR" ]; then
+            echo "Found hwloc at $HWLOC_DIR"
+            BUILD_FILE="$HWLOC_DIR/BUILD.bazel"
+            if [ -f "$BUILD_FILE" ]; then
+              cp "$BUILD_FILE" "$BUILD_FILE.bak"
+              echo "Before patching BUILD file (x86 sources):"
+              grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  No x86 source found"
+              # 删除包含 topology-x86.c 和 topology-x86_64.c 的行
+              grep -v 'topology-x86.*\.c' "$BUILD_FILE" > "$BUILD_FILE.tmp"
+              mv "$BUILD_FILE.tmp" "$BUILD_FILE"
+              # 清理可能遗留的逗号
+              sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' "$BUILD_FILE"
+              echo "After patching BUILD file:"
+              grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  Success: no x86 source remaining"
+            else
+              echo "BUILD.bazel not found, skipping"
+            fi
+
+            # 修改 topology-linux.c 强制禁用 pthread affinity 函数
+            LINUX_SRC="$HWLOC_DIR/hwloc/topology-linux.c"
+            if [ -f "$LINUX_SRC" ]; then
+              cp "$LINUX_SRC" "$LINUX_SRC.bak"
+              echo "Patching $LINUX_SRC to disable pthread affinity..."
+              sed -i '/#include "private\/autogen\/config.h"/a #undef HAVE_DECL_PTHREAD_SETAFFINITY_NP\n#define HAVE_DECL_PTHREAD_SETAFFINITY_NP 0\n#undef HAVE_DECL_PTHREAD_GETAFFINITY_NP\n#define HAVE_DECL_PTHREAD_GETAFFINITY_NP 0' "$LINUX_SRC"
+              echo "Patched topology-linux.c"
+            else
+              echo "topology-linux.c not found, skipping"
+            fi
+          else
+            echo "hwloc directory not found, skipping"
+          fi
+
+      - name: Run build_android_package.sh
+        run: |
+          chmod +x ./ci/build_android_package.sh
+          echo "BAZEL_CONFIG_FLAGS = $BAZEL_CONFIG_FLAGS"
+          ./ci/build_android_package.sh
+        env:
+          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
+          BAZEL_CONFIG_FLAGS: ${{ env.BAZEL_CONFIG_FLAGS }}
+          # BUILD_LITERT_KOTLIN_API: ${{ env.BUILD_LITERT_KOTLIN_API }}
+
+      - name: List generated files
+        run: find ./ci/gen -type f
+
+      - name: Upload AAR artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: litert-android-aars
+          path: ci/gen/
+          if-no-files-found: error
