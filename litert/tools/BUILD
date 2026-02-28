@@ -486,6 +486,41 @@ cc_binary(
     ] + litert_gpu_accelerator_deps(),
 )
 
+tool_test(
+    name = "run_external_cpu_test",
+    data = [
+        "//litert/test:extern_weight_model_file",
+        "//litert/test:extern_weight_test_data",
+    ],
+    tags = [
+        "notap",
+    ],
+    tool = ":run_model",
+    tool_args = [
+        "--graph=$(location //litert/test:extern_weight_model_file)",
+        "--accelerator=cpu",
+        "--compare_numerical=true",
+    ],
+)
+
+tool_test(
+    name = "run_external_gpu_test",
+    data = [
+        "//litert/test:extern_weight_model_file",
+        "//litert/test:extern_weight_test_data",
+    ],
+    tags = [
+        "notap",
+        "requires-gpu-nvidia",
+    ],
+    tool = ":run_model",
+    tool_args = [
+        "--graph=$(location //litert/test:extern_weight_model_file)",
+        "--accelerator=gpu",
+        "--compare_numerical=true",
+    ],
+)
+
 [
     litert_device_exec(
         name = "run_model_device_{}".format(backend),
@@ -812,6 +847,8 @@ cc_library(
         "@com_google_absl//absl/log:absl_log",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
