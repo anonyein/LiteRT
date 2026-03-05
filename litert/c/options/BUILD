@@ -173,7 +173,6 @@ cc_library(
     hdrs = ["litert_gpu_options.h"],
     deps = [
         "//litert/c:litert_common",
-        "//litert/c:litert_opaque_options",
         "//litert/cc:litert_expected",
         "//litert/cc:litert_macros",
         "//litert/core:litert_toml_parser",
@@ -268,21 +267,6 @@ cc_test(
         "//litert/c:litert_opaque_options",
         "//litert/test:matchers",
         "@com_google_googletest//:gtest_main",
-    ],
-)
-
-# DARWINN ##########################################################################################
-
-cc_library(
-    name = "litert_darwinn_runtime_options",
-    srcs = ["litert_darwinn_runtime_options.cc"],
-    hdrs = ["litert_darwinn_runtime_options.h"],
-    deps = [
-        "//litert/c:litert_common",
-        "//litert/c:litert_opaque_options",
-        "//litert/cc:litert_expected",
-        "//litert/cc:litert_macros",
-        "//litert/runtime:litert_darwinn_options",
     ],
 )
 
