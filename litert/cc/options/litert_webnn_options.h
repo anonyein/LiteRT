@@ -35,6 +35,9 @@ class WebNnOptions {
   LrtWebNnOptions* Get() { return options_.get(); }
   const LrtWebNnOptions* Get() const { return options_.get(); }
 
+  LiteRtStatus GetOpaqueOptionsData(const char** identifier, void** payload,
+                                    void (**payload_deleter)(void*)) const;
+
  private:
   explicit WebNnOptions(LrtWebNnOptions* options);
 

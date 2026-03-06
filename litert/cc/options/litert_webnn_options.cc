@@ -43,4 +43,11 @@ LiteRtStatus WebNnOptions::SetPrecision(LiteRtWebNnPrecision precision) {
   return LrtSetWebNnOptionsPrecision(Get(), precision);
 }
 
+LiteRtStatus WebNnOptions::GetOpaqueOptionsData(
+    const char** identifier, void** payload,
+    void (**payload_deleter)(void*)) const {
+  return LrtGetOpaqueWebNnOptionsData(Get(), identifier, payload,
+                                      payload_deleter);
+}
+
 }  // namespace litert
