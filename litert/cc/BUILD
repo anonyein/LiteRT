@@ -733,13 +733,13 @@ cc_test(
         "//conditions:default": [],
     }),
     deps = [
+        ":litert_any",
         ":litert_common",
         ":litert_compiled_model",
         ":litert_environment",
         ":litert_environment_options",
         ":litert_expected",
-        ":litert_model",
-        "//litert/c:litert_common",
+        "//litert/cc/internal:litert_runtime_builtin",
         "//litert/test:common",
         "//litert/test:matchers",
         "//litert/test:simple_model",
@@ -1072,6 +1072,8 @@ cc_library_with_testonly_vis(
         "//litert/c/options:litert_compiler_options",
         "//litert/c/options:litert_cpu_options",
         "//litert/c/options:litert_gpu_options",
+        "//litert/c/options:litert_intel_openvino_options",
+        "//litert/c/options:litert_mediatek_options",
         "//litert/c/options:litert_qualcomm_options",
         "//litert/c/options:litert_runtime_options",
         "//litert/cc/internal:litert_handle",
@@ -1273,10 +1275,10 @@ cc_library(
         # C++ Common Options API targets.
         "//litert/cc/dynamic_runtime:litert_opaque_options",
         "//litert/cc/dynamic_runtime:litert_options",
-        "//litert/cc/dynamic_runtime/options:litert_intel_openvino_options",
         "//litert/cc/options:litert_compiler_options",
         "//litert/cc/options:litert_cpu_options",
         "//litert/cc/options:litert_gpu_options",
+        "//litert/cc/options:litert_intel_openvino_options",
         "//litert/cc/options:litert_qualcomm_options",
         # Other (static) C++ API targets.
         ":litert_any",
@@ -1319,7 +1321,7 @@ cc_library(
             "//litert/cc/dynamic_runtime:litert_op_options",
             # C++ NPU Options API targets.
             "//litert/cc/dynamic_runtime/options:litert_google_tensor_options",
-            "//litert/cc/dynamic_runtime/options:litert_mediatek_options",
+            "//litert/cc/options:litert_mediatek_options",
         ],
     }) + gles_headers(),
 )

@@ -157,6 +157,8 @@ cc_library(
         "//litert/cc:litert_macros",
         "//litert/core:environment",
         "//litert/runtime/accelerators:auto_registration",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
     ] + select({
         "//litert/build_common:build_include_gpu_enabled": [
@@ -501,6 +503,8 @@ cc_library(
         "//litert/cc:litert_macros",
         "//litert/runtime:compiled_model",
         "//tflite/c:c_api_types",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/types:span",
     ],
     # Keep symbols in libLiteRt.dylib.
@@ -706,7 +710,6 @@ LITERT_C_API_COMMON_DEPS = [
     "//litert/c/options:litert_gpu_options",
     "//litert/c/options:litert_mediatek_options",
     "//litert/c/options:litert_qualcomm_options",
-    "//litert/c/options:litert_intel_openvino_options",
 ]
 
 # This test verifies that the C API header files can build via C compiler.
@@ -718,6 +721,7 @@ cc_test(
     deps = LITERT_C_API_COMMON_DEPS + [
         ":litert_profiler_event",
         "//litert/c/options:litert_compiler_options",
+        "//litert/c/options:litert_intel_openvino_options",
         "//litert/c/options:litert_runtime_options",
         "//litert/c/options:litert_webnn_options",
     ],
