@@ -566,6 +566,7 @@ cc_library(
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
+        "//litert/c/options:litert_cpu_options",
         "//litert/c:litert_any",
         "//litert/c:litert_common",
         "//litert/c:litert_environment_options_header",
@@ -624,11 +625,13 @@ cc_library(
         "//litert/build_common:litert_disable_cpu": [
             # No support for CPU backend. Builtin ops are still needed for GPU.
             "//tflite/kernels:builtin_ops",
+            "//tflite/kernels:reference_ops",
         ],
         "//conditions:default": [
             ":litert_cpu_options",
             "//litert/runtime/accelerators/xnnpack:xnnpack_accelerator",  # buildcleaner: keep
             "//tflite/kernels:builtin_ops",
+            "//tflite/kernels:reference_ops",
         ],
     }),
 )
@@ -842,6 +845,7 @@ cc_library(
     hdrs = ["litert_cpu_options.h"],
     deps = [
         "//litert/c:litert_common",
+        "//litert/c/options:litert_cpu_options",
         "//litert/cc:litert_macros",
         "//litert/core:litert_toml_parser",
         "//tflite/delegates/xnnpack:xnnpack_delegate",
