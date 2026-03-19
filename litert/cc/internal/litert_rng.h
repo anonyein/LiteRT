@@ -488,8 +488,12 @@ class RandomTensorType {
 };
 
 template <size_t Rank, size_t MaxSize, LiteRtElementType... ElementType>
-const auto RandomTensorType<Rank, MaxSize, ElementType...>::kMaxDimSize =
-    MaxDimSize();
+const typename RandomTensorType<Rank, MaxSize, ElementType...>::DimSize
+    RandomTensorType<Rank, MaxSize, ElementType...>::kMaxDimSize =
+        RandomTensorType<Rank, MaxSize, ElementType...>::MaxDimSize();
+
+template <typename>
+inline constexpr bool kUnsupportedRandomTensorDataType = false;
 
 // RANDOM TENSOR DATA //////////////////////////////////////////////////////////
 
@@ -628,7 +632,7 @@ class RandomTensorDataBuilder {
         return {static_cast<double>(min), static_cast<double>(max)};
       }
     } else {
-      static_assert(false, "Unsupported type");
+      static_assert(kUnsupportedRandomTensorDataType<D>, "Unsupported type");
     }
   }
 
@@ -677,7 +681,7 @@ class RandomTensorDataBuilder {
         return Functor()(data, std::forward<Args>(args)...);
       }
     } else {
-      static_assert(false, "Unsupported type");
+      static_assert(kUnsupportedRandomTensorDataType<D>, "Unsupported type");
     }
   }
 
