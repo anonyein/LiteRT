@@ -27,6 +27,14 @@ http_archive(
     ],
 )
 
+# Lower the version from 1.24.5 that tensorflow uses to 1.23.1, the highest version which don't have
+# issues with missing LC_UUID, DEVELOPER_DIR or SDKROOT on MacOS Tahoe.
+http_archive(
+    name = "build_bazel_apple_support",
+    sha256 = "ee20cc5c0bab47065473c8033d462374dd38d172406ecc8de5c8f08487943f2f",
+    url = "https://github.com/bazelbuild/apple_support/releases/download/1.23.1/apple_support.1.23.1.tar.gz",
+)
+
 # Download coremltools of the same version of tensorflow, but with a custom patchcmd until
 # tensorflow is updated to do the same patchcmd.
 http_archive(
@@ -48,9 +56,9 @@ tensorflow_source_repo(
     name = "org_tensorflow",
     patches = ["//:PATCH.tf_xla_tsl_win_copts"],
     protobuf_patches = ["//:PATCH.protobuf_port_msvc_compat"],
-    sha256 = "91a075b8b6e0c1f94ca8d29ba04c2d49ab6f68de38bf8ba5380123aa0e0e3999",
-    strip_prefix = "tensorflow-e93514726bee0c764f856cab9aa4c6b4c040bb06",
-    urls = ["https://github.com/tensorflow/tensorflow/archive/e93514726bee0c764f856cab9aa4c6b4c040bb06.tar.gz"],
+    sha256 = "ce01a4c6d72a4641baac24a92b8d3babd9a910a88c1abacbf33b6c5a71d652e4",
+    strip_prefix = "tensorflow-dce6e6d13734c5e879f4cd2d7ad5cf84af2097e7",
+    urls = ["https://github.com/tensorflow/tensorflow/archive/dce6e6d13734c5e879f4cd2d7ad5cf84af2097e7.tar.gz"],
 )
 
 # Initialize the TensorFlow repository and all dependencies.
