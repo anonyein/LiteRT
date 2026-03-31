@@ -32,6 +32,15 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+      
+      # 新增：强制同步子模块并清理缓存
+      - name: Force update submodules
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive --force
+      
+      - name: Clean Bazel cache
+        run: bazel clean --expunge
 
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
