@@ -104,6 +104,13 @@ jobs:
           cat WORKSPACE >> WORKSPACE.new
           mv WORKSPACE.new WORKSPACE
           echo "✅ WORKSPACE patched: local_repository inserted at top"
+
+      - name: Modify build script to force XNNPACK override
+        run: |
+          cp ci/build_android_package.sh ci/build_android_package.sh.bak
+          # 在 bazel build 命令中插入 --override_repository
+          sed -i 's/bazel build/bazel build --override_repository=xnnpack=\/tmp\/xnnpack /' ci/build_android_package.sh
+          echo "Patched build script to add XNNPACK override"
       # =================================================
 
       - name: Setup Bazel
