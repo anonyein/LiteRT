@@ -36,11 +36,10 @@ jobs:
       # ========== 修复 XNNPACK 版本不匹配 ==========
       - name: Use XNNPACK version with required API
         run: |
-          # 克隆包含 xnn_define_static_constant_pad_v2 的 XNNPACK 版本（使用包含该函数的最新稳定 commit）
-          # 若需要特定 commit，可指定；此处使用最新 main 分支，已验证包含所需函数
+          # 克隆包含所需 API 的 XNNPACK 版本
           git clone --depth 1 https://github.com/google/XNNPACK.git /tmp/xnnpack
           cd /tmp/xnnpack
-          # 可选：回退到特定已知包含该函数的 commit（如 0374903756f122a2859d28d0b8f4d1374aa3ff90）
+          # 可选：切换到特定 commit（若需要）
           # git checkout 0374903756f122a2859d28d0b8f4d1374aa3ff90
           cd -
           echo "XNNPACK cloned to /tmp/xnnpack"
@@ -53,25 +52,45 @@ jobs:
             exit 1
           fi
 
-          # 查找所有 WORKSPACE 和 .bzl 文件，注释掉其中定义 xnnpack 的 http_archive/tf_http_archive 块
-          find . -name "WORKSPACE" -o -name "*.bzl" | while read file; do
-            if grep -q 'name\s*=\s*"xnnpack"' "$file"; then
-              echo "Processing $file"
-              # 使用 Python 注释整个 http_archive/tf_http_archive 块
-              python3 <<-EOF
-              import re
-              with open("$file", "r") as f:
+          # 创建 Python 脚本用于注释 WORKSPACE 和 .bzl 中的定义
+          cat > /tmp/comment_xnnpack.py << 'PYEOF'
+          import re
+          import sys
+          import os
+
+          def process_file(filepath):
+              with open(filepath, 'r') as f:
                   content = f.read()
               # 匹配 http_archive 或 tf_http_archive 块，其中 name = "xnnpack"
-              pattern = r'^(?P<indent>\s*)(?:tf_)?http_archive\(\s*name\s*=\s*"xnnpack",.*?\)\s*(?:\n|$)'
-              new_content, count = re.subn(pattern, lambda m: m.group(0).replace(m.group(0), '# ' + m.group(0).replace('\n', '\n# ')), content, flags=re.DOTALL|re.MULTILINE)
+              pattern = re.compile(
+                  r'^(?P<indent>\s*)(?:tf_)?http_archive\(\s*name\s*=\s*"xnnpack",.*?\)\s*(?:\n|$)',
+                  re.DOTALL | re.MULTILINE
+              )
+              new_content, count = pattern.subn(
+                  lambda m: '# ' + m.group(0).replace('\n', '\n# '),
+                  content
+              )
               if count:
-                  with open("$file", "w") as f:
+                  with open(filepath, 'w') as f:
                       f.write(new_content)
-                  print(f"  Commented {count} definition(s) in $file")
-              EOF
-            fi
-          done
+                  print(f"  Commented {count} definition(s) in {filepath}")
+              return count
+
+          if __name__ == "__main__":
+              total = 0
+              for root, dirs, files in os.walk('.'):
+                  for file in files:
+                      if file == 'WORKSPACE' or file.endswith('.bzl'):
+                          filepath = os.path.join(root, file)
+                          # 快速检查是否包含 xnnpack 的 http_archive 定义
+                          with open(filepath, 'r') as f:
+                              content_snippet = f.read(4096)
+                          if 'name' in content_snippet and 'xnnpack' in content_snippet:
+                              total += process_file(filepath)
+              print(f"Total definitions commented: {total}")
+          PYEOF
+
+          python3 /tmp/comment_xnnpack.py
 
           # 在 WORKSPACE 最前面插入 local_repository 定义，确保优先级最高
           cat > WORKSPACE.new << 'EOF'
