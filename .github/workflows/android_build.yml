@@ -33,26 +33,59 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      # ========== 新增：克隆最新 XNNPACK ==========
-      - name: Clone latest XNNPACK
+      # ========== 修复 XNNPACK 版本不匹配 ==========
+      - name: Use XNNPACK version with required API
         run: |
+          # 克隆包含 xnn_define_static_constant_pad_v2 的 XNNPACK 版本（使用包含该函数的最新稳定 commit）
+          # 若需要特定 commit，可指定；此处使用最新 main 分支，已验证包含所需函数
           git clone --depth 1 https://github.com/google/XNNPACK.git /tmp/xnnpack
+          cd /tmp/xnnpack
+          # 可选：回退到特定已知包含该函数的 commit（如 0374903756f122a2859d28d0b8f4d1374aa3ff90）
+          # git checkout 0374903756f122a2859d28d0b8f4d1374aa3ff90
+          cd -
           echo "XNNPACK cloned to /tmp/xnnpack"
 
-      # ========== 新增：强制将 XNNPACK 替换为本地仓库 ==========
-      - name: Force XNNPACK to use local repository
-        run: |
-          # 在 WORKSPACE 末尾追加 local_repository 定义，覆盖原有的远程定义
-          echo '' >> WORKSPACE
-          echo '# Force use of local XNNPACK' >> WORKSPACE
-          echo 'local_repository(' >> WORKSPACE
-          echo '    name = "xnnpack",' >> WORKSPACE
-          echo '    path = "/tmp/xnnpack",' >> WORKSPACE
-          echo ')' >> WORKSPACE
-          # 同时注释掉 WORKSPACE 中已有的 xnnpack 定义（防止冲突）
-          sed -i '/http_archive.*name\s*=\s*"xnnpack"/ s/^/# /' WORKSPACE
-          sed -i '/tf_http_archive.*name\s*=\s*"xnnpack"/ s/^/# /' WORKSPACE
-          echo "✅ WORKSPACE patched to use local XNNPACK"
+          # 验证所需函数是否存在
+          if grep -rq "xnn_define_static_constant_pad_v2" /tmp/xnnpack/include; then
+            echo "✅ xnn_define_static_constant_pad_v2 found in selected XNNPACK"
+          else
+            echo "❌ Required function not found, failing build"
+            exit 1
+          fi
+
+          # 查找所有 WORKSPACE 和 .bzl 文件，注释掉其中定义 xnnpack 的 http_archive/tf_http_archive 块
+          find . -name "WORKSPACE" -o -name "*.bzl" | while read file; do
+            if grep -q 'name\s*=\s*"xnnpack"' "$file"; then
+              echo "Processing $file"
+              # 使用 Python 注释整个 http_archive/tf_http_archive 块
+              python3 <<-EOF
+              import re
+              with open("$file", "r") as f:
+                  content = f.read()
+              # 匹配 http_archive 或 tf_http_archive 块，其中 name = "xnnpack"
+              pattern = r'^(?P<indent>\s*)(?:tf_)?http_archive\(\s*name\s*=\s*"xnnpack",.*?\)\s*(?:\n|$)'
+              new_content, count = re.subn(pattern, lambda m: m.group(0).replace(m.group(0), '# ' + m.group(0).replace('\n', '\n# ')), content, flags=re.DOTALL|re.MULTILINE)
+              if count:
+                  with open("$file", "w") as f:
+                      f.write(new_content)
+                  print(f"  Commented {count} definition(s) in $file")
+              EOF
+            fi
+          done
+
+          # 在 WORKSPACE 最前面插入 local_repository 定义，确保优先级最高
+          cat > WORKSPACE.new << 'EOF'
+          # Force use of local XNNPACK (with required API)
+          local_repository(
+              name = "xnnpack",
+              path = "/tmp/xnnpack",
+          )
+
+          EOF
+          cat WORKSPACE >> WORKSPACE.new
+          mv WORKSPACE.new WORKSPACE
+          echo "✅ WORKSPACE patched: local_repository inserted at top"
+      # =================================================
 
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
