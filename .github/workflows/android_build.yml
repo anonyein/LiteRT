@@ -46,50 +46,6 @@ jobs:
             exit 1
           fi
 
-      # ========== 新增：替换 WORKSPACE 中的 XNNPACK 定义为本地仓库（通用方法） ==========
-      - name: Replace XNNPACK dependency in WORKSPACE with local repository
-        run: |
-          cat > /tmp/fix_xnnpack.py << 'EOF'
-          import re
-          workspace_path = "WORKSPACE"
-          with open(workspace_path, "r") as f:
-              content = f.read()
-
-          # 查找所有 http_archive 或 tf_http_archive 中 name 包含 xnnpack 的块
-          pattern = r'(?:tf_)?http_archive\(\s*name\s*=\s*"[^"]*xnnpack[^"]*",.*?\)\s*(?:\n|$)'
-          replacement = '''local_repository(
-              name = "xnnpack",
-              path = "/tmp/xnnpack",
-          )'''
-          new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
-
-          if count == 0:
-              # 未找到标准块，尝试注释掉相关行并在末尾添加 local_repository
-              lines = content.split('\n')
-              new_lines = []
-              found = False
-              for line in lines:
-                  if 'http_archive' in line and 'xnnpack' in line.lower():
-                      new_lines.append('# ' + line)  # 注释掉
-                      found = True
-                  else:
-                      new_lines.append(line)
-              if found:
-                  new_lines.append('')  # 空行
-                  new_lines.append(replacement.rstrip())
-                  new_content = '\n'.join(new_lines)
-                  count = 1
-              else:
-                  print("ERROR: Could not find any http_archive definition for xnnpack in WORKSPACE")
-                  exit(1)
-
-          with open(workspace_path, "w") as f:
-              f.write(new_content)
-
-          print(f"✅ WORKSPACE updated (replaced/added {count} definition(s))")
-          EOF
-          python3 /tmp/fix_xnnpack.py
-
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
         with:
@@ -300,6 +256,7 @@ jobs:
             echo "hwloc directory not found, skipping"
           fi
 
+      # ========== 构建步骤：使用 --override_repository 强制使用最新 XNNPACK ==========
       - name: Run build_android_package.sh
         run: |
           chmod +x ./ci/build_android_package.sh
@@ -307,7 +264,7 @@ jobs:
           ./ci/build_android_package.sh
         env:
           RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
-          BAZEL_CONFIG_FLAGS: ${{ env.BAZEL_CONFIG_FLAGS }}
+          BAZEL_CONFIG_FLAGS: "${{ env.BAZEL_CONFIG_FLAGS }} --override_repository=xnnpack=/tmp/xnnpack"
 
       - name: List generated files
         run: find ./ci/gen -type f
