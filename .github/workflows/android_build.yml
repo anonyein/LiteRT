@@ -105,13 +105,29 @@ jobs:
           mv WORKSPACE.new WORKSPACE
           echo "✅ WORKSPACE patched: local_repository inserted at top"
 
-      - name: Modify build script to force XNNPACK override
+      - name: Force XNNPACK override (double insurance)
         run: |
+          # 1. 在 WORKSPACE 最前面插入 local_repository，优先级最高
+          cat > WORKSPACE.new << 'EOF'
+          # Force use of local XNNPACK
+          local_repository(
+              name = "xnnpack",
+              path = "/tmp/xnnpack",
+          )
+
+          EOF
+          cat WORKSPACE >> WORKSPACE.new
+          mv WORKSPACE.new WORKSPACE
+          echo "✅ Inserted local_repository at top of WORKSPACE"
+
+          # 2. 修改构建脚本，在所有 bazel build 命令中强制添加 --override_repository
           cp ci/build_android_package.sh ci/build_android_package.sh.bak
-          # 在 bazel build 命令中插入 --override_repository
-          sed -i 's/bazel build/bazel build --override_repository=xnnpack=\/tmp\/xnnpack /' ci/build_android_package.sh
-          echo "Patched build script to add XNNPACK override"
-      # =================================================
+          # 替换所有 "bazel build" 为 "bazel build --override_repository=xnnpack=/tmp/xnnpack"
+          # 注意：sed 的 'g' 标志确保一行内多次出现也被替换（但本脚本每行只有一个）
+          sed -i 's/bazel build/bazel build --override_repository=xnnpack=\/tmp\/xnnpack /g' ci/build_android_package.sh
+          echo "✅ Patched build script with --override_repository"
+      # ==============================================
+
 
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
@@ -326,6 +342,8 @@ jobs:
       - name: Run build_android_package.sh
         run: |
           chmod +x ./ci/build_android_package.sh
+          echo "First few lines of patched script to verify override:"
+          grep -n "bazel build" ci/build_android_package.sh | head -5
           echo "BAZEL_CONFIG_FLAGS = $BAZEL_CONFIG_FLAGS"
           ./ci/build_android_package.sh
         env:
