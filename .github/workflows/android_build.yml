@@ -46,7 +46,7 @@ jobs:
             exit 1
           fi
 
-      # ========== 新增：替换 WORKSPACE 中的 XNNPACK 定义为本地仓库 ==========
+      # ========== 新增：替换 WORKSPACE 中的 XNNPACK 定义为本地仓库（通用方法） ==========
       - name: Replace XNNPACK dependency in WORKSPACE with local repository
         run: |
           cat > /tmp/fix_xnnpack.py << 'EOF'
@@ -54,18 +54,39 @@ jobs:
           workspace_path = "WORKSPACE"
           with open(workspace_path, "r") as f:
               content = f.read()
-          pattern = r'http_archive\(\s*name\s*=\s*"xnnpack",.*?\)\s*(?:\n|$)'
+
+          # 查找所有 http_archive 或 tf_http_archive 中 name 包含 xnnpack 的块
+          pattern = r'(?:tf_)?http_archive\(\s*name\s*=\s*"[^"]*xnnpack[^"]*",.*?\)\s*(?:\n|$)'
           replacement = '''local_repository(
               name = "xnnpack",
               path = "/tmp/xnnpack",
           )'''
           new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
+
           if count == 0:
-              print("ERROR: Could not find http_archive definition for xnnpack in WORKSPACE")
-              exit(1)
+              # 未找到标准块，尝试注释掉相关行并在末尾添加 local_repository
+              lines = content.split('\n')
+              new_lines = []
+              found = False
+              for line in lines:
+                  if 'http_archive' in line and 'xnnpack' in line.lower():
+                      new_lines.append('# ' + line)  # 注释掉
+                      found = True
+                  else:
+                      new_lines.append(line)
+              if found:
+                  new_lines.append('')  # 空行
+                  new_lines.append(replacement.rstrip())
+                  new_content = '\n'.join(new_lines)
+                  count = 1
+              else:
+                  print("ERROR: Could not find any http_archive definition for xnnpack in WORKSPACE")
+                  exit(1)
+
           with open(workspace_path, "w") as f:
               f.write(new_content)
-          print(f"✅ WORKSPACE updated: replaced {count} http_archive with local_repository for xnnpack")
+
+          print(f"✅ WORKSPACE updated (replaced/added {count} definition(s))")
           EOF
           python3 /tmp/fix_xnnpack.py
 
