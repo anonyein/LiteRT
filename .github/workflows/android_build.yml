@@ -33,101 +33,26 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      # ========== 修复 XNNPACK 版本不匹配 ==========
-      - name: Use XNNPACK version with required API
+      # ========== 修复 XNNPACK 版本 ==========
+      - name: Clone latest XNNPACK
         run: |
-          # 克隆包含所需 API 的 XNNPACK 版本
           git clone --depth 1 https://github.com/google/XNNPACK.git /tmp/xnnpack
-          cd /tmp/xnnpack
-          # 可选：切换到特定 commit（若需要）
-          # git checkout 0374903756f122a2859d28d0b8f4d1374aa3ff90
-          cd -
           echo "XNNPACK cloned to /tmp/xnnpack"
-
-          # 验证所需函数是否存在
           if grep -rq "xnn_define_static_constant_pad_v2" /tmp/xnnpack/include; then
-            echo "✅ xnn_define_static_constant_pad_v2 found in selected XNNPACK"
+            echo "✅ xnn_define_static_constant_pad_v2 found"
           else
-            echo "❌ Required function not found, failing build"
+            echo "❌ Required function not found"
             exit 1
           fi
 
-          # 创建 Python 脚本用于注释 WORKSPACE 和 .bzl 中的定义
-          cat > /tmp/comment_xnnpack.py << 'PYEOF'
-          import re
-          import sys
-          import os
-
-          def process_file(filepath):
-              with open(filepath, 'r') as f:
-                  content = f.read()
-              # 匹配 http_archive 或 tf_http_archive 块，其中 name = "xnnpack"
-              pattern = re.compile(
-                  r'^(?P<indent>\s*)(?:tf_)?http_archive\(\s*name\s*=\s*"xnnpack",.*?\)\s*(?:\n|$)',
-                  re.DOTALL | re.MULTILINE
-              )
-              new_content, count = pattern.subn(
-                  lambda m: '# ' + m.group(0).replace('\n', '\n# '),
-                  content
-              )
-              if count:
-                  with open(filepath, 'w') as f:
-                      f.write(new_content)
-                  print(f"  Commented {count} definition(s) in {filepath}")
-              return count
-
-          if __name__ == "__main__":
-              total = 0
-              for root, dirs, files in os.walk('.'):
-                  for file in files:
-                      if file == 'WORKSPACE' or file.endswith('.bzl'):
-                          filepath = os.path.join(root, file)
-                          # 快速检查是否包含 xnnpack 的 http_archive 定义
-                          with open(filepath, 'r') as f:
-                              content_snippet = f.read(4096)
-                          if 'name' in content_snippet and 'xnnpack' in content_snippet:
-                              total += process_file(filepath)
-              print(f"Total definitions commented: {total}")
-          PYEOF
-
-          python3 /tmp/comment_xnnpack.py
-
-          # 在 WORKSPACE 最前面插入 local_repository 定义，确保优先级最高
-          cat > WORKSPACE.new << 'EOF'
-          # Force use of local XNNPACK (with required API)
-          local_repository(
-              name = "xnnpack",
-              path = "/tmp/xnnpack",
-          )
-
-          EOF
-          cat WORKSPACE >> WORKSPACE.new
-          mv WORKSPACE.new WORKSPACE
-          echo "✅ WORKSPACE patched: local_repository inserted at top"
-
-      - name: Force XNNPACK override (double insurance)
+      - name: Inject XNNPACK override into build script
         run: |
-          # 1. 在 WORKSPACE 最前面插入 local_repository，优先级最高
-          cat > WORKSPACE.new << 'EOF'
-          # Force use of local XNNPACK
-          local_repository(
-              name = "xnnpack",
-              path = "/tmp/xnnpack",
-          )
-
-          EOF
-          cat WORKSPACE >> WORKSPACE.new
-          mv WORKSPACE.new WORKSPACE
-          echo "✅ Inserted local_repository at top of WORKSPACE"
-
-          # 2. 修改构建脚本，在所有 bazel build 命令中强制添加 --override_repository
-          cp ci/build_android_package.sh ci/build_android_package.sh.bak
-          # 替换所有 "bazel build" 为 "bazel build --override_repository=xnnpack=/tmp/xnnpack"
-          # 注意：sed 的 'g' 标志确保一行内多次出现也被替换（但本脚本每行只有一个）
-          sed -i 's/bazel build/bazel build --override_repository=xnnpack=\/tmp\/xnnpack /g' ci/build_android_package.sh
-          echo "✅ Patched build script with --override_repository"
-      # ==============================================
-
+          # 在 BUILD_FLAGS 数组定义之后，追加 --override_repository
+          # 找到 BUILD_FLAGS 数组的结束位置（通常是 BUILD_FLAGS+=(${BAZEL_CONFIG_FLAGS}) 后面）
+          # 我们在该行后插入一行添加 override
+          sed -i '/BUILD_FLAGS+=(\${BAZEL_CONFIG_FLAGS})/a BUILD_FLAGS+=("--override_repository=xnnpack=/tmp/xnnpack")' ci/build_android_package.sh
+          echo "✅ Patched build script with override flag"
+      # ======================================
 
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
@@ -343,7 +268,7 @@ jobs:
         run: |
           chmod +x ./ci/build_android_package.sh
           echo "First few lines of patched script to verify override:"
-          grep -n "bazel build" ci/build_android_package.sh | head -5
+          grep -n "BUILD_FLAGS" ci/build_android_package.sh | head -10
           echo "BAZEL_CONFIG_FLAGS = $BAZEL_CONFIG_FLAGS"
           ./ci/build_android_package.sh
         env:
