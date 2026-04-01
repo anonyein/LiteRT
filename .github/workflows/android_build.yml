@@ -33,26 +33,22 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      # ========== 修复 XNNPACK 版本 ==========
-      - name: Clone latest XNNPACK
+      # ========== 唯一新增修复步骤：强制使用包含所需 API 的 XNNPACK ==========
+      - name: Force XNNPACK version with required API
         run: |
+          # 克隆最新 XNNPACK 到临时目录
           git clone --depth 1 https://github.com/google/XNNPACK.git /tmp/xnnpack
-          echo "XNNPACK cloned to /tmp/xnnpack"
+          # 验证所需函数存在
           if grep -rq "xnn_define_static_constant_pad_v2" /tmp/xnnpack/include; then
-            echo "✅ xnn_define_static_constant_pad_v2 found"
+            echo "✅ xnn_define_static_constant_pad_v2 found in selected XNNPACK"
           else
-            echo "❌ Required function not found"
+            echo "❌ Required function not found, failing build"
             exit 1
           fi
-
-      - name: Inject XNNPACK override into build script
-        run: |
-          # 在 BUILD_FLAGS 数组定义之后，追加 --override_repository
-          # 找到 BUILD_FLAGS 数组的结束位置（通常是 BUILD_FLAGS+=(${BAZEL_CONFIG_FLAGS}) 后面）
-          # 我们在该行后插入一行添加 override
-          sed -i '/BUILD_FLAGS+=(\${BAZEL_CONFIG_FLAGS})/a BUILD_FLAGS+=("--override_repository=xnnpack=/tmp/xnnpack")' ci/build_android_package.sh
-          echo "✅ Patched build script with override flag"
-      # ======================================
+          # 修改构建脚本：在所有 bazel build 命令前插入 --override_repository 全局标志
+          sed -i 's/\bbazel build\b/bazel --override_repository=xnnpack=\/tmp\/xnnpack build/g' ci/build_android_package.sh
+          echo "✅ Patched build script to use local XNNPACK"
+      # =====================================================================
 
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
