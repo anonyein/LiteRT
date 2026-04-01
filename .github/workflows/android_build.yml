@@ -33,33 +33,18 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      # ========== 新增：强制同步子模块并清理缓存 ==========
-      - name: Force update submodules
+      # ========== 修复：使用最新 XNNPACK 覆盖 ==========
+      - name: Clone latest XNNPACK
         run: |
-          git submodule sync --recursive
-          git submodule update --init --recursive --force
-
-      - name: Clean Bazel cache
-        run: bazel clean --expunge
-
-      # ========== 可选：检查 XNNPACK 版本（诊断用） ==========
-      - name: Check XNNPACK version
-        run: |
-          if [ -d "third_party/xnnpack" ]; then
-            cd third_party/xnnpack
-            echo "XNNPACK submodule commit: $(git log -1 --oneline)"
-            # 检查是否包含所需函数
-            if grep -rq "xnn_define_static_constant_pad_v2" include; then
-              echo "✅ xnn_define_static_constant_pad_v2 found in headers"
-            else
-              echo "⚠️ xnn_define_static_constant_pad_v2 NOT found in headers"
-            fi
-            cd -
+          git clone --depth 1 https://github.com/google/XNNPACK.git /tmp/xnnpack
+          echo "XNNPACK cloned to /tmp/xnnpack"
+          # 验证所需函数是否存在（可选）
+          if grep -rq "xnn_define_static_constant_pad_v2" /tmp/xnnpack/include; then
+            echo "✅ xnn_define_static_constant_pad_v2 found in latest XNNPACK"
           else
-            echo "XNNPACK submodule not found at third_party/xnnpack, trying other paths..."
-            find . -type d -name "xnnpack" -path "*/third_party/*" -exec echo "Found: {}" \;
+            echo "❌ Required function not found, failing build"
+            exit 1
           fi
-      # ===================================================
 
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
@@ -271,6 +256,7 @@ jobs:
             echo "hwloc directory not found, skipping"
           fi
 
+      # ========== 构建步骤（使用最新的 XNNPACK） ==========
       - name: Run build_android_package.sh
         run: |
           chmod +x ./ci/build_android_package.sh
@@ -278,8 +264,8 @@ jobs:
           ./ci/build_android_package.sh
         env:
           RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
-          BAZEL_CONFIG_FLAGS: ${{ env.BAZEL_CONFIG_FLAGS }}
-          # BUILD_LITERT_KOTLIN_API: ${{ env.BUILD_LITERT_KOTLIN_API }}
+          # 关键：添加 --override_repository 覆盖 XNNPACK 依赖
+          BAZEL_CONFIG_FLAGS: "${{ env.BAZEL_CONFIG_FLAGS }} --override_repository=xnnpack=/tmp/xnnpack"
 
       - name: List generated files
         run: find ./ci/gen -type f
