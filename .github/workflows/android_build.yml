@@ -33,22 +33,24 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      # ========== 唯一新增修复步骤：强制使用包含所需 API 的 XNNPACK ==========
-      - name: Force XNNPACK version with required API
+      # ========== 唯一修复：提供包含新 API 的 XNNPACK ==========
+      - name: Clone latest XNNPACK
         run: |
-          # 克隆最新 XNNPACK 到临时目录
           git clone --depth 1 https://github.com/google/XNNPACK.git /tmp/xnnpack
-          # 验证所需函数存在
           if grep -rq "xnn_define_static_constant_pad_v2" /tmp/xnnpack/include; then
-            echo "✅ xnn_define_static_constant_pad_v2 found in selected XNNPACK"
+            echo "✅ xnn_define_static_constant_pad_v2 found"
           else
-            echo "❌ Required function not found, failing build"
+            echo "❌ Required function not found"
             exit 1
           fi
-          # 修改构建脚本：在所有 bazel build 命令前插入 --override_repository 全局标志
-          sed -i 's/\bbazel build\b/bazel --override_repository=xnnpack=\/tmp\/xnnpack build/g' ci/build_android_package.sh
-          echo "✅ Patched build script to use local XNNPACK"
-      # =====================================================================
+          echo "XNNPACK cloned to /tmp/xnnpack"
+
+      - name: Inject correct XNNPACK override (uppercase repo name)
+        run: |
+          # 修改构建脚本，使用正确的仓库名 XNNPACK
+          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack /g' ci/build_android_package.sh
+          echo "✅ Patched build script with --override_repository=XNNPACK=/tmp/xnnpack"
+      # ======================================================
 
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
@@ -264,7 +266,7 @@ jobs:
         run: |
           chmod +x ./ci/build_android_package.sh
           echo "First few lines of patched script to verify override:"
-          grep -n "BUILD_FLAGS" ci/build_android_package.sh | head -10
+          grep -n "bazel build" ci/build_android_package.sh | head -5
           echo "BAZEL_CONFIG_FLAGS = $BAZEL_CONFIG_FLAGS"
           ./ci/build_android_package.sh
         env:
