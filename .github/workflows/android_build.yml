@@ -32,15 +32,34 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
-      
-      # 新增：强制同步子模块并清理缓存
+
+      # ========== 新增：强制同步子模块并清理缓存 ==========
       - name: Force update submodules
         run: |
           git submodule sync --recursive
           git submodule update --init --recursive --force
-      
+
       - name: Clean Bazel cache
         run: bazel clean --expunge
+
+      # ========== 可选：检查 XNNPACK 版本（诊断用） ==========
+      - name: Check XNNPACK version
+        run: |
+          if [ -d "third_party/xnnpack" ]; then
+            cd third_party/xnnpack
+            echo "XNNPACK submodule commit: $(git log -1 --oneline)"
+            # 检查是否包含所需函数
+            if grep -rq "xnn_define_static_constant_pad_v2" include; then
+              echo "✅ xnn_define_static_constant_pad_v2 found in headers"
+            else
+              echo "⚠️ xnn_define_static_constant_pad_v2 NOT found in headers"
+            fi
+            cd -
+          else
+            echo "XNNPACK submodule not found at third_party/xnnpack, trying other paths..."
+            find . -type d -name "xnnpack" -path "*/third_party/*" -exec echo "Found: {}" \;
+          fi
+      # ===================================================
 
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
