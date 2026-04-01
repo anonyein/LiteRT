@@ -49,30 +49,25 @@ jobs:
       # ========== 新增：替换 WORKSPACE 中的 XNNPACK 定义为本地仓库 ==========
       - name: Replace XNNPACK dependency in WORKSPACE with local repository
         run: |
-          python3 << 'EOF'
+          cat > /tmp/fix_xnnpack.py << 'EOF'
           import re
           workspace_path = "WORKSPACE"
           with open(workspace_path, "r") as f:
               content = f.read()
-
-          # 匹配 http_archive 块，其中 name = "xnnpack"
-          # 使用非贪婪匹配，支持多行定义，忽略中间注释和换行
           pattern = r'http_archive\(\s*name\s*=\s*"xnnpack",.*?\)\s*(?:\n|$)'
           replacement = '''local_repository(
-    name = "xnnpack",
-    path = "/tmp/xnnpack",
-)'''
+              name = "xnnpack",
+              path = "/tmp/xnnpack",
+          )'''
           new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
-
           if count == 0:
               print("ERROR: Could not find http_archive definition for xnnpack in WORKSPACE")
               exit(1)
-
           with open(workspace_path, "w") as f:
               f.write(new_content)
-
           print(f"✅ WORKSPACE updated: replaced {count} http_archive with local_repository for xnnpack")
           EOF
+          python3 /tmp/fix_xnnpack.py
 
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
