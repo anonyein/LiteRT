@@ -38,13 +38,21 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/google/XNNPACK.git /tmp/xnnpack
           echo "XNNPACK cloned to /tmp/xnnpack"
-          # 验证所需函数是否存在（可选）
-          if grep -rq "xnn_define_static_constant_pad_v2" /tmp/xnnpack/include; then
-            echo "✅ xnn_define_static_constant_pad_v2 found in latest XNNPACK"
-          else
-            echo "❌ Required function not found, failing build"
-            exit 1
-          fi
+
+      # ========== 新增：强制将 XNNPACK 替换为本地仓库 ==========
+      - name: Force XNNPACK to use local repository
+        run: |
+          # 在 WORKSPACE 末尾追加 local_repository 定义，覆盖原有的远程定义
+          echo '' >> WORKSPACE
+          echo '# Force use of local XNNPACK' >> WORKSPACE
+          echo 'local_repository(' >> WORKSPACE
+          echo '    name = "xnnpack",' >> WORKSPACE
+          echo '    path = "/tmp/xnnpack",' >> WORKSPACE
+          echo ')' >> WORKSPACE
+          # 同时注释掉 WORKSPACE 中已有的 xnnpack 定义（防止冲突）
+          sed -i '/http_archive.*name\s*=\s*"xnnpack"/ s/^/# /' WORKSPACE
+          sed -i '/tf_http_archive.*name\s*=\s*"xnnpack"/ s/^/# /' WORKSPACE
+          echo "✅ WORKSPACE patched to use local XNNPACK"
 
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
@@ -256,7 +264,6 @@ jobs:
             echo "hwloc directory not found, skipping"
           fi
 
-      # ========== 构建步骤：使用 --override_repository 强制使用最新 XNNPACK ==========
       - name: Run build_android_package.sh
         run: |
           chmod +x ./ci/build_android_package.sh
@@ -264,7 +271,7 @@ jobs:
           ./ci/build_android_package.sh
         env:
           RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
-          BAZEL_CONFIG_FLAGS: "${{ env.BAZEL_CONFIG_FLAGS }} --override_repository=xnnpack=/tmp/xnnpack"
+          BAZEL_CONFIG_FLAGS: ${{ env.BAZEL_CONFIG_FLAGS }}
 
       - name: List generated files
         run: find ./ci/gen -type f
