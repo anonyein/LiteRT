@@ -105,6 +105,7 @@ cc_library(
         "//litert/cc:litert_buffer_ref",
         "//litert/cc:litert_expected",
         "//litert/cc:litert_macros",
+        "//litert/core:build_stamp",
         "//litert/core:dispatch_op_schema",
         "//litert/core/util:flatbuffer_tools",
         "//tflite/converter:allocation",
@@ -372,6 +373,66 @@ cc_test(
         "//litert/cc:litert_buffer_ref",
         "//litert/core/util:flatbuffer_tools_testonly",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_library(
+    name = "shape_inference_types",
+    hdrs = ["shape_inference_types.h"],
+    deps = [
+        ":model",
+        "//litert/c:litert_common",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
+    name = "ops_simple_binary",
+    hdrs = ["ops/simple_binary.h"],
+    deps = [
+        ":model",
+        ":shape_inference_types",
+        "//litert/c:litert_common",
+        "//litert/c/internal:litert_logging",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
+    name = "ops_simple_unary",
+    hdrs = ["ops/simple_unary.h"],
+    deps = [
+        ":model",
+        ":shape_inference_types",
+        "//litert/c:litert_common",
+        "//litert/c/internal:litert_logging",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "ops_simple_binary_test",
+    srcs = ["ops/simple_binary_test.cc"],
+    deps = [
+        ":model",
+        ":ops_simple_binary",
+        ":shape_inference_types",
+        "//litert/c:litert_common",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "ops_simple_unary_test",
+    srcs = ["ops/simple_unary_test.cc"],
+    deps = [
+        ":model",
+        ":ops_simple_unary",
+        ":shape_inference_types",
+        "//litert/c:litert_common",
         "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
     ],
