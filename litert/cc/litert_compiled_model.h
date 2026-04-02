@@ -46,7 +46,8 @@
 #include "litert/cc/litert_ranked_tensor_type.h"
 #include "litert/cc/litert_tensor_buffer.h"
 #include "litert/cc/litert_tensor_buffer_requirements.h"
-#include "litert/cc/litert_tensor_buffer_types.h"
+#include "litert/c/internal/litert_scheduling_info.h"
+
 
 namespace mediapipe {
 class InferenceRunnerLiteRt;
@@ -421,19 +422,6 @@ class CompiledModel : public internal::BaseHandle<LiteRtCompiledModel> {
   Expected<std::vector<TensorBuffer>> CreateOutputBuffers() const {
     return CreateInputOutputBuffers(/*signature_index=*/0, /*is_input=*/false);
   }
-
-  /// @brief Returns the profiler used by the compiled model.
-  ///
-  /// The returned `Profiler` does not own the underlying `LiteRtProfiler`.
-  Expected<Profiler> GetProfiler();
-
-  /// @brief Starts the collection of hardware-specific metrics at a given
-  /// level of detail.
-  Expected<void> StartMetricsCollection(int detail_level);
-
-  /// @brief Stops the collection of hardware-specific metrics and reports the
-  /// collected data.
-  Expected<Metrics> StopMetricsCollection();
 
   /// @brief Sets model-level default scheduling info.
   Expected<void> SetSchedulingInfo(

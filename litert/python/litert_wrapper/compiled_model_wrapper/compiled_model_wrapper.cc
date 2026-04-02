@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
+#include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/c/litert_common.h"
 #include "litert/c/litert_model_types.h"
@@ -35,40 +36,98 @@
 #include "litert/cc/litert_compiled_model.h"
 #include "litert/cc/litert_element_type.h"
 #include "litert/cc/litert_expected.h"
+#include "litert/cc/litert_layout.h"
+#include "litert/cc/litert_model_types.h"
 #include "litert/cc/litert_tensor_buffer.h"
 #include "litert/python/litert_wrapper/common/litert_wrapper_utils.h"
 
 namespace litert::compiled_model_wrapper {
 
 namespace {
-// Converts ElementType to a string representation for Python.
-const char* ElementTypeToString(ElementType dtype) {
-  switch (dtype) {
-    case ElementType::Float32:
-      return "float32";
-    case ElementType::Float16:
-      return "float16";
-    case ElementType::Int32:
-      return "int32";
-    case ElementType::UInt8:
-      return "uint8";
-    case ElementType::Int64:
-      return "int64";
-    case ElementType::Bool:
-      return "bool";
-    case ElementType::Int16:
-      return "int16";
-    case ElementType::Int8:
-      return "int8";
-    case ElementType::Float64:
-      return "float64";
-    case ElementType::UInt32:
-      return "uint32";
-    case ElementType::UInt16:
-      return "uint16";
-    default:
-      return "unknown";
+
+bool SetDictItemStringSteal(PyObject* dict, const char* key, PyObject* value) {
+  if (value == nullptr) {
+    return false;
   }
+  const int status = PyDict_SetItemString(dict, key, value);
+  Py_DECREF(value);
+  return status == 0;
+}
+
+bool AppendUnicodeToList(PyObject* list, absl::string_view value) {
+  PyObject* unicode = PyUnicode_FromStringAndSize(value.data(), value.size());
+  if (unicode == nullptr) {
+    return false;
+  }
+  const int status = PyList_Append(list, unicode);
+  Py_DECREF(unicode);
+  return status == 0;
+}
+
+PyObject* BuildShapeList(const Layout& layout) {
+  const auto dims = layout.Dimensions();
+  PyObject* shape_list = PyList_New(dims.size());
+  if (shape_list == nullptr) {
+    return nullptr;
+  }
+  for (size_t i = 0; i < dims.size(); ++i) {
+    PyObject* dim = PyLong_FromLong(dims[i]);
+    if (dim == nullptr) {
+      Py_DECREF(shape_list);
+      return nullptr;
+    }
+    PyList_SetItem(shape_list, i, dim);  // steal ref
+  }
+  return shape_list;
+}
+
+PyObject* BuildTensorDetailsDict(const SimpleTensor& tensor,
+                                 const Layout* layout) {
+  PyObject* tensor_dict = PyDict_New();
+  if (tensor_dict == nullptr) {
+    return nullptr;
+  }
+
+  std::string tensor_name(tensor.Name());
+  if (!SetDictItemStringSteal(tensor_dict, "name",
+                              PyUnicode_FromString(tensor_name.c_str())) ||
+      !SetDictItemStringSteal(tensor_dict, "index",
+                              PyLong_FromUnsignedLong(tensor.TensorIndex())) ||
+      !SetDictItemStringSteal(
+          tensor_dict, "dtype",
+          PyUnicode_FromString(litert_wrapper_utils::ElementTypeToString(
+              tensor.ElementType())))) {
+    Py_DECREF(tensor_dict);
+    return nullptr;
+  }
+
+  if (layout != nullptr) {
+    PyObject* shape_list = BuildShapeList(*layout);
+    if (shape_list == nullptr) {
+      Py_DECREF(tensor_dict);
+      return nullptr;
+    }
+    if (PyDict_SetItemString(tensor_dict, "shape", shape_list) != 0) {
+      Py_DECREF(shape_list);
+      Py_DECREF(tensor_dict);
+      return nullptr;
+    }
+    Py_DECREF(shape_list);
+  }
+
+  return tensor_dict;
+}
+
+bool SetTensorDetailsDictItem(PyObject* result_dict, absl::string_view key,
+                              PyObject* value) {
+  if (value == nullptr) {
+    return false;
+  }
+  std::string key_string(key);
+  const int status =
+      PyDict_SetItemString(result_dict, key_string.c_str(), value);
+  Py_DECREF(value);
+  return status == 0;
 }
 
 bool SetDictItemStringSteal(PyObject* dict, const char* key, PyObject* value) {
@@ -678,9 +737,9 @@ PyObject* CompiledModelWrapper::GetOutputTensorDetails(
       return ConvertErrorToPyExc(tensor_or.Error());
     }
     const SimpleTensor& tensor = *tensor_or;
-    const Layout* output_layout =
-        tensor.TypeId() == kLiteRtRankedTensorType ? &output_layouts[i]
-                                                   : nullptr;
+    const Layout* output_layout = tensor.TypeId() == kLiteRtRankedTensorType
+                                      ? &output_layouts[i]
+                                      : nullptr;
     PyObject* tensor_dict = BuildTensorDetailsDict(tensor, output_layout);
     if (!SetTensorDetailsDictItem(result_dict, output_names[i], tensor_dict)) {
       Py_DECREF(result_dict);

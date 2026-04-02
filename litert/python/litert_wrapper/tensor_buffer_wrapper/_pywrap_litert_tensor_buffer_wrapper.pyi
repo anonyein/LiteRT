@@ -15,18 +15,19 @@
 """Python type stubs for the LiteRT TensorBuffer wrapper."""
 
 from typing import Any, List
+import numpy as np
 
 
 def CreateTensorBufferFromHostMemory(
-        py_data: Any,
+        py_data: np.ndarray,
         dtype: str,
         num_elements: int
 ) -> object:
     """Creates a TensorBuffer from existing host memory.
 
     Args:
-      py_data: Python object exporting a contiguous readable buffer, such as a
-        NumPy array or memoryview.
+      py_data: Contiguous NumPy array whose storage is used by the tensor
+        buffer.
       dtype: Data type of the tensor elements as a string (e.g., 'float32',
         'float16').
       num_elements: Number of elements in the tensor.
@@ -39,7 +40,7 @@ def CreateTensorBufferFromHostMemory(
 
 def WriteTensor(
         capsule: object,
-        data_list: Any,
+        data_list: List[Any] | np.ndarray,
         dtype: str
 ) -> None:
     """Writes data into the tensor buffer.
@@ -47,7 +48,7 @@ def WriteTensor(
     Args:
       capsule: PyCapsule object containing the LiteRT TensorBuffer.
       data_list: Data to write to the tensor buffer. Can be a Python list of
-        values or a contiguous buffer object such as a NumPy array.
+        values or a NumPy array.
       dtype: Data type of the tensor elements as a string (e.g., 'float32',
         'float16').
     """
@@ -56,15 +57,14 @@ def WriteTensor(
 
 def WriteTensorBuffer(
         capsule: object,
-        py_data: Any,
+        py_data: np.ndarray,
         dtype: str
 ) -> None:
     """Writes raw contiguous tensor storage from a Python buffer object.
 
     Args:
       capsule: PyCapsule object containing the LiteRT TensorBuffer.
-      py_data: Python object exporting a contiguous readable buffer whose
-        storage matches `dtype`.
+      py_data: Contiguous NumPy array whose storage matches `dtype`.
       dtype: Data type of the tensor elements as a string.
     """
     ...
@@ -91,15 +91,14 @@ def ReadTensor(
 
 def ReadTensorToBuffer(
         capsule: object,
-        py_data: Any,
+        py_data: np.ndarray,
         dtype: str
 ) -> None:
     """Reads raw contiguous tensor storage into a Python buffer object.
 
     Args:
       capsule: PyCapsule object containing the LiteRT TensorBuffer.
-      py_data: Python object exporting a contiguous writable buffer whose
-        storage matches `dtype`.
+      py_data: Contiguous writable NumPy array whose storage matches `dtype`.
       dtype: Data type of the tensor elements as a string.
     """
     ...

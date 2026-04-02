@@ -66,7 +66,8 @@ class TensorBufferWrapper {
    * @param dtype String representation of the data type.
    * @return PyObject* indicating success (Py_None) or nullptr on error.
    */
-  static PyObject* WriteTensorBuffer(PyObject* buffer_capsule, PyObject* py_data,
+  static PyObject* WriteTensorBuffer(PyObject* buffer_capsule,
+                                     PyObject* py_data,
                                      const std::string& dtype);
 
   /**
@@ -88,7 +89,8 @@ class TensorBufferWrapper {
    * @param dtype String representation of the data type.
    * @return PyObject* indicating success (Py_None) or nullptr on error.
    */
-  static PyObject* ReadTensorToBuffer(PyObject* buffer_capsule, PyObject* py_data,
+  static PyObject* ReadTensorToBuffer(PyObject* buffer_capsule,
+                                      PyObject* py_data,
                                       const std::string& dtype);
 
   /**

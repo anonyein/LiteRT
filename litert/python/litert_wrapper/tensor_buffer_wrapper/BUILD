@@ -14,7 +14,7 @@
 
 load("@org_tensorflow//tensorflow:tensorflow.default.bzl", "pybind_extension")
 
-# copybara:uncomment load("@org_tensorflow//tensorflow:strict.default.bzl", "py_strict_test")
+# copybara:uncomment load("//litert/python:strict.bzl", "py_strict_test")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@xla//third_party/rules_python/python:py_library.bzl", "py_library")
 
@@ -78,8 +78,6 @@ pybind_extension(
         ":tensor_buffer_wrapper_lib",
         "//litert/cc:litert_api_with_dynamic_runtime",
         "//tflite:framework",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/strings:string_view",
         "@pybind11",
         "@xla//third_party/python_runtime:headers",
     ],
@@ -92,7 +90,7 @@ py_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "//litert/python/litert_wrapper/tensor_buffer_wrapper:_pywrap_litert_tensor_buffer_wrapper",
+        ":_pywrap_litert_tensor_buffer_wrapper",
         "@org_tensorflow//third_party/py/numpy:headers",
     ],
 )

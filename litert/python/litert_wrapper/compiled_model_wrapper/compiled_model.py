@@ -15,7 +15,7 @@
 """Python wrapper for LiteRT compiled models."""
 
 import os
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 # pylint: disable=g-import-not-at-top
 if not os.path.splitext(__file__)[0].endswith(
@@ -125,7 +125,7 @@ class CompiledModel:
     """Returns the shared LiteRT environment used by this compiled model."""
     return self._environment
 
-  def get_signature_list(self) -> Dict[str, Dict[str, List[str]]]:
+  def get_signature_list(self) -> dict[str, dict[str, List[str]]]:
     """Returns a dictionary of all available model signatures.
 
     Returns:
@@ -133,7 +133,7 @@ class CompiledModel:
     """
     return self._model.GetSignatureList()
 
-  def get_signature_by_index(self, index: int) -> Dict[str, Any]:
+  def get_signature_by_index(self, index: int) -> dict[str, Any]:
     """Returns signature information for the given index.
 
     Args:
@@ -163,7 +163,7 @@ class CompiledModel:
     """
     return self._model.GetSignatureIndex(key)
 
-  def get_input_tensor_details(self, signature_key: str) -> Dict[str, Any]:
+  def get_input_tensor_details(self, signature_key: str) -> dict[str, Any]:
     """Returns details of input tensors for a given signature.
 
     Args:
@@ -175,7 +175,7 @@ class CompiledModel:
     """
     return self._model.GetInputTensorDetails(signature_key)
 
-  def get_output_tensor_details(self, signature_key: str) -> Dict[str, Any]:
+  def get_output_tensor_details(self, signature_key: str) -> dict[str, Any]:
     """Returns details of output tensors for a given signature.
 
     Args:
@@ -189,7 +189,7 @@ class CompiledModel:
 
   def get_input_buffer_requirements(
       self, input_index: int, signature_index: int = 0
-  ) -> Dict[str, Any]:
+  ) -> dict[str, Any]:
     """Returns memory requirements for an input tensor.
 
     Args:
@@ -203,7 +203,7 @@ class CompiledModel:
 
   def get_output_buffer_requirements(
       self, output_index: int, signature_index: int = 0
-  ) -> Dict[str, Any]:
+  ) -> dict[str, Any]:
     """Returns memory requirements for an output tensor.
 
     Args:
@@ -323,8 +323,8 @@ class CompiledModel:
   def run_by_name(
       self,
       signature_key: str,
-      input_map: Dict[str, TensorBuffer],
-      output_map: Dict[str, TensorBuffer],
+      input_map: dict[str, TensorBuffer],
+      output_map: dict[str, TensorBuffer],
   ) -> None:
     """Runs inference using the named signature and tensor maps.
 

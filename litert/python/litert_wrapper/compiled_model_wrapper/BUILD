@@ -14,7 +14,7 @@
 
 load("@org_tensorflow//tensorflow:tensorflow.default.bzl", "pybind_extension")
 
-# copybara:uncomment load("@org_tensorflow//tensorflow:strict.default.bzl", "py_strict_test")
+# copybara:uncomment load("//litert/python:strict.bzl", "py_strict_test")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@xla//third_party/rules_python/python:py_library.bzl", "py_library")
 
@@ -45,10 +45,13 @@ cc_library(
         "//litert/c:litert_common",
         "//litert/cc:litert_api_with_dynamic_runtime",
         "//litert/cc:litert_environment_options",
+        "//litert/cc:litert_model_types",
         "//litert/python/litert_wrapper/common:litert_wrapper_utils",
         "//tflite:framework",
         "//tflite/core:framework",
+        "@com_google_absl//absl/cleanup",
         "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
         "@xla//third_party/python_runtime:headers",
     ] + select({
@@ -81,8 +84,6 @@ pybind_extension(
         ":compiled_model_wrapper_lib",
         "//litert/cc:litert_api_with_dynamic_runtime",
         "//tflite:framework",
-        "@com_google_absl//absl/container:flat_hash_map",
-        "@com_google_absl//absl/strings:string_view",
         "@pybind11",
         "@xla//third_party/python_runtime:headers",
     ],
