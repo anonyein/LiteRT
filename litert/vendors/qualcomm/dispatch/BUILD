@@ -54,6 +54,7 @@ litert_dynamic_lib(
     visibility = ["//litert:litert_public"],
     deps = [
         "@com_google_absl//absl/base:no_destructor",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
@@ -94,6 +95,7 @@ litert_device_test(
     deps = [
         "//litert/c:litert_common",
         "//litert/c:litert_runtime_c_api_shared_lib",
+        "//litert/c/internal:litert_runtime_context_testonly",
         "//litert/cc:litert_any",
         "//litert/cc:litert_environment_options",
         "//litert/cc/dynamic_runtime:litert_environment",

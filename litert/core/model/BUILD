@@ -483,6 +483,113 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "ops_matmul",
+    hdrs = ["ops/matmul.h"],
+    deps = [
+        ":model",
+        ":shape_inference_types",
+        "//litert/c:litert_common",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
+    name = "ops_pad",
+    hdrs = ["ops/pad.h"],
+    deps = [
+        ":model",
+        ":shape_inference_types",
+        "//litert/c:litert_common",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
+    name = "ops_pooling",
+    hdrs = ["ops/pooling.h"],
+    deps = [
+        ":model",
+        ":op_shape_inference_utils",
+        ":shape_inference_types",
+        "//litert/c:litert_common",
+        "//tflite/converter/schema:schema_fbs",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_library(
+    name = "ops_reductions",
+    hdrs = ["ops/reductions.h"],
+    deps = [
+        ":model",
+        ":shape_inference_types",
+        "//litert/c:litert_common",
+        "@com_google_absl//absl/types:span",
+    ],
+)
+
+cc_test(
+    name = "ops_reductions_test",
+    srcs = ["ops/reductions_test.cc"],
+    deps = [
+        ":model",
+        ":ops_reductions",
+        ":ops_simple_unary",
+        ":shape_inference_types",
+        "//litert/c:litert_common",
+        "//litert/cc:litert_buffer_ref",
+        "//litert/core/util:flatbuffer_tools_testonly",
+        "//tflite/converter/schema:schema_fbs",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "ops_pooling_test",
+    srcs = ["ops/pooling_test.cc"],
+    deps = [
+        ":model",
+        ":ops_pooling",
+        ":shape_inference_types",
+        "//litert/c:litert_common",
+        "//litert/core/util:flatbuffer_tools",
+        "//tflite/converter/schema:schema_fbs",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "ops_pad_test",
+    srcs = ["ops/pad_test.cc"],
+    deps = [
+        ":model",
+        ":ops_pad",
+        ":shape_inference_types",
+        "//litert/c:litert_common",
+        "//litert/cc:litert_buffer_ref",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "ops_matmul_test",
+    srcs = ["ops/matmul_test.cc"],
+    deps = [
+        ":model",
+        ":ops_matmul",
+        ":shape_inference_types",
+        "//litert/c:litert_common",
+        "//litert/core/util:flatbuffer_tools",
+        "//tflite/converter/schema:schema_fbs",
+        "@com_google_absl//absl/types:span",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "ops_pack_test",
     srcs = ["ops/pack_test.cc"],
