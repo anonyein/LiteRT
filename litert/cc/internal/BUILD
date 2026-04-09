@@ -128,6 +128,7 @@ cc_test(
     srcs = ["litert_c_types_printing_test.cc"],
     deps = [
         ":litert_c_types_printing",
+        ":litert_logging",
         "//litert/c:litert_layout",
         "//litert/c:litert_model_types",
         "//litert/c:litert_op_code",
@@ -197,7 +198,6 @@ cc_library(
     deps = [
         ":litert_detail",
         ":litert_numerics",
-        "//litert/c:litert_common",
         "//litert/c:litert_layout",
         "//litert/c:litert_model_types",
         "//litert/cc:litert_expected",

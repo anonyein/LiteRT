@@ -1097,10 +1097,9 @@ LiteRtCompiledModelT::GetTensorBufferRequirements(const TfLiteTensor* tensor) {
   LiteRtTensorBufferRequirements litert_cpu_buffer_requirements;
   LiteRtTensorBufferType cpu_buffer_type[] = {
       kLiteRtTensorBufferTypeHostMemory};
-  uint32_t cpu_buffer_strides[] = {0};
   LITERT_RETURN_IF_ERROR(LiteRtCreateTensorBufferRequirements(
       /*num_supported_tensor_buffer_types=*/1, cpu_buffer_type, tensor->bytes,
-      /*num_strides=*/1, cpu_buffer_strides, &litert_cpu_buffer_requirements));
+      /*num_strides=*/0, /*strides=*/nullptr, &litert_cpu_buffer_requirements));
   cpu_buffer_requirements_[tensor_id] =
       LiteRtTensorBufferRequirementsPtr(litert_cpu_buffer_requirements);
   return const_cast<LiteRtTensorBufferRequirementsT*>(
@@ -1442,7 +1441,7 @@ Expected<void> LiteRtCompiledModelT::RegisterBuffer(
     bool buffer_is_cpu_compatible =
         buffer->buffer_type() == kLiteRtTensorBufferTypeHostMemory ||
         IsUserCustomBuffer(buffer->buffer_type()) || buffer->is_opencl_memory();
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || (defined(__linux__) && defined(__aarch64__))
     if (buffer->buffer_type() == kLiteRtTensorBufferTypeAhwb) {
       if (__builtin_available(android 26, *)) {
         if (auto ahwb = buffer->GetAhwbBuffer()) {
