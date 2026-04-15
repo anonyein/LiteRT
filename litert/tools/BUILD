@@ -88,7 +88,7 @@ litert_bin(
     name = "apply_plugin_main",
     srcs = ["apply_plugin_main.cc"],
     data = select({
-        "@platforms//os:windows": [],
+        "//litert/build_common:windows": [],
         "//conditions:default": [
             # copybara:uncomment_begin(google-only)
             # "//platforms/darwinn/compiler/external:litert_plugin_compiler",
@@ -97,12 +97,15 @@ litert_bin(
             "//litert/vendors/mediatek/compiler:compiler_plugin_so",
             "//litert/vendors/examples:example_plugin_so",
             "//litert/vendors/qualcomm/compiler:qnn_compiler_plugin_so",
-            # copybara:uncomment "//litert/vendors/samsung/compiler:compiler_plugin_so",
+            "//litert/vendors/samsung/compiler:compiler_plugin_so",
             "@qairt//:lib/x86_64-linux-clang/libQnnHtp.so",
             "@qairt//:lib/x86_64-linux-clang/libQnnSystem.so",
             "@neuro_pilot//:v9_latest/host/lib/libneuron_adapter.so",
             "@neuro_pilot//:v8_latest/host/lib/libneuron_adapter.so",
             "@neuro_pilot//:v7_latest/host/lib/libneuron_adapter.so",
+            "@exynos_ai_litecore//:lib/x86_64-linux/libgraph_wrapper.so",
+            "@exynos_ai_litecore//:lib/x86_64-linux/libgraphgen.so",
+            "@exynos_ai_litecore//:lib/x86_64-linux/libgraphgen_api.so",
         ],
     }),
     export_litert_only = 1,
@@ -114,8 +117,8 @@ litert_bin(
         "nosan",
     ],
     target_compatible_with = select({
-        "@platforms//os:linux": [],
-        "@platforms//os:windows": [],
+        "//litert/build_common:linux": [],
+        "//litert/build_common:windows": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
     ungrte = True,
@@ -136,7 +139,7 @@ litert_bin(
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/strings:string_view",
     ] + select({
-        "@platforms//os:windows": [],
+        "//litert/build_common:windows": [],
         "//conditions:default": [
             "//litert/tools/flags/vendors:google_tensor_flags_with_dynamic_runtime",
             "//litert/tools/flags/vendors:mediatek_flags_with_dynamic_runtime",
@@ -162,7 +165,7 @@ litert_bin(
         "nosan",
     ],
     target_compatible_with = select({
-        "@platforms//os:linux": [],
+        "//litert/build_common:linux": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
     visibility = [
@@ -874,6 +877,29 @@ cc_binary(
         "@com_google_absl//absl/flags:parse",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
+    ],
+)
+
+cc_binary(
+    name = "apply_input_shapes_main",
+    srcs = ["apply_input_shapes_main.cc"],
+    deps = [
+        "//litert/c:litert_common",
+        "//litert/c:litert_model_types",
+        "//litert/cc:litert_expected",
+        "//litert/core/model",
+        "//litert/core/model:model_load",
+        "//litert/core/model:model_serialize",
+        "//litert/core/model:shape_inference",
+        "//litert/core/model:shape_inference_types",
+        "//litert/core/util:flatbuffer_tools",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/log:absl_log",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
