@@ -13,12 +13,8 @@
 # limitations under the License.
 
 load("@bazel_skylib//lib:selects.bzl", "selects")
-
-# copybara:uncomment_begin(google-only)
-# load("@build_bazel_rules_apple//apple:macos.bzl", "macos_dylib", "macos_unit_test")
-# copybara:uncomment_end_and_comment_begin
+load("@build_bazel_rules_apple//apple:ios.bzl", "ios_unit_test")
 load("@build_bazel_rules_apple//apple:macos.bzl", "macos_dylib")
-# copybara:comment_end
 
 # copybara:uncomment load("//devtools/deps/check:deps_check.bzl", "check_dependencies")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
@@ -26,8 +22,7 @@ load("@rules_cc//cc:cc_import.bzl", "cc_import")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_shared_library.bzl", "cc_shared_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-
-# copybara:uncomment load("@rules_cc//cc:objc_library.bzl", "objc_library")
+load("@rules_cc//cc:objc_library.bzl", "objc_library")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load(
     "//litert/build_common:litert_build_defs.bzl",
@@ -48,7 +43,6 @@ load(
     "litert_metal_linkopts",
     "litert_metal_opts",
 )
-# copybara:uncomment load("@build_bazel_rules_apple//apple:ios.bzl", "ios_unit_test")
 
 LITERT_MIN_IOS_VERSION = "14.0"
 
@@ -771,8 +765,8 @@ cc_test(
 cc_library(
     name = "litert_runtime_c_api_so_shim",
     linkopts = select({
-        "//litert/build_common:macos": [],
-        "//litert/build_common:ios": [],
+        "//litert:macos": [],
+        "//litert:ios": [],
         "//conditions:default": ["-Wl,--undefined-glob=LiteRt*"],
     }),
     deps = LITERT_C_API_COMMON_DEPS,
@@ -784,7 +778,7 @@ cc_shared_library(
     additional_linker_inputs = export_lrt_runtime_only_script(),
     shared_lib_name = "libLiteRt.so",
     user_link_flags = export_lrt_runtime_only_linkopt() + select({
-        "//litert/build_common:macos": ["-Wl,-install_name,@rpath/libLiteRt.so"],
+        "//litert:macos": ["-Wl,-install_name,@rpath/libLiteRt.so"],
         "//conditions:default": ["-Wl,-soname=libLiteRt.so"],
     }) + litert_android_linkopts(),
     deps = [":litert_runtime_c_api_so_shim"],
@@ -882,8 +876,8 @@ exports_files(srcs = ["windows_exported_symbols.def"])
 cc_library(
     name = "litert_tflite_runtime_c_api_so_shim",
     linkopts = select({
-        "//litert/build_common:macos": [],
-        "//litert/build_common:ios": [],
+        "//litert:macos": [],
+        "//litert:ios": [],
         "//conditions:default": ["-Wl,--undefined-glob=LiteRt*"],
     }),
     deps = LITERT_C_API_COMMON_DEPS + [
@@ -908,9 +902,9 @@ cc_shared_library(
 
 SELECT_LITERT_RUNTIME_C_API_SHARED_LIB = select({
     ":resolve_symbols_in_exec": [],
-    "//litert/build_common:ios": [":litert_runtime_c_api_dylib"],
-    "//litert/build_common:macos": [":litert_runtime_c_api_dylib"],
-    "//litert/build_common:windows": [],
+    "//litert:ios": [":litert_runtime_c_api_dylib"],
+    "//litert:macos": [":litert_runtime_c_api_dylib"],
+    "//litert:windows": [],
     "//conditions:default": [":litert_runtime_c_api_so"],
 })
 
@@ -964,8 +958,8 @@ cc_library(
         "//tflite/core/c:headers_filegroup",
     ],
     linkopts = select({
-        "//litert/build_common:ios": ["-Wl,-rpath,@loader_path"],
-        "//litert/build_common:macos": ["-Wl,-rpath,@loader_path"],
+        "//litert:ios": ["-Wl,-rpath,@loader_path"],
+        "//litert:macos": ["-Wl,-rpath,@loader_path"],
         "//conditions:default": [],
     }),
     linkstatic = 1,
@@ -986,7 +980,7 @@ cc_library(
         "//litert/build_common:build_config",
     ] + gles_headers() + select({
         ":resolve_symbols_in_exec": [],
-        "//litert/build_common:windows": [":litert_runtime_c_api_import"],
+        "//litert:windows": [":litert_runtime_c_api_import"],
         "//conditions:default": [],
     }),
 )
@@ -1001,37 +995,29 @@ cc_library(
 
 exports_files(srcs = glob(["litert_*.h"]))
 
-# copybara:uncomment_begin(google-only)
-# objc_library(
-#     name = "litert_tensor_buffer_test_library",
-#     testonly = True,
-#     srcs = ["litert_tensor_buffer_test.mm"],
-#     deps = [
-#         ":litert_any",
-#         ":litert_common",
-#         ":litert_environment",
-#         ":litert_environment_options",
-#         ":litert_model",
-#         ":litert_tensor_buffer",
-#         ":litert_tensor_buffer_types",
-#         "//third_party/apple_frameworks:XCTest",
-#         "//litert/cc:litert_any",
-#         "//litert/cc:litert_layout",
-#         "//litert/runtime/accelerators/gpu:ml_drift_metal_accelerator",
-#     ],
-# )
-#
-# macos_unit_test(
-#     name = "litert_tensor_buffer_test_macos",
-#     minimum_os_version = LITERT_MIN_MACOS_VERSION,
-#     tags = ["notap"],
-#     deps = [":litert_tensor_buffer_test_library"],
-# )
-#
-# ios_unit_test(
-#     name = "litert_tensor_buffer_test_ios",
-#     minimum_os_version = LITERT_MIN_IOS_VERSION,
-#     runner = "@build_bazel_rules_apple//apple/testing/default_runner:ios_default_runner",
-#     deps = [":litert_tensor_buffer_test_library"],
-# )
-# copybara:uncomment_end(google-only)
+objc_library(
+    name = "litert_tensor_buffer_test_library",
+    testonly = True,
+    srcs = ["litert_tensor_buffer_test.mm"],
+    deps = [
+        ":litert_any",
+        ":litert_common",
+        ":litert_environment",
+        ":litert_environment_options",
+        ":litert_model",
+        ":litert_tensor_buffer",
+        ":litert_tensor_buffer_types",
+        "//litert/cc:litert_any",
+        "//litert/cc:litert_layout",
+        "//litert/runtime/accelerators/gpu:ml_drift_metal_accelerator",
+        "//third_party/apple_frameworks:Metal",
+        "//third_party/apple_frameworks:XCTest",
+    ],
+)
+
+ios_unit_test(
+    name = "litert_tensor_buffer_test_ios",
+    minimum_os_version = LITERT_MIN_IOS_VERSION,
+    runner = "@build_bazel_rules_apple//apple/testing/default_runner:ios_default_runner",
+    deps = [":litert_tensor_buffer_test_library"],
+)
