@@ -397,22 +397,21 @@ objc_library(
     testonly = True,
     srcs = ["metal_test_helper.mm"],
     hdrs = ["metal_test_helper.h"],
-    sdk_frameworks = [
-        "Metal",
-        "XCTest",
-    ],
     deps = [
         ":common",
         ":matchers",
         "//litert/cc:litert_expected",
         "//litert/cc:litert_macros",
         "//litert/cc:litert_tensor_buffer",
+        "//third_party/apple_frameworks:Metal",
+        "//third_party/apple_frameworks:XCTest",
         "@com_google_absl//absl/types:span",
     ],
 )
 
 exports_files(
     srcs = [
+        "litert_c_api_dependency_test.sh",
         "testdata/mobilenet_v2_1.0_224.tflite",
         "testdata/model_magic_test.tflite",
         "testdata/model_with_external_weights.tflite",

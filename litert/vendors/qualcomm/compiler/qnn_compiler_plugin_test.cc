@@ -178,7 +178,8 @@ const auto kSupportedSocModels = Values(
     "SM8550",
     "SM8650",
     "SM8750",
-    "SM8850"
+    "SM8850",
+    "SW6100"
 );
 // clang-format on
 #if defined(__x86_64__) || defined(_M_X64)
@@ -259,7 +260,8 @@ TEST(TestQnnPlugin, CompileMulSubgraphWithOptions) {
   qnn_opts->SetLogLevel(qualcomm::QualcommOptions::LogLevel::kError);
   qnn_opts->SetEnableWeightSharing(false);
 
-  auto plugin = CreatePlugin(/*env=*/nullptr, opts->Get());
+  auto plugin =
+      CreatePlugin(/*runtime_context=*/nullptr, /*env=*/nullptr, opts->Get());
   auto model = testing::LoadTestFileModel("one_mul.tflite");
 
   LiteRtCompiledResult compiled;
