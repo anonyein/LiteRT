@@ -203,7 +203,7 @@ fi
 
 # TODO(b/503213161): Avoid piggybacking Tensor API's bazel build test on
 # LiteRT's wheel kokoro job.
-bazel build "${BUILD_FLAGS[@]}" //tensor/...
+# bazel build "${BUILD_FLAGS[@]}" //tensor/...
 
 bazel build "${BUILD_FLAGS[@]}" \
     //tflite/java:tensorflow-lite-api \
