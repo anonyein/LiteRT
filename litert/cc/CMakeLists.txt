@@ -75,7 +75,6 @@ set(LITERT_CC_REQUIRED_INTERNAL_HEADERS
 set(LITERT_CC_PUBLIC_SOURCES
     litert_compiled_model.cc
     litert_custom_op_kernel.cc
-    litert_macros.cc
     litert_model.cc
     litert_opaque_options.cc
     litert_options.cc
@@ -135,9 +134,17 @@ set(LITERT_CC_HEADERS
 )
 
 # Core C++ API library
-add_library(litert_cc_api STATIC
-    ${LITERT_CC_PUBLIC_SOURCES}
-)
+# If no public sources, create an empty library to avoid build failures.
+# TODO (b/507233667): Convert this to an INTERFACE library.
+if(LITERT_CC_PUBLIC_SOURCES)
+    add_library(litert_cc_api STATIC
+        ${LITERT_CC_PUBLIC_SOURCES}
+    )
+else()
+    add_library(litert_cc_api STATIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/../c/empty.cc
+    )
+endif()
 
 target_include_directories(litert_cc_api
     PUBLIC

@@ -106,7 +106,6 @@ cc_library(
 
 cc_library(
     name = "litert_macros",
-    srcs = ["litert_macros.cc"],
     hdrs = ["litert_macros.h"],
     compatible_with = get_compatible_with_portable(),
     deps = [
@@ -147,6 +146,7 @@ cc_library(
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
