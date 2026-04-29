@@ -5,12 +5,6 @@ litert/cc/internal/litert_shared_library.cc
 litert/cc/internal/scoped_file.cc
 litert/cc/internal/scoped_file_posix.cc
 litert/cc/internal/scoped_file_win.cc
-litert/cc/litert_compiled_model.cc
-litert/cc/litert_custom_op_kernel.cc
-litert/cc/litert_model.cc
-litert/cc/litert_opaque_options.cc
-litert/cc/litert_options.cc
-litert/cc/litert_tensor_buffer.cc
 litert/c/options/litert_compiler_options.cc
 litert/c/options/litert_cpu_options.cc
 litert/c/options/litert_google_tensor_options.cc
@@ -20,14 +14,4 @@ litert/c/options/litert_mediatek_options.cc
 litert/c/options/litert_qualcomm_options.cc
 litert/c/options/litert_runtime_options.cc
 litert/c/options/litert_samsung_options.cc
-litert/cc/options/litert_compiler_options.cc
-litert/cc/options/litert_cpu_options.cc
-litert/cc/options/litert_google_tensor_options.cc
-litert/cc/options/litert_gpu_options.cc
-litert/cc/options/litert_intel_openvino_options.cc
-litert/cc/options/litert_magic_number_options.cc
-litert/cc/options/litert_mediatek_options.cc
-litert/cc/options/litert_qualcomm_options.cc
-litert/cc/options/litert_runtime_options.cc
-litert/cc/options/litert_samsung_options.cc
 litert/core/litert_toml_parser.cc

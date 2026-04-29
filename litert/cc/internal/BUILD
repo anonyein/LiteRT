@@ -73,7 +73,6 @@ cc_library(
 # This is for accelerator shared libs not to depend on the registry, but depend on CAPI.so instead.
 cc_library(
     name = "litert_tensor_buffer_without_registry",
-    srcs = ["//litert/cc:litert_tensor_buffer.cc"],
     hdrs = [
         "//litert/cc:litert_tensor_buffer.h",
     ],
@@ -198,6 +197,7 @@ cc_test(
         ":litert_options_wrapper",
         "//litert/c:litert_common",
         "//litert/c/internal:litert_compiler_context_testonly",
+        "//litert/cc:litert_environment",
         "//litert/cc:litert_expected",
         "//litert/cc:litert_macros",
         "//litert/cc:litert_opaque_options",
@@ -229,6 +229,7 @@ cc_test(
         "//litert/c:litert_opaque_options",
         "//litert/c:litert_options",
         "//litert/c/internal:litert_compiler_context_testonly",
+        "//litert/cc:litert_environment",
         "//litert/cc:litert_expected",
         "//litert/cc:litert_macros",
         "//litert/cc:litert_opaque_options",

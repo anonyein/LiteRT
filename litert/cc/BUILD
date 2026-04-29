@@ -206,7 +206,6 @@ cc_test(
 
 cc_library(
     name = "litert_opaque_options",
-    srcs = ["litert_opaque_options.cc"],
     hdrs = ["litert_opaque_options.h"],
     deps = [
         ":litert_common",
@@ -270,7 +269,6 @@ cc_test(
 
 cc_library(
     name = "litert_compiled_model",
-    srcs = [":litert_compiled_model.cc"],
     hdrs = [":litert_compiled_model.h"],
     visibility = [
         # copybara:uncomment_begin(oss litert_lm)
@@ -619,7 +617,6 @@ litert_device_test(
 
 cc_library(
     name = "litert_custom_op_kernel",
-    srcs = [":litert_custom_op_kernel.cc"],
     hdrs = [":litert_custom_op_kernel.h"],
     visibility = [
         # copybara:uncomment_begin(oss litert_lm)
@@ -837,7 +834,6 @@ cc_library(
 
 cc_library(
     name = "litert_model",
-    srcs = [":litert_model.cc"],
     hdrs = [":litert_model.h"],
     defines = select({
         "//litert:litert_runtime_link_mode_dynamic": ["LITERT_DYNAMIC_RUNTIME"],
@@ -1015,7 +1011,10 @@ cc_test(
     srcs = ["litert_options_test.cc"],
     deps = [
         ":litert_common",
+        ":litert_environment",
         ":litert_options",
+        "//litert/c:litert_common",
+        "//litert/cc/internal:litert_handle",
         "//litert/cc/internal:scoped_file",
         "//litert/cc/internal:scoped_weight_source",
         "//litert/core:options",
@@ -1083,7 +1082,6 @@ cc_test(
 
 cc_library_with_testonly_vis(
     name = "litert_options",
-    srcs = ["litert_options.cc"],
     hdrs = ["litert_options.h"],
     vis = [
         # copybara:uncomment_begin(oss litert_lm)
@@ -1095,6 +1093,7 @@ cc_library_with_testonly_vis(
     deps = [
         ":litert_common",
         ":litert_custom_op_kernel",
+        ":litert_environment",
         ":litert_expected",
         ":litert_macros",
         ":litert_opaque_options",
@@ -1113,6 +1112,7 @@ cc_library_with_testonly_vis(
         "//litert/c/options:litert_runtime_options",
         "//litert/c/options:litert_samsung_options",
         "//litert/cc/internal:litert_handle",
+        "//litert/cc/internal:litert_runtime_proxy",
         "//litert/cc/internal:scoped_file",
         "//litert/cc/internal:scoped_weight_source",
         "//litert/cc/options:litert_compiler_options",
@@ -1301,6 +1301,7 @@ cc_library(
         "//litert/cc/dynamic_runtime:litert_profiler",
         "//litert/cc/dynamic_runtime:litert_tensor_buffer",
         "//litert/cc/internal:litert_runtime_proxy_runtimecapi",
+        "//litert/cc/internal:litert_tensor_buffer_utils",
         # C++ Common Options API targets.
         "//litert/cc/dynamic_runtime:litert_opaque_options",
         "//litert/cc/dynamic_runtime:litert_options",
@@ -1340,6 +1341,8 @@ cc_library(
         "//litert/cc/internal:scoped_file",
         "//litert/cc/internal:scoped_weight_source",
         "//litert/core:options",
+        "//litert/core/model:model_load",
+        "//tflite/converter:allocation",
         "@opencl_headers",
         "//tflite/core/api",
         "//tflite/profiling:memory_info",
@@ -1359,7 +1362,6 @@ cc_library(
 
 cc_library(
     name = "litert_tensor_buffer_types",
-    srcs = ["litert_tensor_buffer_types.cc"],
     hdrs = ["litert_tensor_buffer_types.h"],
     deps = [
         "//litert/c:litert_tensor_buffer_types",
