@@ -40,6 +40,7 @@
 #include "litert/cc/litert_model_types.h"
 #include "litert/cc/litert_options.h"
 #include "litert/cc/litert_tensor_buffer.h"
+#include "litert/c/options/litert_cpu_options.h"
 #include "litert/cc/options/litert_gpu_options.h"
 #include "litert/python/litert_wrapper/common/litert_wrapper_utils.h"
 
@@ -259,7 +260,7 @@ PyObject* CompiledModelWrapper::ConvertErrorToPyExc(const Error& error) {
 CompiledModelWrapper* CompiledModelWrapper::CreateWrapperFromFile(
     PyObject* environment_capsule, const char* model_path, int hardware_accel,
     int cpu_num_threads, bool gpu_enforce_f32, bool gpu_share_constant_tensors,
-    std::string* out_error) {
+    int cpu_kernel_mode, int xnnpack_flags, std::string* out_error) {
   auto* env =
       litert_wrapper_utils::GetEnvironmentFromCapsule(environment_capsule);
   if (env == nullptr) {
@@ -298,13 +299,22 @@ CompiledModelWrapper* CompiledModelWrapper::CreateWrapperFromFile(
     }
   }
 
-  if (cpu_num_threads > 0) {
+  if (cpu_num_threads > 0 || cpu_kernel_mode >= 0 || xnnpack_flags >= 0) {
     auto cpu_options_or = options.GetCpuOptions();
     if (!cpu_options_or) {
       if (out_error) *out_error = cpu_options_or.Error().Message();
       return nullptr;
     }
-    cpu_options_or->SetNumThreads(cpu_num_threads);
+    if (cpu_num_threads > 0) {
+      cpu_options_or->SetNumThreads(cpu_num_threads);
+    }
+    if (cpu_kernel_mode >= 0) {
+      cpu_options_or->SetKernelMode(
+          static_cast<LiteRtCpuKernelMode>(cpu_kernel_mode));
+    }
+    if (xnnpack_flags >= 0) {
+      cpu_options_or->SetXNNPackFlags(static_cast<uint32_t>(xnnpack_flags));
+    }
   }
 
   // Create a compiled model
@@ -330,7 +340,7 @@ int ConvertFromPyString(PyObject* obj, char** data, Py_ssize_t* length) {
 CompiledModelWrapper* CompiledModelWrapper::CreateWrapperFromBuffer(
     PyObject* environment_capsule, PyObject* model_data, int hardware_accel,
     int cpu_num_threads, bool gpu_enforce_f32, bool gpu_share_constant_tensors,
-    std::string* out_error) {
+    int cpu_kernel_mode, int xnnpack_flags, std::string* out_error) {
   auto* env =
       litert_wrapper_utils::GetEnvironmentFromCapsule(environment_capsule);
   if (env == nullptr) {
@@ -379,13 +389,22 @@ CompiledModelWrapper* CompiledModelWrapper::CreateWrapperFromBuffer(
     }
   }
 
-  if (cpu_num_threads > 0) {
+  if (cpu_num_threads > 0 || cpu_kernel_mode >= 0 || xnnpack_flags >= 0) {
     auto cpu_options_or = options.GetCpuOptions();
     if (!cpu_options_or) {
       if (out_error) *out_error = cpu_options_or.Error().Message();
       return nullptr;
     }
-    cpu_options_or->SetNumThreads(cpu_num_threads);
+    if (cpu_num_threads > 0) {
+      cpu_options_or->SetNumThreads(cpu_num_threads);
+    }
+    if (cpu_kernel_mode >= 0) {
+      cpu_options_or->SetKernelMode(
+          static_cast<LiteRtCpuKernelMode>(cpu_kernel_mode));
+    }
+    if (xnnpack_flags >= 0) {
+      cpu_options_or->SetXNNPackFlags(static_cast<uint32_t>(xnnpack_flags));
+    }
   }
 
   // Create a compiled model
