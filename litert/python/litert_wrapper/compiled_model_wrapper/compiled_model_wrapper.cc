@@ -263,7 +263,7 @@ CompiledModelWrapper* CompiledModelWrapper::CreateWrapperFromFile(
     int cpu_kernel_mode, int xnnpack_flags, const char* xnnpack_weight_cache_path,
     bool enable_constant_tensor_sharing, bool enable_infinite_float_capping,
     bool enable_benchmark_mode, bool enable_allow_src_quantized_fc_conv_ops,
-    std::string* out_error) {
+    bool enable_hint_waiting_for_completion, std::string* out_error) {
   auto* env =
       litert_wrapper_utils::GetEnvironmentFromCapsule(environment_capsule);
   if (env == nullptr) {
@@ -288,7 +288,7 @@ CompiledModelWrapper* CompiledModelWrapper::CreateWrapperFromFile(
   auto& options = *options_or;
   options.SetHardwareAccelerators(static_cast<HwAccelerators>(hardware_accel));
 
-  if (gpu_enforce_f32 || gpu_share_constant_tensors || enable_constant_tensor_sharing || enable_infinite_float_capping || enable_benchmark_mode || enable_allow_src_quantized_fc_conv_ops) {
+  if (gpu_enforce_f32 || gpu_share_constant_tensors || enable_constant_tensor_sharing || enable_infinite_float_capping || enable_benchmark_mode || enable_allow_src_quantized_fc_conv_ops || enable_hint_waiting_for_completion) {
     auto gpu_options_or = options.GetGpuOptions();
     if (!gpu_options_or) {
       if (out_error) *out_error = gpu_options_or.Error().Message();
@@ -308,6 +308,9 @@ CompiledModelWrapper* CompiledModelWrapper::CreateWrapperFromFile(
     }
     if (enable_allow_src_quantized_fc_conv_ops) {
       gpu_options_or->EnableAllowSrcQuantizedFcConvOps(true);
+    }
+    if (enable_hint_waiting_for_completion) {
+      gpu_options_or->HintWaitingForCompletion(true);
     }
   }
 
@@ -359,7 +362,7 @@ CompiledModelWrapper* CompiledModelWrapper::CreateWrapperFromBuffer(
     int cpu_kernel_mode, int xnnpack_flags, const char* xnnpack_weight_cache_path,
     bool enable_constant_tensor_sharing, bool enable_infinite_float_capping,
     bool enable_benchmark_mode, bool enable_allow_src_quantized_fc_conv_ops,
-    std::string* out_error) {
+    bool enable_hint_waiting_for_completion, std::string* out_error) {
   auto* env =
       litert_wrapper_utils::GetEnvironmentFromCapsule(environment_capsule);
   if (env == nullptr) {
@@ -394,7 +397,7 @@ CompiledModelWrapper* CompiledModelWrapper::CreateWrapperFromBuffer(
   auto& options = *options_or;
   options.SetHardwareAccelerators(static_cast<HwAccelerators>(hardware_accel));
 
-  if (gpu_enforce_f32 || gpu_share_constant_tensors || enable_constant_tensor_sharing || enable_infinite_float_capping || enable_benchmark_mode || enable_allow_src_quantized_fc_conv_ops) {
+  if (gpu_enforce_f32 || gpu_share_constant_tensors || enable_constant_tensor_sharing || enable_infinite_float_capping || enable_benchmark_mode || enable_allow_src_quantized_fc_conv_ops || enable_hint_waiting_for_completion) {
     auto gpu_options_or = options.GetGpuOptions();
     if (!gpu_options_or) {
       if (out_error) *out_error = gpu_options_or.Error().Message();
@@ -414,6 +417,9 @@ CompiledModelWrapper* CompiledModelWrapper::CreateWrapperFromBuffer(
     }
     if (enable_allow_src_quantized_fc_conv_ops) {
       gpu_options_or->EnableAllowSrcQuantizedFcConvOps(true);
+    }
+    if (enable_hint_waiting_for_completion) {
+      gpu_options_or->HintWaitingForCompletion(true);
     }
   }
 
