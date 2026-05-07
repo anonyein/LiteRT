@@ -63,4 +63,4 @@ optimization tools.
 
 - vendors/
 
-  Code specific to SoC-vendors
+  Code specific to SoC-vendors.

@@ -14,23 +14,25 @@
 
 #include "litert/vendors/c/litert_dispatch.h"
 
-#include "litert/c/internal/litert_runtime_context.h"
-#include "litert/c/internal/litert_scheduling_info.h"
-#include "litert/c/litert_any.h"
-#include "litert/c/litert_model_types.h"
+#include <cstddef>
+#include <string>
+#include <vector>
 
 #if !defined(LITERT_WINDOWS_OS)
 #include <dlfcn.h>
 #endif  // !defined(LITERT_WINDOWS_OS)
 
-#include <string>
-#include <vector>
-
+#include "litert/c/internal/litert_custom_tensor_buffer_handlers_def.h"
 #include "litert/c/internal/litert_logging.h"
+#include "litert/c/internal/litert_runtime_context.h"
+#include "litert/c/internal/litert_scheduling_info.h"
+#include "litert/c/internal/litert_tensor_buffer_registry.h"
+#include "litert/c/litert_any.h"
 #include "litert/c/litert_common.h"
 #include "litert/c/litert_environment.h"
 #include "litert/c/litert_environment_options.h"
 #include "litert/c/litert_metrics.h"
+#include "litert/c/litert_model_types.h"
 #include "litert/cc/internal/litert_shared_library.h"
 #include "litert/cc/litert_expected.h"
 #include "litert/cc/litert_macros.h"
@@ -87,6 +89,7 @@ LiteRtDispatchApi TheApi = {
     /*.interface=*/nullptr,
     /*.async_interface=*/nullptr,
     /*.graph_interface=*/nullptr,
+    /*.tensor_buffer_handlers=*/nullptr,
 };
 
 LiteRtStatus Initialize(const LiteRtRuntimeContext* runtime_context,
@@ -171,6 +174,24 @@ LiteRtStatus LiteRtDispatchInitialize(
   if (!litert::internal::IsSameVersionAsRuntime(TheApi.version)) {
     LITERT_LOG(LITERT_ERROR, "Unsupported dispatch runtime version");
     return kLiteRtStatusErrorWrongVersion;
+  }
+
+  if (TheApi.tensor_buffer_handlers_def != nullptr) {
+    for (size_t i = 0;
+         i < TheApi.tensor_buffer_handlers_def->num_supported_buffer_types &&
+         i < LITERT_CUSTOM_BUFFER_HANDLERS_DEF_MAX_SUPPORTED_BUFFER_TYPES;
+         ++i) {
+      LITERT_RETURN_IF_ERROR(LiteRtRegisterTensorBufferHandlers(
+          env, TheApi.tensor_buffer_handlers_def->supported_buffer_types[i],
+          TheApi.tensor_buffer_handlers_def->create_func,
+          TheApi.tensor_buffer_handlers_def->destroy_func,
+          TheApi.tensor_buffer_handlers_def->lock_func,
+          TheApi.tensor_buffer_handlers_def->unlock_func,
+          TheApi.tensor_buffer_handlers_def->clear_func,
+          TheApi.tensor_buffer_handlers_def->import_func,
+          TheApi.tensor_buffer_handlers_def->device_tag,
+          TheApi.tensor_buffer_handlers_def->queue_tag));
+    }
   }
 
   auto status = Initialize(runtime_context, env, options);
