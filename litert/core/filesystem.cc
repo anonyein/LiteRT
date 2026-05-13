@@ -106,6 +106,19 @@ Expected<absl::Time> GetLastWriteTime(absl::string_view path) {
                           std::filesystem::file_time_type::clock::now());
 }
 
+Expected<void> TouchFile(absl::string_view path) {
+  auto std_path = MakeStdPath(path);
+  std::error_code ec;
+  std::filesystem::last_write_time(
+      std_path, std::filesystem::file_time_type::clock::now(), ec);
+  if (ec) {
+    return Error(kLiteRtStatusErrorFileIO,
+                 absl::StrFormat("Failed to touch file: %s, error: %s",
+                                 path, ec.message().c_str()));
+  }
+  return {};
+}
+
 Expected<OwningBufferRef<uint8_t>> LoadBinaryFile(absl::string_view path) {
   auto std_path = MakeStdPath(path);
 
@@ -197,6 +210,18 @@ Expected<void> MkDir(absl::string_view path) {
 Expected<std::string> Parent(absl::string_view path) {
   auto std_path = MakeStdPath(path);
   return std_path.parent_path().generic_string();
+}
+
+Expected<void> RemoveFile(absl::string_view path) {
+  auto std_path = MakeStdPath(path);
+  std::error_code ec;
+  std::filesystem::remove(std_path, ec);
+  if (ec) {
+    return Error(kLiteRtStatusErrorFileIO,
+                 absl::StrFormat("Failed to remove file: %s, error: %s",
+                                 path, ec.message().c_str()));
+  }
+  return {};
 }
 
 Expected<std::string> Relative(absl::string_view path, absl::string_view base) {
