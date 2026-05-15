@@ -422,7 +422,7 @@ class LiteRtTensorT {
 
   // IR is generally, default constructible and movable but not copyable.
   LiteRtTensorT() = default;
-  LiteRtTensorT(::litert::internal::BufferManager* buffer_manager)
+  explicit LiteRtTensorT(::litert::internal::BufferManager* buffer_manager)
       : weights_(buffer_manager) {}
   LiteRtTensorT(const LiteRtTensorT&) = delete;
   LiteRtTensorT(LiteRtTensorT&&) = default;
@@ -707,7 +707,7 @@ class LiteRtSubgraphT {
 
   // IR is generally, default constructible and movable but not copyable.
   LiteRtSubgraphT() = default;
-  LiteRtSubgraphT(::litert::internal::BufferManager* buffer_manager)
+  explicit LiteRtSubgraphT(::litert::internal::BufferManager* buffer_manager)
       : buffer_manager_(buffer_manager) {};
   LiteRtSubgraphT(const LiteRtSubgraphT&) = delete;
   LiteRtSubgraphT(LiteRtSubgraphT&&) = default;
@@ -1414,7 +1414,7 @@ void AbslStringify(Sink& sink, const LiteRtOpT* op) {
 namespace absl {
 
 template <class Sink>
-void StringifyLiteRtOpImpl(Sink& sink, const absl::Span<const LiteRtOp>& ops) {
+void StringifyLiteRtOpImpl(Sink& sink, const absl::Span<const LiteRtOp> ops) {
   for (auto it = ops.begin(); it < ops.end() - 1; ++it) {
     sink.Append(absl::StrFormat("%v", **it));
     sink.Append("/");
@@ -1423,12 +1423,12 @@ void StringifyLiteRtOpImpl(Sink& sink, const absl::Span<const LiteRtOp>& ops) {
 }
 
 template <class Sink>
-void AbslStringify(Sink& sink, const absl::Span<const LiteRtOp>& ops) {
+void AbslStringify(Sink& sink, const absl::Span<const LiteRtOp> ops) {
   StringifyLiteRtOpImpl(sink, ops);
 }
 
 template <class Sink>
-void AbslStringify(Sink& sink, const absl::Span<LiteRtOp>& ops) {
+void AbslStringify(Sink& sink, const absl::Span<LiteRtOp> ops) {
   StringifyLiteRtOpImpl(sink, ops);
 }
 
@@ -1442,25 +1442,25 @@ namespace litert::internal {
 // sets of options in a consistent manner.
 template <typename Sink>
 struct OptionStrBuilder {
-  OptionStrBuilder(Sink& sink) : sink_(sink) { sink_.Append("{"); }
+  explicit OptionStrBuilder(Sink& sink) : sink(sink) { sink.Append("{"); }
 
   template <typename Val>
   void operator()(const std::string& key, const Val& value) {
-    if (num_opts_++ > 0) {
-      sink_.Append(",");
+    if (num_opts++ > 0) {
+      sink.Append(",");
     }
     if constexpr (std::is_convertible_v<Val, absl::string_view>) {
-      absl::Format(&sink_, "%s=%s", key, value);
+      absl::Format(&sink, "%s=%s", key, value);
     } else {
-      absl::Format(&sink_, "%s=%v", key, value);
+      absl::Format(&sink, "%s=%v", key, value);
     }
   }
 
-  ~OptionStrBuilder() { sink_.Append("}"); }
+  ~OptionStrBuilder() { sink.Append("}"); }
 
  private:
-  size_t num_opts_ = 0;
-  Sink& sink_;
+  size_t num_opts = 0;
+  Sink& sink;
 };
 template <typename Sink>
 OptionStrBuilder(Sink& sink) -> OptionStrBuilder<Sink>;
@@ -1503,6 +1503,11 @@ void AbslStringify(Sink& sink, const ::litert::internal::TflOptions& opts) {
       absl::Format(&sink, "%v", dw_opts);
       break;
     }
+    case tflite::BuiltinOptions_ReducerOptions: {
+      const auto* reducer_opts = opts.AsReducerOptions();
+      absl::Format(&sink, "%v", reducer_opts);
+      break;
+    }
     case tflite::BuiltinOptions_MulOptions: {
       const auto* mul_opts = opts.AsMulOptions();
       absl::Format(&sink, "%v", mul_opts);
@@ -1516,6 +1521,11 @@ void AbslStringify(Sink& sink, const ::litert::internal::TflOptions& opts) {
     case tflite::BuiltinOptions_Pool2DOptions: {
       const auto* pool_opts = opts.AsPool2DOptions();
       absl::Format(&sink, "%v", pool_opts);
+      break;
+    }
+    case tflite::BuiltinOptions_ReshapeOptions: {
+      const auto* reshape_opts = opts.AsReshapeOptions();
+      absl::Format(&sink, "%v", reshape_opts);
       break;
     }
     case tflite::BuiltinOptions_NONE: {
@@ -1657,6 +1667,17 @@ void AbslStringify(Sink& sink, const DepthwiseConv2DOptionsT* opts) {
 }
 
 template <class Sink>
+void AbslStringify(Sink& sink, const ReducerOptionsT& opts) {
+  ::litert::internal::OptionStrBuilder b(sink);
+  b("keep_dims", opts.keep_dims);
+}
+
+template <class Sink>
+void AbslStringify(Sink& sink, const ReducerOptionsT* opts) {
+  ::litert::internal::PrintNullableOpts(sink, opts);
+}
+
+template <class Sink>
 void AbslStringify(Sink& sink, const MulOptionsT& opts) {
   ::litert::internal::OptionStrBuilder b(sink);
   b("fa", opts.fused_activation_function);
@@ -1675,6 +1696,25 @@ void AbslStringify(Sink& sink, const DivOptionsT& opts) {
 
 template <class Sink>
 void AbslStringify(Sink& sink, const DivOptionsT* opts) {
+  ::litert::internal::PrintNullableOpts(sink, opts);
+}
+
+template <class Sink>
+void AbslStringify(Sink& sink, const ReshapeOptionsT& opts) {
+  ::litert::internal::OptionStrBuilder b(sink);
+  std::string shape_str = "[";
+  for (auto it = opts.new_shape.begin(); it != opts.new_shape.end(); ++it) {
+    if (it != opts.new_shape.begin()) {
+      shape_str += ",";
+    }
+    shape_str += std::to_string(*it);
+  }
+  shape_str += "]";
+  b("new_shape", shape_str);
+}
+
+template <class Sink>
+void AbslStringify(Sink& sink, const ReshapeOptionsT* opts) {
   ::litert::internal::PrintNullableOpts(sink, opts);
 }
 
