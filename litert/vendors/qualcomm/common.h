@@ -42,10 +42,18 @@ typedef QNN_INTERFACE_VER_TYPE QnnApi;
 typedef QNN_SYSTEM_INTERFACE_VER_TYPE QnnSystemApi;
 
 // QNN backend library should be on DT_RUNPATH (-rpath) (for linux).
+#if LITERT_WINDOWS_OS
+static const char kLibQnnSystemSo[] = "QnnSystem.dll";
+#else
 static const char kLibQnnSystemSo[] = "libQnnSystem.so";
+#endif
 
 // Android only library.
+#if LITERT_WINDOWS_OS
+static const char kLibQnnHtpPrepareSo[] = "QnnHtpPrepare.dll";
+#else
 static const char kLibQnnHtpPrepareSo[] = "libQnnHtpPrepare.so";
+#endif
 
 // Map LiteRT element type to Qnn counterpart.
 inline LiteRtStatus LegalizeElementType(litert::ElementType litert_type,
@@ -114,6 +122,7 @@ inline LiteRtStatus InitQnnOptions(
   qnn_options.SetEnableWeightSharing(qualcomm_options.GetEnableWeightSharing());
   qnn_options.SetUseConvHMX(qualcomm_options.GetUseConvHMX());
   qnn_options.SetUseFoldReLU(qualcomm_options.GetUseFoldReLU());
+  qnn_options.SetHtpPPoint(qualcomm_options.GetHtpPPoint());
   qnn_options.SetHtpPerformanceMode(static_cast<::qnn::HtpPerformanceMode>(
       qualcomm_options.GetHtpPerformanceMode()));
   qnn_options.SetDspPerformanceMode(static_cast<::qnn::DspPerformanceMode>(
