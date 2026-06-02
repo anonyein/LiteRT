@@ -170,20 +170,7 @@ litert_define_ats(
         "yamnet",
         "yolo11n",
     ],
-    dont_register = [
-        ".*tfl\\.sub.*",
-        ".*tfl\\.add.*i32.*",
-        ".*861.*",
-        ".*tfl\\.relu_0_to_1.*",
-        ".*resnet18.*",
-        ".*BinaryNoBroadcast.*",
-        ".*tfl\\.exp.*",
-        ".*f16.*",
-        ".*tfl\\.ceil.*",
-        ".*5d.*",
-        ".*6d.*",
-        ".*tfl\\.zeros_like.*",
-    ],
+    dont_register = [],
     extra_flags = [
         "--data_seed=42",
     ],
@@ -360,6 +347,7 @@ cc_library(
         "//litert/cc/internal:litert_rng",
         "//litert/core:filesystem",
         "//litert/test/generators",
+        "@com_google_absl//absl/strings:string_view",
     ],
 )
 

@@ -58,6 +58,7 @@
 #include "litert/core/model/model_serialize.h"
 #include "litert/core/util/flatbuffer_tools.h"
 #include "litert/test/common.h"
+#include "litert/test/load_test_model.h"
 #include "litert/test/matchers.h"
 #include "litert/test/test_models.h"
 #include "tflite/schema/mutable/schema_generated.h"
@@ -422,6 +423,81 @@ TEST(ModelTestCCApi, Int2) {
   const auto num_channels = q_params.num_channels;
   ASSERT_EQ(num_channels, layout.Dimensions()[q_dim]);
   EXPECT_THAT(absl::MakeConstSpan(q_params.zero_points, num_channels), Each(0));
+}
+
+TEST(ModelTestCCApi, BlockWiseQuantization) {
+  auto model = LoadModelThroughRoundTrip("blockwise_quantized.tflite");
+  ASSERT_TRUE(model);
+
+  const auto& litert_model = *model;
+  LITERT_ASSERT_OK_AND_ASSIGN(const auto sg, litert_model.MainSubgraph());
+  const auto ops = sg.Ops();
+
+  ASSERT_EQ(ops.size(), 1);
+  const auto& add = ops[0];
+  ASSERT_EQ(add.Code(), kLiteRtOpCodeTflAdd);
+
+  const auto inputs = add.Inputs();
+  ASSERT_EQ(inputs.size(), 2);
+
+  Tensor quantized_tensor(nullptr);
+  for (const auto& input : inputs) {
+    if (input.Name() == "quantized_tensor") {
+      quantized_tensor = input;
+      break;
+    }
+  }
+  ASSERT_NE(quantized_tensor.Get(), nullptr);
+
+  LITERT_ASSERT_OK_AND_ASSIGN(const auto rtt,
+                              quantized_tensor.RankedTensorType());
+  ASSERT_EQ(rtt.ElementType(), ElementType::Int8);
+
+  ASSERT_TRUE(quantized_tensor.HasQuantization());
+  ASSERT_EQ(quantized_tensor.QTypeId(), kLiteRtQuantizationBlockWise);
+
+  const auto q_params = quantized_tensor.BlockWiseQuantization();
+  EXPECT_EQ(q_params.block_size, 32);
+
+  ASSERT_NE(q_params.scales, nullptr);
+  const char* scales_name;
+  LITERT_ASSERT_OK(LiteRtGetTensorName(q_params.scales, &scales_name));
+  EXPECT_STREQ(scales_name, "scales");
+
+  ASSERT_NE(q_params.zero_points, nullptr);
+  const char* zps_name;
+  LITERT_ASSERT_OK(LiteRtGetTensorName(q_params.zero_points, &zps_name));
+  EXPECT_STREQ(zps_name, "zps");
+}
+
+TEST(ModelTestCCApi, QwenBlockWiseQuantization) {
+  auto model = LoadModelThroughRoundTrip("qwen_fc_blockwise_quantized.tflite");
+  ASSERT_TRUE(model);
+
+  const auto& litert_model = *model;
+  LITERT_ASSERT_OK_AND_ASSIGN(const auto sg, litert_model.MainSubgraph());
+  const auto ops = sg.Ops();
+
+  ASSERT_EQ(ops.size(), 1);
+  const auto& fc = ops[0];
+  ASSERT_EQ(fc.Code(), kLiteRtOpCodeTflFullyConnected);
+
+  const auto inputs = fc.Inputs();
+  ASSERT_GE(inputs.size(), 2);
+
+  const auto& weights_tensor = inputs[1];
+
+  LITERT_ASSERT_OK_AND_ASSIGN(const auto rtt,
+                              weights_tensor.RankedTensorType());
+  ASSERT_EQ(rtt.ElementType(), ElementType::Int4);
+
+  ASSERT_TRUE(weights_tensor.HasQuantization());
+  ASSERT_EQ(weights_tensor.QTypeId(), kLiteRtQuantizationBlockWise);
+
+  const auto q_params = weights_tensor.BlockWiseQuantization();
+  EXPECT_EQ(q_params.block_size, 32);
+
+  ASSERT_NE(q_params.scales, nullptr);
 }
 
 TEST(ModelSerializeTest, WithOffsetTensorBuffer) {
