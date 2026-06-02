@@ -370,7 +370,7 @@ class CompiledModel : public internal::BaseHandle<LiteRtCompiledModel> {
                             BuildOptions(compilation_options, env_holder));
     LiteRtModel litert_model;
     if (auto status = env_holder.runtime->CreateModelFromFile(
-            model_filename.c_str(), &litert_model);
+            env_holder.handle, model_filename.c_str(), &litert_model);
         status != kLiteRtStatusOk) {
       return Unexpected(ToStatus(status), "Failed to load model from file");
     }
@@ -398,7 +398,8 @@ class CompiledModel : public internal::BaseHandle<LiteRtCompiledModel> {
         BuildOptions(std::move(compilation_options), env.GetHolder()));
     LiteRtModel litert_model;
     if (auto status = env_holder.runtime->CreateModelFromBuffer(
-            model_buffer.Data(), model_buffer.Size(), &litert_model);
+            env_holder.handle, model_buffer.Data(), model_buffer.Size(),
+            &litert_model);
         status != kLiteRtStatusOk) {
       return Unexpected(ToStatus(status), "Failed to load model from buffer");
     }
