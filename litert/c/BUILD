@@ -134,6 +134,16 @@ litert_c_api_library(
     ],
 )
 
+cc_test(
+    name = "litert_metrics_test",
+    srcs = ["litert_metrics_test.cc"],
+    deps = [
+        ":litert_common",
+        ":litert_metrics",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
 litert_c_api_library(
     name = "litert_environment",
     srcs = ["litert_environment.cc"],
@@ -198,6 +208,16 @@ cc_library(
     hdrs = ["litert_layout.h"],
     compatible_with = get_compatible_with_portable(),
     deps = [":litert_common"],
+)
+
+cc_test(
+    name = "litert_layout_test",
+    srcs = ["litert_layout_test.cc"],
+    deps = [
+        ":litert_common",
+        ":litert_layout",
+        "@com_google_googletest//:gtest_main",
+    ],
 )
 
 cc_library(
