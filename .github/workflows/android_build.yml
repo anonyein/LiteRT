@@ -267,6 +267,12 @@ jobs:
             echo "hwloc directory not found, skipping"
           fi
 
+      # ✅ 关键步骤：在 select-tf-ops 构建命令的末尾强制追加 --features=-layering_check
+      - name: Force disable layering_check for select-tf-ops build
+        run: |
+          sed -i '/\/\/tflite\/java:tensorflow-lite-select-tf-ops/ s/$/ --features=-layering_check/' ci/build_android_package.sh
+          echo "✅ Appended --features=-layering_check to select-tf-ops build line"
+
       - name: Run build_android_package.sh
         run: |
           chmod +x ./ci/build_android_package.sh
