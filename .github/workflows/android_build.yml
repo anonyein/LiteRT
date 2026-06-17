@@ -279,7 +279,6 @@ jobs:
           BUILD_FILE="${OUTPUT_BASE}/external/org_tensorflow/tensorflow/core/BUILD"
           cp "$BUILD_FILE" "$BUILD_FILE.bak"
 
-          # 通过环境变量将 BUILD_FILE 传入 Python
           export BUILD_FILE
           python3 << EOF
           import os, re
@@ -288,15 +287,15 @@ jobs:
           with open(build_file, 'r') as f:
               content = f.read()
 
-          # 匹配 portable_tensorflow_lib_lite 规则，在 features 行之后插入 deps
-          pattern = r'(name\s*=\s*"portable_tensorflow_lib_lite".*?features\s*=\s*\[[^\]]*\])'
+          # 匹配 portable_tensorflow_lib_lite 规则，在 features 行（含末尾逗号）之后插入 deps
+          pattern = r'(name\s*=\s*"portable_tensorflow_lib_lite".*?features\s*=\s*\[[^\]]*\]\s*,)'
           replacement = r'\1\n    deps = ["@xla//xla/tsl/framework:fixedpoint"],'
           new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
 
           if count == 0:
-              # 如果没找到 features，尝试在 linkopts 之后插入
-              pattern = r'(name\s*=\s*"portable_tensorflow_lib_lite".*?linkopts\s*=\s*[^\n]+)'
-              replacement = r'\1\n    deps = ["@xla//xla/tsl/framework:fixedpoint"],'
+              # 如果没找到 features，尝试在 linkopts 之前插入（同时处理逗号）
+              pattern = r'(name\s*=\s*"portable_tensorflow_lib_lite".*?)(linkopts\s*=)'
+              replacement = r'\1    deps = ["@xla//xla/tsl/framework:fixedpoint"],\n    \2'
               new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
 
           if count == 0:
@@ -307,11 +306,9 @@ jobs:
           print("✅ Added deps to portable_tensorflow_lib_lite")
           EOF
 
-          # 打印修改后的规则内容（前 20 行）
           echo "=== Patched portable_tensorflow_lib_lite rule ==="
           grep -A 20 'name = "portable_tensorflow_lib_lite"' "$BUILD_FILE"
 
-          # 验证是否包含 fixedpoint
           if grep -A 20 'name = "portable_tensorflow_lib_lite"' "$BUILD_FILE" | grep -q 'fixedpoint'; then
             echo "✅ Dependency verified"
           else
