@@ -307,7 +307,11 @@ jobs:
           print("✅ Added deps to portable_tensorflow_lib_lite")
           EOF
 
-          # 验证是否成功添加
+          # 打印修改后的规则内容（前 20 行）
+          echo "=== Patched portable_tensorflow_lib_lite rule ==="
+          grep -A 20 'name = "portable_tensorflow_lib_lite"' "$BUILD_FILE"
+
+          # 验证是否包含 fixedpoint
           if grep -A 20 'name = "portable_tensorflow_lib_lite"' "$BUILD_FILE" | grep -q 'fixedpoint'; then
             echo "✅ Dependency verified"
           else
