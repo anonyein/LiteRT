@@ -20,8 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
-      # ✅ 最小修改：追加 -DXNN_ENABLE_KLEIDIAI=0，避免因缺少 Kai 头文件而编译失败 --features=-layering_check 绕过未声明头文件依赖检查
-      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL --copt=-DXNN_ENABLE_KLEIDIAI=0 --features=-layering_check"
+      # ✅ 最小修改：追加 -DXNN_ENABLE_KLEIDIAI=0，避免因缺少 Kai 头文件而编译失败
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL --copt=-DXNN_ENABLE_KLEIDIAI=0"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
       # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
@@ -45,11 +45,11 @@ jobs:
           fi
           echo "XNNPACK cloned to /tmp/xnnpack"
 
-      - name: Inject XNNPACK override and disable layering_check
+      - name: Inject XNNPACK override (uppercase repo name)
         run: |
           # 修改构建脚本，使用正确的仓库名 XNNPACK
-          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack --features=-layering_check /g' ci/build_android_package.sh
-          echo "✅ Patched build script with --override_repository=XNNPACK=/tmp/xnnpack and --features=-layering_check"
+          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack /g' ci/build_android_package.sh
+          echo "✅ Patched build script with --override_repository=XNNPACK=/tmp/xnnpack"
       # ======================================================
 
       - name: Setup Bazel
@@ -224,7 +224,57 @@ jobs:
                        "#endif" > "$MKL_UTIL_H"
           echo "Created empty $MKL_UTIL_H"
 
-      # 修复 hwloc：1. 删除 x86 源文件引用；2. 禁用 pthread affinity 函数
+      # ✅ 修正后的步骤：用 Python 精确添加缺失的 fixedpoint 依赖
+      - name: Fix missing fixedpoint deps in portable_tensorflow_lib_lite
+        run: |
+          # 外部仓库已被前面的步骤下载，这里可直接定位
+          OUTPUT_BASE=$(bazel info output_base)
+          BUILD_FILE="${OUTPUT_BASE}/external/org_tensorflow/tensorflow/core/BUILD"
+          if [ ! -f "$BUILD_FILE" ]; then
+            echo "❌ BUILD file not found at $BUILD_FILE"
+            exit 1
+          fi
+          cp "$BUILD_FILE" "$BUILD_FILE.bak"
+
+          export BUILD_FILE
+          python3 << 'PYEOF'
+          import re, os
+
+          build_file = os.environ['BUILD_FILE']
+          with open(build_file, 'r') as f:
+              content = f.read()
+
+          new_dep = '        "@xla//xla/tsl/framework:fixedpoint",'
+
+          # 匹配 name = "portable_tensorflow_lib_lite" 后的 deps = [ 块，并插入新依赖
+          pattern = r'(name\s*=\s*"portable_tensorflow_lib_lite".*?deps\s*=\s*\[)(\s*\n)'
+          replacement = r'\1\2' + new_dep + '\n'
+          new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
+
+          if count == 0:
+              # 如果 deps = [ 后面已有内容，则在 [ 后换行插入
+              pattern2 = r'(name\s*=\s*"portable_tensorflow_lib_lite".*?deps\s*=\s*\[)([^\]\n])'
+              replacement2 = r'\1\n' + new_dep + '\n\2'
+              new_content, count = re.subn(pattern2, replacement2, content, flags=re.DOTALL)
+
+          if count == 0:
+              raise Exception("Could not find deps = [ for portable_tensorflow_lib_lite")
+
+          with open(build_file, 'w') as f:
+              f.write(new_content)
+          print("✅ Added fixedpoint dep (occurrences: {})".format(count))
+          PYEOF
+
+          # 验证
+          echo "=== Verification ==="
+          if grep -A 15 'name = "portable_tensorflow_lib_lite"' "$BUILD_FILE" | grep -q 'fixedpoint'; then
+            echo "✅ Dependency successfully inserted."
+          else
+            echo "❌ Failed to insert dependency!"
+            grep -A 15 'name = "portable_tensorflow_lib_lite"' "$BUILD_FILE" || true
+            exit 1
+          fi
+
       - name: Fetch hwloc and apply fixes
         run: |
           bazel fetch @hwloc//... || true
