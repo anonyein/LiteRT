@@ -273,7 +273,7 @@ jobs:
           sed -i '/\/\/tflite\/java:tensorflow-lite-select-tf-ops/ s/$/ --features=-layering_check/' ci/build_android_package.sh
           echo "✅ Appended --features=-layering_check to select-tf-ops build line"
       
-      - name: Add missing fixedpoint deps and print BUILD file
+      - name: Add fixedpoint dep to existing deps list and print BUILD
         run: |
           OUTPUT_BASE=$(bazel info output_base)
           BUILD_FILE="${OUTPUT_BASE}/external/org_tensorflow/tensorflow/core/BUILD"
@@ -281,54 +281,41 @@ jobs:
 
           export BUILD_FILE
           python3 << 'PYEOF'
-          import os
+          import os, re
 
           build_file = os.environ['BUILD_FILE']
           with open(build_file, 'r') as f:
-              lines = f.readlines()
+              content = f.read()
 
-          in_target = False
-          target_indent = ''
-          inserted = False
-          output_lines = []
-          for i, line in enumerate(lines):
-              if 'name = "portable_tensorflow_lib_lite"' in line and not in_target:
-                  in_target = True
-                  target_indent = line[:len(line) - len(line.lstrip())]  # 缩进
-              if in_target:
-                  output_lines.append(line)
-                  # 在 features 行之后立即插入 deps
-                  if not inserted and 'features' in line and '"-layering_check"' in line:
-                      output_lines.append(target_indent + '    deps = ["@xla//xla/tsl/framework:fixedpoint"],\n')
-                      inserted = True
-                  # 检查规则是否结束（与规则起始相同缩进的右括号）
-                  stripped = line.lstrip()
-                  if stripped.startswith(')') and line.startswith(target_indent):
-                      if not inserted:
-                          # 兜底：如果没找到 features，在右括号前插入
-                          output_lines.insert(-1, target_indent + '    deps = ["@xla//xla/tsl/framework:fixedpoint"],\n')
-                          inserted = True
-                      in_target = False
-              else:
-                  output_lines.append(line)
+          # 在 portable_tensorflow_lib_lite 规则的 deps = [ 之后立即插入依赖项
+          pattern = r'(name\s*=\s*"portable_tensorflow_lib_lite".*?deps\s*=\s*\[)'
+          replacement = r'\1\n        "@xla//xla/tsl/framework:fixedpoint",'
+          new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
 
-          if not inserted:
-              raise Exception("Could not insert deps into portable_tensorflow_lib_lite")
+          if count == 0:
+              raise Exception("Could not find deps list for portable_tensorflow_lib_lite")
 
           with open(build_file, 'w') as f:
-              f.writelines(output_lines)
-          print("✅ Added deps to portable_tensorflow_lib_lite")
+              f.write(new_content)
+          print("✅ Added fixedpoint dep to existing deps")
           PYEOF
 
-          # 输出整个 BUILD 文件（如文件过大可改用 grep -A 30 仅打印规则附近）
           echo "=== Full patched BUILD file ==="
           cat "$BUILD_FILE"
 
-          # 验证
-          if grep -A 20 'name = "portable_tensorflow_lib_lite"' "$BUILD_FILE" | grep -q 'fixedpoint'; then
-            echo "✅ Dependency verified"
+          echo "=== Verification ==="
+          # 检查规则范围内只出现一次 deps 定义
+          RULE_BLOCK=$(grep -A 40 'name = "portable_tensorflow_lib_lite"' "$BUILD_FILE")
+          DEPS_COUNT=$(echo "$RULE_BLOCK" | grep -c '^\s*deps\s*=' || true)
+          if [ "$DEPS_COUNT" -ne 1 ]; then
+            echo "❌ Found $DEPS_COUNT deps definitions (expected 1)"
+            exit 1
+          fi
+
+          if echo "$RULE_BLOCK" | grep -q 'fixedpoint'; then
+            echo "✅ Dependency inserted and verified"
           else
-            echo "❌ Failed to insert dependency"
+            echo "❌ fixedpoint not found in rule"
             exit 1
           fi
           
