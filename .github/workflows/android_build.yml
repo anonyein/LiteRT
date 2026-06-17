@@ -45,11 +45,11 @@ jobs:
           fi
           echo "XNNPACK cloned to /tmp/xnnpack"
 
-      - name: Inject correct XNNPACK override (uppercase repo name)
+      - name: Inject XNNPACK override and disable layering_check
         run: |
           # 修改构建脚本，使用正确的仓库名 XNNPACK
-          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack /g' ci/build_android_package.sh
-          echo "✅ Patched build script with --override_repository=XNNPACK=/tmp/xnnpack"
+          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack --features=-layering_check /g' ci/build_android_package.sh
+          echo "✅ Patched build script with --override_repository=XNNPACK=/tmp/xnnpack and --features=-layering_check"
       # ======================================================
 
       - name: Setup Bazel
