@@ -87,6 +87,12 @@ jobs:
           echo "build --repo_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
           echo "build --action_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
 
+      # ✅ 关键步骤：全局 + monolithic 配置双关闭 layering_check
+      - name: Disable layering_check globally and for monolithic config
+        run: |
+          echo "build --features=-layering_check" >> .bazelrc
+          echo "build:monolithic --features=-layering_check" >> .bazelrc
+
       - name: Verify Android paths
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"
@@ -223,57 +229,6 @@ jobs:
                        "// Empty file for Android build to satisfy dependencies." \
                        "#endif" > "$MKL_UTIL_H"
           echo "Created empty $MKL_UTIL_H"
-
-      # ✅ 修正后的步骤：用 Python 精确添加缺失的 fixedpoint 依赖
-      - name: Fix missing fixedpoint deps in portable_tensorflow_lib_lite
-        run: |
-          # 外部仓库已被前面的步骤下载，这里可直接定位
-          OUTPUT_BASE=$(bazel info output_base)
-          BUILD_FILE="${OUTPUT_BASE}/external/org_tensorflow/tensorflow/core/BUILD"
-          if [ ! -f "$BUILD_FILE" ]; then
-            echo "❌ BUILD file not found at $BUILD_FILE"
-            exit 1
-          fi
-          cp "$BUILD_FILE" "$BUILD_FILE.bak"
-
-          export BUILD_FILE
-          python3 << 'PYEOF'
-          import re, os
-
-          build_file = os.environ['BUILD_FILE']
-          with open(build_file, 'r') as f:
-              content = f.read()
-
-          new_dep = '        "@xla//xla/tsl/framework:fixedpoint",'
-
-          # 匹配 name = "portable_tensorflow_lib_lite" 后的 deps = [ 块，并插入新依赖
-          pattern = r'(name\s*=\s*"portable_tensorflow_lib_lite".*?deps\s*=\s*\[)(\s*\n)'
-          replacement = r'\1\2' + new_dep + '\n'
-          new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
-
-          if count == 0:
-              # 如果 deps = [ 后面已有内容，则在 [ 后换行插入
-              pattern2 = r'(name\s*=\s*"portable_tensorflow_lib_lite".*?deps\s*=\s*\[)([^\]\n])'
-              replacement2 = r'\1\n' + new_dep + '\n\2'
-              new_content, count = re.subn(pattern2, replacement2, content, flags=re.DOTALL)
-
-          if count == 0:
-              raise Exception("Could not find deps = [ for portable_tensorflow_lib_lite")
-
-          with open(build_file, 'w') as f:
-              f.write(new_content)
-          print("✅ Added fixedpoint dep (occurrences: {})".format(count))
-          PYEOF
-
-          # 验证
-          echo "=== Verification ==="
-          if grep -A 15 'name = "portable_tensorflow_lib_lite"' "$BUILD_FILE" | grep -q 'fixedpoint'; then
-            echo "✅ Dependency successfully inserted."
-          else
-            echo "❌ Failed to insert dependency!"
-            grep -A 15 'name = "portable_tensorflow_lib_lite"' "$BUILD_FILE" || true
-            exit 1
-          fi
 
       - name: Fetch hwloc and apply fixes
         run: |
