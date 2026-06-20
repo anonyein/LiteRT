@@ -21,7 +21,7 @@ jobs:
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
       # 保持原有的编译选项，不在这里添加 override_repository
-      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL"
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL --copt=-Iexternal/XNNPACK/third_party/kleidiai/src"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
       # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
@@ -51,7 +51,7 @@ jobs:
           git clone --depth 1 https://github.com/ARM-software/kleidiai.git /tmp/kleidiai
           echo "KleidiAI cloned to /tmp/kleidiai"
 
-      # ---------- 修复 KleidiAI 目录结构（对齐官方 BUILD.gn：文件必须在 src/kai/ 下） ----------
+      # ---------- 修复 KleidiAI 目录结构（确保 src/kai/ 存在） ----------
       - name: Fix KleidiAI directory layout
         run: |
           cd /tmp/kleidiai
@@ -71,11 +71,11 @@ jobs:
           if [ -f "$HEADER" ]; then
             echo "✅ Required header found"
           else
-            echo "❌ Required header MISSING. KleidiAI version mismatch. Please check XNNPACK submodule commit."
+            echo "❌ Required header MISSING. KleidiAI version mismatch."
             exit 1
           fi
 
-      # ---------- 将修复后的 KleidiAI 整体复制到 XNNPACK 的 third_party/kleidiai ----------
+      # ---------- 将修复后的 KleidiAI 复制到 XNNPACK 的 third_party/kleidiai ----------
       - name: Install KleidiAI into XNNPACK third_party
         run: |
           mkdir -p /tmp/xnnpack/third_party
@@ -83,7 +83,7 @@ jobs:
           cp -r /tmp/kleidiai /tmp/xnnpack/third_party/kleidiai
           echo "KleidiAI installed at /tmp/xnnpack/third_party/kleidiai"
 
-      # ---------- 在 third_party/kleidiai 中生成 Bazel BUILD 文件 ----------
+      # ---------- 在 third_party/kleidiai 中生成 BUILD.bazel（虽然主要靠 -I，但保留以备不时之需） ----------
       - name: Create BUILD.bazel for third_party/kleidiai
         run: |
           cd /tmp/xnnpack/third_party/kleidiai
@@ -99,50 +99,7 @@ jobs:
           echo "=== Generated BUILD.bazel ==="
           cat BUILD.bazel
 
-      # ---------- 修改 XNNPACK 的 BUILD.bazel，为 neonsme 目标添加 Kai 依赖 ----------
-      - name: Add Kai dependency to XNNPACK's neonsme target
-        run: |
-          cd /tmp/xnnpack
-          BUILD_FILE="BUILD.bazel"
-          if [ ! -f "$BUILD_FILE" ]; then
-            echo "BUILD.bazel not found"
-            exit 1
-          fi
-          cp "$BUILD_FILE" "$BUILD_FILE.bak"
-
-          python3 << 'PYEOF'
-          import re
-
-          with open("BUILD.bazel", "r") as f:
-              content = f.read()
-
-          # 查找 neonsme_prod_microkernels 定义的 cc_library 块，为其添加 deps
-          pattern = r'(name\s*=\s*"neonsme_prod_microkernels".*?)(\n\s*\))'
-
-          def replacer(match):
-              block = match.group(1)
-              closing = match.group(2)
-              if re.search(r'deps\s*=\s*\[', block):
-                  # 已有 deps 列表，在列表末尾插入
-                  block = re.sub(r'(deps\s*=\s*\[)(.*?)(\])',
-                                 r'\1\2, "//third_party/kleidiai:kai"\3',
-                                 block, flags=re.DOTALL)
-              else:
-                  # 没有 deps，在 closing 之前插入 deps
-                  block += ',\n    deps = ["//third_party/kleidiai:kai"]'
-              return block + closing
-
-          new_content, count = re.subn(pattern, replacer, content, flags=re.DOTALL)
-          if count == 0:
-              print("❌ Could not find neonsme_prod_microkernels target, cannot add deps")
-              exit(1)
-
-          with open("BUILD.bazel", "w") as f:
-              f.write(new_content)
-          print("✅ Added //third_party/kleidiai:kai to deps of neonsme_prod_microkernels")
-          PYEOF
-
-      # ---------- 注入 XNNPACK 仓库覆盖（KleidiAI 已内嵌，无需单独 override） ----------
+      # ---------- 注入 XNNPACK 仓库覆盖 ----------
       - name: Inject XNNPACK override into build script
         run: |
           sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack /g' ci/build_android_package.sh
@@ -150,7 +107,7 @@ jobs:
           echo "=== Patched build commands (first 5) ==="
           grep -n 'bazel build' ci/build_android_package.sh | head -5
 
-      # ======================= 以下为原有的 Android 构建环境及所有补丁 =======================
+      # ======================= 以下为原有的 Android 构建环境及所有补丁（完全不变） =======================
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
         with:
