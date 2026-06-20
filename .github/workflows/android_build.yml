@@ -51,7 +51,18 @@ jobs:
           # 修改构建脚本，使用正确的仓库名 XNNPACK
           sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack /g' ci/build_android_package.sh
           echo "✅ Patched build script with --override_repository=XNNPACK=/tmp/xnnpack"
-      # ======================================================
+
+      # ========== 新增：添加 KleidiAI 仓库 ==========
+      - name: Clone KleidiAI
+        run: |
+          git clone --depth 1 https://github.com/ARM-software/kleidiai.git /tmp/kleidiai
+          echo "KleidiAI cloned to /tmp/kleidiai"
+
+      - name: Inject KleidiAI override
+        run: |
+          sed -i 's/bazel build/bazel build --override_repository=kleidiai=\/tmp\/kleidiai /g' ci/build_android_package.sh
+          echo "✅ Patched build script with --override_repository=kleidiai=/tmp/kleidiai"
+      # ==============================================
 
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
