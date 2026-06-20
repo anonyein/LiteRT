@@ -99,34 +99,46 @@ jobs:
           echo "=== Generated BUILD.bazel ==="
           cat BUILD.bazel
 
-      # ========== 🔥 关键修复：在 MICROKERNEL_DEPS 中添加 Kai 依赖 ==========
-      - name: Add KleidiAI to XNNPACK MICROKERNEL_DEPS
+      # 🔥 关键步骤：添加 Kai 依赖并打印详细日志
+      - name: Add KleidiAI to MICROKERNEL_DEPS with verbose log
         run: |
           cd /tmp/xnnpack
           BUILD_FILE="BUILD.bazel"
           cp "$BUILD_FILE" "$BUILD_FILE.bak"
 
+          echo "=== Original MICROKERNEL_DEPS (first 5 and last 5 lines) ==="
+          grep -A 20 "MICROKERNEL_DEPS" "$BUILD_FILE" | head -25
+
           python3 << 'PYEOF'
           with open("BUILD.bazel", "r") as f:
               lines = f.readlines()
 
-          in_microkernel_deps = False
+          in_deps = False
           new_lines = []
+          inserted = False
           for i, line in enumerate(lines):
               if line.strip().startswith("MICROKERNEL_DEPS"):
-                  in_microkernel_deps = True
-              if in_microkernel_deps and line.strip() == "]":
-                  # 在 ] 之前插入新依赖行
+                  in_deps = True
+              if in_deps and line.strip() == "]":
+                  # 在 ] 之前插入新依赖
                   new_lines.append('    "//third_party/kleidiai:kai",\n')
-                  in_microkernel_deps = False
+                  inserted = True
+                  in_deps = False
               new_lines.append(line)
+
+          if not inserted:
+              print("❌ Could not find closing bracket of MICROKERNEL_DEPS")
+              exit(1)
 
           with open("BUILD.bazel", "w") as f:
               f.writelines(new_lines)
-          print("✅ Inserted //third_party/kleidiai:kai into MICROKERNEL_DEPS")
+          print("✅ Inserted '//third_party/kleidiai:kai' into MICROKERNEL_DEPS")
           PYEOF
 
-      # ========== 注入 XNNPACK 仓库覆盖（KleidiAI 已内嵌） ==========
+          echo ""
+          echo "=== Modified MICROKERNEL_DEPS (first 5 and last 5 lines) ==="
+          grep -A 20 "MICROKERNEL_DEPS" "$BUILD_FILE" | head -25
+
       - name: Inject XNNPACK override into build script
         run: |
           sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack /g' ci/build_android_package.sh
