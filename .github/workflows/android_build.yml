@@ -52,94 +52,48 @@ jobs:
           echo "KleidiAI cloned to /tmp/kleidiai"
 
       # ========== 动态生成 KleidiAI 的 BUILD.bazel ==========
-      - name: Create correct Bazel BUILD for KleidiAI
+      - name: Fix KleidiAI directory layout
         run: |
           cd /tmp/kleidiai
-          # 探测真实目录结构
           if [ -d src/kai ]; then
-            INCLUDE_DIR="src"
-            HEADER_GLOB="src/kai/**/*.h"
+            echo "✅ Already have src/kai, nothing to do"
           elif [ -d kai ]; then
-            INCLUDE_DIR="."
-            HEADER_GLOB="kai/**/*.h"
+            echo "Found kai at root, moving into src/kai..."
+            mkdir -p src
+            mv kai src/
           else
-            echo "❌ Cannot find kai headers (tried src/kai and kai)"
+            echo "❌ Neither src/kai nor kai found"
             find . -maxdepth 2 -type d
             exit 1
           fi
-          echo "Using include dir: $INCLUDE_DIR"
-          echo "Using glob: $HEADER_GLOB"
+          # 验证最终结构
+          ls -la src/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/ 2>/dev/null || echo "Directory listing failed"
 
-          printf '%s\n' \
-            'package(default_visibility = ["//visibility:public"])' \
-            '' \
-            'cc_library(' \
-            "    name = \"kai\"," \
-            "    hdrs = glob([\"$HEADER_GLOB\"])," \
-            "    includes = [\"$INCLUDE_DIR\"]," \
-            ')' > BUILD.bazel
+      # ========== 生成正确的 BUILD.bazel ==========
+      - name: Create correct Bazel BUILD for KleidiAI
+        run: |
+          cd /tmp/kleidiai
+          cat > BUILD.bazel << 'BAZEL_EOF'
+          package(default_visibility = ["//visibility:public"])
 
-          echo "=== Final BUILD.bazel ==="
+          cc_library(
+              name = "kai",
+              hdrs = glob(["src/kai/**/*.h"]),
+              includes = ["src"],
+          )
+          BAZEL_EOF
+          echo "=== Generated BUILD.bazel ==="
           cat BUILD.bazel
 
-          # 验证缺失的头文件至少存在于某个位置
-          NEEDLE="kai_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot.h"
-          if [ -f "$INCLUDE_DIR/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/$NEEDLE" ]; then
-            echo "✅ Required header found"
-          else
-            echo "⚠️ Required header not found at expected path, searching..."
-            find . -name "$NEEDLE" 2>/dev/null || echo "❌ Not found anywhere"
-          fi
-
-      # ========== 给 XNNPACK 的 neonsme 目标注入 @kleidiai 依赖 ==========
-      - name: Add @kleidiai dep to XNNPACK's neonsme target
-        run: |
-          XNNPACK_BUILD="/tmp/xnnpack/BUILD.bazel"
-          if [ ! -f "$XNNPACK_BUILD" ]; then
-            echo "BUILD.bazel not found at $XNNPACK_BUILD"
-            exit 1
-          fi
-          cp "$XNNPACK_BUILD" "$XNNPACK_BUILD.bak"
-
-          python3 << 'PYEOF'
-          import re
-
-          build_file = "/tmp/xnnpack/BUILD.bazel"
-          with open(build_file, 'r') as f:
-              content = f.read()
-
-          # 查找 neonsme_prod_microkernels 所在的 cc_library 块，并确保依赖中包含 @kleidiai//:kai
-          pattern = r'(name\s*=\s*"neonsme_prod_microkernels".*?)(\n\s*\))'
-          def replacer(match):
-              block = match.group(1)
-              closing = match.group(2)
-              # 如果已有 deps，则在列表末尾追加
-              if re.search(r'deps\s*=\s*\[', block):
-                  block = re.sub(r'(deps\s*=\s*\[.*?)(\])', r'\1, "@kleidiai//:kai"\2', block, flags=re.DOTALL)
-              else:
-                  # 没有 deps，在 closing 之前插入 deps = ["@kleidiai//:kai"]
-                  block += '\n    deps = ["@kleidiai//:kai"],'
-              return block + closing
-
-          new_content, count = re.subn(pattern, replacer, content, flags=re.DOTALL)
-          if count == 0:
-              print("❌ Could not find neonsme_prod_microkernels target, cannot patch deps")
-              exit(1)
-
-          with open(build_file, 'w') as f:
-              f.write(new_content)
-          print("✅ Added @kleidiai//:kai to deps of neonsme_prod_microkernels")
-          PYEOF
-
-      # ========== 注入仓库覆盖参数 ==========
-      - name: Inject XNNPACK and KleidiAI overrides into build script
+      # ---------- 注入仓库覆盖参数（XNNPACK 和 KleidiAI） ----------
+      - name: Inject repository overrides into build script
         run: |
           sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack --override_repository=kleidiai=\/tmp\/kleidiai /g' ci/build_android_package.sh
           echo "✅ Injected both overrides"
           echo "=== Patched build commands (first 5) ==="
           grep -n 'bazel build' ci/build_android_package.sh | head -5
 
-      # ========== 以下是所有原有构建步骤（完全保留） ==========
+      # ---------- 以下所有原有构建步骤保持不变 ----------
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
         with:
