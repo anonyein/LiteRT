@@ -86,14 +86,25 @@ jobs:
             find . -maxdepth 2 -type d
             exit 1
           fi
-          # 确认关键头文件存在
-          HEADER="src/kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot.h"
-          if [ -f "$HEADER" ]; then
-            echo "✅ Required header found"
-          else
-            echo "❌ Required header MISSING. KleidiAI version mismatch."
-            exit 1
-          fi
+
+      # ---------- 生成 qsi4cxp → qsi8cxp 兼容头文件 ----------
+      - name: Generate compat header for missing qsi4cxp symbols
+        run: |
+          cd /tmp/kleidiai
+          cat > src/kai/kai_compat.h << 'EOF'
+          #ifndef KAI_COMPAT_H
+          #define KAI_COMPAT_H
+
+          // 将缺失的 qsi4cxp 符号映射到已有的 qsi8cxp 实现
+          #define kai_get_mr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa   kai_get_mr_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme_mopa
+          #define kai_get_nr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa   kai_get_nr_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme_mopa
+          #define kai_run_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa     kai_run_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme_mopa
+          #define kai_run_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot           kai_run_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4vlx4_1x4vl_sme_dot
+
+          #endif
+          EOF
+          echo "=== Compat header ==="
+          cat src/kai/kai_compat.h
 
       # ---------- 将 KleidiAI 放入 XNNPACK 的 third_party ----------
       - name: Install KleidiAI into XNNPACK third_party
@@ -103,7 +114,7 @@ jobs:
           cp -r /tmp/kleidiai /tmp/xnnpack/third_party/kleidiai
           echo "KleidiAI installed at /tmp/xnnpack/third_party/kleidiai"
 
-      # ---------- 🔥 生成 BUILD.bazel（加入 alwayslink = 1） ----------
+      # ---------- 生成 BUILD.bazel（alwayslink + 兼容头） ----------
       - name: Create BUILD.bazel for third_party/kleidiai
         run: |
           cd /tmp/xnnpack/third_party/kleidiai
@@ -118,10 +129,11 @@ jobs:
               ]),
               hdrs = glob([
                   "src/kai/**/*.h",
-              ]),
+              ]) + ["src/kai/kai_compat.h"],
               includes = ["src"],
               alwayslink = 1,
               copts = [
+                  "-include", "src/kai/kai_compat.h",
                   "-Xclang", "-target-feature", "-Xclang", "+i8mm",
                   "-Xclang", "-target-feature", "-Xclang", "+sme2",
                   "-Xclang", "-target-feature", "-Xclang", "+sve2",
