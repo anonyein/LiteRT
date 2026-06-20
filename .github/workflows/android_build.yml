@@ -84,7 +84,7 @@ jobs:
           echo "KleidiAI installed at /tmp/xnnpack/third_party/kleidiai"
 
       # ---------- 🔥 关键修复：生成 BUILD.bazel 并包含源文件 ----------
-      - name: Create BUILD.bazel for third_party/kleidiai (with srcs)
+      - name: Create BUILD.bazel for third_party/kleidiai (with proper copts)
         run: |
           cd /tmp/xnnpack/third_party/kleidiai
           cat > BUILD.bazel << 'BAZEL_EOF'
@@ -100,6 +100,15 @@ jobs:
                   "src/kai/**/*.h",
               ]),
               includes = ["src"],
+              copts = [
+                  "-Xclang", "-target-feature", "-Xclang", "+i8mm",
+                  "-Xclang", "-target-feature", "-Xclang", "+sme2",
+                  "-Xclang", "-target-feature", "-Xclang", "+sve2",
+                  "-Xclang", "-target-feature", "-Xclang", "+sme",
+                  "-Xclang", "-target-feature", "-Xclang", "+bf16",
+                  "-fno-tree-vectorize",
+                  "-Wa,-march=armv8-a+sme2",
+              ],
           )
           BAZEL_EOF
           echo "=== Generated BUILD.bazel ==="
