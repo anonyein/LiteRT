@@ -114,7 +114,7 @@ jobs:
           cp -r /tmp/kleidiai /tmp/xnnpack/third_party/kleidiai
           echo "KleidiAI installed at /tmp/xnnpack/third_party/kleidiai"
 
-      # ---------- 生成 BUILD.bazel（alwayslink + 兼容头） ----------
+      # ---------- 生成 BUILD.bazel（修复重复 hdrs 问题） ----------
       - name: Create BUILD.bazel for third_party/kleidiai
         run: |
           cd /tmp/xnnpack/third_party/kleidiai
@@ -129,7 +129,7 @@ jobs:
               ]),
               hdrs = glob([
                   "src/kai/**/*.h",
-              ]) + ["src/kai/kai_compat.h"],
+              ]),
               includes = ["src"],
               alwayslink = 1,
               copts = [
