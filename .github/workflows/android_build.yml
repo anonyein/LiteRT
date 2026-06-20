@@ -21,7 +21,7 @@ jobs:
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
       # 保持原有的编译选项，不在这里添加 override_repository
-      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL --copt=-include=third_party/kleidiai/src/kai/kai_compat.h"
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL --copt=-includekai/kai_compat.h"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
       # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
@@ -114,7 +114,15 @@ jobs:
           cp -r /tmp/kleidiai /tmp/xnnpack/third_party/kleidiai
           echo "KleidiAI installed at /tmp/xnnpack/third_party/kleidiai"
 
-      # ---------- 生成正确的 BUILD.bazel（修正 -include 路径） ----------
+      # ---------- 在 XNNPACK 根目录创建 kai/ 目录并复制兼容头 ----------
+      - name: Copy compat header to XNNPACK root kai/
+        run: |
+          mkdir -p /tmp/xnnpack/kai
+          cp /tmp/xnnpack/third_party/kleidiai/src/kai/kai_compat.h /tmp/xnnpack/kai/
+          echo "=== Headers in /tmp/xnnpack/kai/ ==="
+          ls -l /tmp/xnnpack/kai/
+
+      # ---------- 生成 BUILD.bazel（alwayslink=1，无 -include） ----------
       - name: Create BUILD.bazel for third_party/kleidiai
         run: |
           cd /tmp/xnnpack/third_party/kleidiai
