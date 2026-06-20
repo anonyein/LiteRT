@@ -104,30 +104,26 @@ jobs:
         run: |
           cd /tmp/xnnpack
           BUILD_FILE="BUILD.bazel"
-          if [ ! -f "$BUILD_FILE" ]; then
-            echo "BUILD.bazel not found"
-            exit 1
-          fi
           cp "$BUILD_FILE" "$BUILD_FILE.bak"
 
           python3 << 'PYEOF'
-          import re
-
           with open("BUILD.bazel", "r") as f:
-              content = f.read()
+              lines = f.readlines()
 
-          # 匹配 MICROKERNEL_DEPS = [ ... ] 块，在 ] 前插入新依赖项
-          pattern = r'(MICROKERNEL_DEPS\s*=\s*\[.*?)(\n\s*\])'
-          replacement = r'\1,\n    "//third_party/kleidiai:kai"\2'
-          new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
-
-          if count == 0:
-              print("❌ Could not find MICROKERNEL_DEPS list")
-              exit(1)
+          in_microkernel_deps = False
+          new_lines = []
+          for i, line in enumerate(lines):
+              if line.strip().startswith("MICROKERNEL_DEPS"):
+                  in_microkernel_deps = True
+              if in_microkernel_deps and line.strip() == "]":
+                  # 在 ] 之前插入新依赖行
+                  new_lines.append('    "//third_party/kleidiai:kai",\n')
+                  in_microkernel_deps = False
+              new_lines.append(line)
 
           with open("BUILD.bazel", "w") as f:
-              f.write(new_content)
-          print("✅ Added //third_party/kleidiai:kai to MICROKERNEL_DEPS")
+              f.writelines(new_lines)
+          print("✅ Inserted //third_party/kleidiai:kai into MICROKERNEL_DEPS")
           PYEOF
 
       # ========== 注入 XNNPACK 仓库覆盖（KleidiAI 已内嵌） ==========
