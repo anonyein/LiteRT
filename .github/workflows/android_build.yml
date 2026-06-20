@@ -45,11 +45,45 @@ jobs:
           fi
           echo "XNNPACK cloned to /tmp/xnnpack"
 
-      # ---------- 克隆 KleidiAI ----------
-      - name: Clone KleidiAI
+      # ---------- 确定匹配的 KleidiAI 版本 ----------
+      - name: Determine matching KleidiAI commit
+        id: kleidiai_commit
         run: |
-          git clone --depth 1 https://github.com/ARM-software/kleidiai.git /tmp/kleidiai
-          echo "KleidiAI cloned to /tmp/kleidiai"
+          # 先尝试从 LiteRT WORKSPACE 获取原始 commit（如果有）
+          if [ -f WORKSPACE ]; then
+            COMMIT=$(grep -A 10 'name = "KleidiAI"' WORKSPACE | grep 'commit' | awk -F '"' '{print $2}')
+          fi
+          if [ -z "$COMMIT" ]; then
+            echo "Searching KleidiAI history for qsi4cxp..."
+            # 克隆仓库（不带文件，只取历史）
+            git clone --filter=tree:0 https://github.com/ARM-software/kleidiai.git /tmp/kleidiai_history
+            cd /tmp/kleidiai_history
+            # 寻找删除 qsi4cxp 的提交
+            DELETE_COMMIT=$(git log --all --oneline --diff-filter=D -S "qsi4cxp" | head -1 | awk '{print $1}')
+            if [ -n "$DELETE_COMMIT" ]; then
+              # 取其父提交
+              COMMIT=$(git rev-parse ${DELETE_COMMIT}^)
+              echo "Found qsi4cxp before deletion, commit: $COMMIT"
+            else
+              # 如果未找到删除记录，则直接搜索包含该字符串的最后一个提交
+              COMMIT=$(git log --all --oneline -S "qsi4cxp" | head -1 | awk '{print $1}')
+              if [ -z "$COMMIT" ]; then
+                # 如果仍然找不到，使用已知的备用 commit
+                COMMIT="47f5b6d"
+                echo "⚠️ Could not find qsi4cxp, falling back to hardcoded commit: $COMMIT"
+              fi
+            fi
+          fi
+          echo "KLEIDIAI_COMMIT=$COMMIT" >> $GITHUB_ENV
+          echo "✅ Using KleidiAI commit: $COMMIT"
+
+      # ---------- 克隆 KleidiAI（匹配版本） ----------
+      - name: Clone KleidiAI (matched version)
+        run: |
+          git clone https://github.com/ARM-software/kleidiai.git /tmp/kleidiai
+          cd /tmp/kleidiai
+          git checkout $KLEIDIAI_COMMIT
+          echo "KleidiAI ready at $(git rev-parse HEAD)"
 
       # ---------- 修复 KleidiAI 目录结构 ----------
       - name: Fix KleidiAI directory layout
