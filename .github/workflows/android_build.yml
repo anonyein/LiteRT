@@ -20,12 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
-      # ✅ 最小修改：追加 -DXNN_ENABLE_KLEIDIAI=0，避免因缺少 Kai 头文件而编译失败
-      # BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL --copt=-DXNN_ENABLE_KLEIDIAI=0"
-      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL"
+      # ===== 修改点：将 XNNPACK 和 KleidiAI 的 override 写入 BAZEL_CONFIG_FLAGS =====
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL --override_repository=XNNPACK=/tmp/xnnpack --override_repository=kleidiai=/tmp/kleidiai"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
-      # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
 
     steps:
       - name: Checkout repository
@@ -34,7 +32,7 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      # ========== 唯一修复：提供包含新 API 的 XNNPACK ==========
+      # ========== 克隆 XNNPACK 和 KleidiAI（保留） ==========
       - name: Clone latest XNNPACK
         run: |
           git clone --depth 1 https://github.com/google/XNNPACK.git /tmp/xnnpack
@@ -46,23 +44,13 @@ jobs:
           fi
           echo "XNNPACK cloned to /tmp/xnnpack"
 
-      - name: Inject XNNPACK override (uppercase repo name)
-        run: |
-          # 修改构建脚本，使用正确的仓库名 XNNPACK
-          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack /g' ci/build_android_package.sh
-          echo "✅ Patched build script with --override_repository=XNNPACK=/tmp/xnnpack"
-
-      # ========== 新增：添加 KleidiAI 仓库 ==========
       - name: Clone KleidiAI
         run: |
           git clone --depth 1 https://github.com/ARM-software/kleidiai.git /tmp/kleidiai
           echo "KleidiAI cloned to /tmp/kleidiai"
 
-      - name: Inject KleidiAI override
-        run: |
-          sed -i 's/bazel build/bazel build --override_repository=kleidiai=\/tmp\/kleidiai /g' ci/build_android_package.sh
-          echo "✅ Patched build script with --override_repository=kleidiai=/tmp/kleidiai"
-      # ==============================================
+      # ========== 删除 sed 注入步骤，改为环境变量（上面已包含） ==========
+      # 原来的 "Inject XNNPACK override" 和 "Inject KleidiAI override" 两个 step 已移除
 
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
@@ -334,8 +322,9 @@ jobs:
       - name: Run build_android_package.sh
         run: |
           chmod +x ./ci/build_android_package.sh
-          echo "First few lines of patched script to verify override:"
-          grep -n "bazel build" ci/build_android_package.sh | head -5
+          echo "=== Verifying final bazel build commands (first 5) ==="
+          grep -n 'bazel build' ci/build_android_package.sh | head -5
+          echo ""
           echo "BAZEL_CONFIG_FLAGS = $BAZEL_CONFIG_FLAGS"
           ./ci/build_android_package.sh
         env:
