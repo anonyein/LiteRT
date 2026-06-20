@@ -45,13 +45,13 @@ jobs:
           fi
           echo "XNNPACK cloned to /tmp/xnnpack"
 
-      # ========== 克隆 KleidiAI ==========
+      # ---------- 克隆 KleidiAI ----------
       - name: Clone KleidiAI
         run: |
           git clone --depth 1 https://github.com/ARM-software/kleidiai.git /tmp/kleidiai
           echo "KleidiAI cloned to /tmp/kleidiai"
 
-      # ========== 修复 KleidiAI 目录结构（确保 src/kai 存在） ==========
+      # ---------- 修复 KleidiAI 目录结构 ----------
       - name: Fix KleidiAI directory layout
         run: |
           cd /tmp/kleidiai
@@ -75,7 +75,7 @@ jobs:
             exit 1
           fi
 
-      # ========== 将修复后的 KleidiAI 复制到 XNNPACK 的 third_party/kleidiai ==========
+      # ---------- 将 KleidiAI 放入 XNNPACK 的 third_party ----------
       - name: Install KleidiAI into XNNPACK third_party
         run: |
           mkdir -p /tmp/xnnpack/third_party
@@ -83,8 +83,8 @@ jobs:
           cp -r /tmp/kleidiai /tmp/xnnpack/third_party/kleidiai
           echo "KleidiAI installed at /tmp/xnnpack/third_party/kleidiai"
 
-      # ---------- 🔥 关键修复：生成 BUILD.bazel 并包含源文件 ----------
-      - name: Create BUILD.bazel for third_party/kleidiai (with proper copts)
+      # ---------- 生成正确的 BUILD.bazel（带 ARM 专用编译标志） ----------
+      - name: Create BUILD.bazel for third_party/kleidiai
         run: |
           cd /tmp/xnnpack/third_party/kleidiai
           cat > BUILD.bazel << 'BAZEL_EOF'
@@ -114,46 +114,38 @@ jobs:
           echo "=== Generated BUILD.bazel ==="
           cat BUILD.bazel
 
-      # 🔥 关键步骤：添加 Kai 依赖并打印详细日志
-      - name: Add KleidiAI to MICROKERNEL_DEPS with verbose log
+      # ---------- 条件添加 Kai 依赖（安全追加，并打印结果） ----------
+      - name: Add KleidiAI conditionally to MICROKERNEL_DEPS
         run: |
           cd /tmp/xnnpack
           BUILD_FILE="BUILD.bazel"
           cp "$BUILD_FILE" "$BUILD_FILE.bak"
 
-          echo "=== Original MICROKERNEL_DEPS (first 5 and last 5 lines) ==="
-          grep -A 20 "MICROKERNEL_DEPS" "$BUILD_FILE" | head -25
-
           python3 << 'PYEOF'
+          import re
+
           with open("BUILD.bazel", "r") as f:
-              lines = f.readlines()
+              content = f.read()
 
-          in_deps = False
-          new_lines = []
-          inserted = False
-          for i, line in enumerate(lines):
-              if line.strip().startswith("MICROKERNEL_DEPS"):
-                  in_deps = True
-              if in_deps and line.strip() == "]":
-                  # 在 ] 之前插入新依赖
-                  new_lines.append('    "//third_party/kleidiai:kai",\n')
-                  inserted = True
-                  in_deps = False
-              new_lines.append(line)
+          # 在原 MICROKERNEL_DEPS 列表的 ] 后追加 + select(...)
+          pattern = r'(MICROKERNEL_DEPS\s*=\s*\[.*?\])(\s*\n)'
+          replacement = r'\1 + select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai"],\n        "//conditions:default": [],\n    })\2'
+          new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
 
-          if not inserted:
-              print("❌ Could not find closing bracket of MICROKERNEL_DEPS")
+          if count == 0:
+              print("❌ Could not find MICROKERNEL_DEPS block")
               exit(1)
 
           with open("BUILD.bazel", "w") as f:
-              f.writelines(new_lines)
-          print("✅ Inserted '//third_party/kleidiai:kai' into MICROKERNEL_DEPS")
+              f.write(new_content)
+          print("✅ MICROKERNEL_DEPS modified with conditional Kai dependency")
           PYEOF
 
-          echo ""
-          echo "=== Modified MICROKERNEL_DEPS (first 5 and last 5 lines) ==="
+          # 🔽 打印修改后的区域，方便验证
+          echo "=== Modified MICROKERNEL_DEPS area ==="
           grep -A 20 "MICROKERNEL_DEPS" "$BUILD_FILE" | head -25
 
+      # ---------- 注入 XNNPACK 仓库覆盖 ----------
       - name: Inject XNNPACK override into build script
         run: |
           sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack /g' ci/build_android_package.sh
