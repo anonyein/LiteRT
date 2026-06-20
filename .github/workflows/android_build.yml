@@ -45,28 +45,26 @@ jobs:
           fi
           echo "XNNPACK cloned to /tmp/xnnpack"
 
-      # ---------- 确定包含所需函数的 KleidiAI 版本 ----------
-      - name: Determine KleidiAI commit with required function
+      # ---------- 从 DownloadKleidiAI.cmake 获取 KleidiAI commit ----------
+      - name: Extract KleidiAI commit from XNNPACK
         id: kleidiai_commit
         run: |
-          # 克隆历史（轻量）
-          git clone --filter=tree:0 https://github.com/ARM-software/kleidiai.git /tmp/kleidiai_history
-          cd /tmp/kleidiai_history
-          # 搜索包含具体函数体 "kai_run_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot" 的最后一个提交
-          COMMIT=$(git log --all --oneline -S "kai_run_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot" | head -1 | awk '{print $1}')
-          if [ -z "$COMMIT" ]; then
-            # 若搜索不到，尝试搜索头文件中的声明
-            COMMIT=$(git log --all --oneline -S "kai_run_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot" -- "*qsi4cxp*" | head -1 | awk '{print $1}')
-          fi
-          if [ -z "$COMMIT" ]; then
-            echo "⚠️ Could not find via git log -S, using known good commit"
-            COMMIT="1f7a0b5"
+          CMAKE_FILE="/tmp/xnnpack/cmake/DownloadKleidiAI.cmake"
+          if [ -f "$CMAKE_FILE" ]; then
+            COMMIT=$(grep -oP 'archive/\K[a-f0-9]+' "$CMAKE_FILE" | head -1)
+            if [ -z "$COMMIT" ]; then
+              echo "⚠️ Could not parse commit, using fallback"
+              COMMIT="51f7190558e51b7415d9ba24994fb477d7371446"
+            fi
+          else
+            echo "⚠️ DownloadKleidiAI.cmake not found, using fallback"
+            COMMIT="51f7190558e51b7415d9ba24994fb477d7371446"
           fi
           echo "KLEIDIAI_COMMIT=$COMMIT" >> $GITHUB_ENV
           echo "✅ Using KleidiAI commit: $COMMIT"
 
-      # ---------- 克隆 KleidiAI（匹配版本） ----------
-      - name: Clone KleidiAI (matched version)
+      # ---------- 克隆 KleidiAI (精确版本) ----------
+      - name: Clone KleidiAI
         run: |
           git clone https://github.com/ARM-software/kleidiai.git /tmp/kleidiai
           cd /tmp/kleidiai
