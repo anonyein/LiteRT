@@ -83,8 +83,8 @@ jobs:
           cp -r /tmp/kleidiai /tmp/xnnpack/third_party/kleidiai
           echo "KleidiAI installed at /tmp/xnnpack/third_party/kleidiai"
 
-      # ========== 在 third_party/kleidiai 中生成 BUILD.bazel ==========
-      - name: Create BUILD.bazel for third_party/kleidiai
+      # ---------- 🔥 关键修复：生成 BUILD.bazel 并包含源文件 ----------
+      - name: Create BUILD.bazel for third_party/kleidiai (with srcs)
         run: |
           cd /tmp/xnnpack/third_party/kleidiai
           cat > BUILD.bazel << 'BAZEL_EOF'
@@ -92,7 +92,13 @@ jobs:
 
           cc_library(
               name = "kai",
-              hdrs = glob(["src/kai/**/*.h"]),
+              srcs = glob([
+                  "src/kai/**/*.c",
+                  "src/kai/**/*.S",
+              ]),
+              hdrs = glob([
+                  "src/kai/**/*.h",
+              ]),
               includes = ["src"],
           )
           BAZEL_EOF
