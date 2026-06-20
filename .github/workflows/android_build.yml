@@ -20,10 +20,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
-      # ===== 修改点：将 XNNPACK 和 KleidiAI 的 override 写入 BAZEL_CONFIG_FLAGS =====
-      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL --override_repository=XNNPACK=/tmp/xnnpack --override_repository=kleidiai=/tmp/kleidiai"
+      # 保持原有的编译选项，不在这里添加 override_repository
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
+      # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
 
     steps:
       - name: Checkout repository
@@ -32,7 +33,7 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      # ========== 克隆 XNNPACK 和 KleidiAI（保留） ==========
+      # ========== 克隆 XNNPACK ==========
       - name: Clone latest XNNPACK
         run: |
           git clone --depth 1 https://github.com/google/XNNPACK.git /tmp/xnnpack
@@ -44,13 +45,61 @@ jobs:
           fi
           echo "XNNPACK cloned to /tmp/xnnpack"
 
+      # ========== 克隆 KleidiAI ==========
       - name: Clone KleidiAI
         run: |
           git clone --depth 1 https://github.com/ARM-software/kleidiai.git /tmp/kleidiai
           echo "KleidiAI cloned to /tmp/kleidiai"
 
-      # ========== 删除 sed 注入步骤，改为环境变量（上面已包含） ==========
-      # 原来的 "Inject XNNPACK override" 和 "Inject KleidiAI override" 两个 step 已移除
+      # ========== 为 KleidiAI 生成正确的 Bazel BUILD 文件（避免 heredoc 缩进问题） ==========
+      - name: Ensure KleidiAI Bazel BUILD
+        run: |
+          cd /tmp/kleidiai
+          # 如果已有 BUILD 且定义了 :kai 目标，则无需操作
+          if [ -f BUILD.bazel ] || [ -f BUILD ]; then
+            echo "BUILD file exists, checking for :kai target..."
+            if grep -q 'name\s*=\s*"kai"' BUILD.bazel BUILD 2>/dev/null; then
+              echo "✅ :kai target already defined"
+            else
+              echo "Overwriting missing :kai target..."
+              printf '%s\n' \
+                'package(default_visibility = ["//visibility:public"])' \
+                '' \
+                'cc_library(' \
+                '    name = "kai",' \
+                '    hdrs = glob(["kai/**/*.h"]),' \
+                '    includes = ["."],' \
+                ')' > BUILD.bazel
+            fi
+          else
+            echo "No BUILD file found, creating one..."
+            printf '%s\n' \
+              'package(default_visibility = ["//visibility:public"])' \
+              '' \
+              'cc_library(' \
+              '    name = "kai",' \
+              '    hdrs = glob(["kai/**/*.h"]),' \
+              '    includes = ["."],' \
+              ')' > BUILD.bazel
+          fi
+          echo "=== Final BUILD.bazel ==="
+          cat BUILD.bazel
+
+          # 验证关键头文件是否存在
+          if [ -f kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi4cxp/kai_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa.h ]; then
+            echo "✅ Required header found in KleidiAI"
+          else
+            echo "⚠️ Required header not found in current KleidiAI, listing kai tree:"
+            find kai -type f | head -30
+          fi
+
+      # ========== 一次 sed 注入两个 override ==========
+      - name: Inject XNNPACK and KleidiAI overrides into build script
+        run: |
+          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack --override_repository=kleidiai=\/tmp\/kleidiai /g' ci/build_android_package.sh
+          echo "✅ Injected both overrides"
+          echo "=== Patched build commands (first 5) ==="
+          grep -n 'bazel build' ci/build_android_package.sh | head -5
 
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
@@ -322,9 +371,8 @@ jobs:
       - name: Run build_android_package.sh
         run: |
           chmod +x ./ci/build_android_package.sh
-          echo "=== Verifying final bazel build commands (first 5) ==="
+          echo "=== Final build commands (first 5) ==="
           grep -n 'bazel build' ci/build_android_package.sh | head -5
-          echo ""
           echo "BAZEL_CONFIG_FLAGS = $BAZEL_CONFIG_FLAGS"
           ./ci/build_android_package.sh
         env:
