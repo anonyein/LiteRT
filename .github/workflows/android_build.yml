@@ -179,63 +179,43 @@ jobs:
           content = content[:m.start(2)] + new_inner + content[m.end(2):]
           print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS")
 
-          # 2. Add matmul to XNNPACK's deps via select, only for aarch64
-          #    Locate the XNNPACK rule's deps closing parenthesis
-          #    We'll find the line that starts with '    deps = select(' for XNNPACK target
-          #    and then locate the matching closing ')' that belongs to that assignment.
-          #    Better: locate the string '    deps = select({' within the XNNPACK rule.
-          xnnpack_start = 'name = "XNNPACK"'
-          xnnpack_idx = content.find(xnnpack_start)
-          if xnnpack_idx == -1:
-              print("❌ XNNPACK target not found")
+          # 2. Append a select to XNNPACK's deps after xnnpack_if_kleidiai_enabled call
+          fn_call = 'xnnpack_if_kleidiai_enabled('
+          idx = content.find(fn_call)
+          if idx == -1:
+              print("❌ xnnpack_if_kleidiai_enabled not found")
               exit(1)
 
-          # Find the start of deps attribute
-          deps_start = content.find('    deps = select({', xnnpack_idx)
-          if deps_start == -1:
-              print("❌ XNNPACK deps not found")
-              exit(1)
-
-          # Find the end of the deps attribute (the matching closing ')')
-          # We'll scan from deps_start, counting parentheses.
-          # The deps attribute starts with '    deps = select({...}) + xnnpack_if_kleidiai_enabled(...)'
-          # We need to find the final ')' that closes the outermost expression.
-          i = deps_start
-          paren_depth = 0
-          while i < len(content):
+          # find closing parenthesis of this function call
+          start_paren = idx + len(fn_call)
+          depth = 1
+          i = start_paren
+          while i < len(content) and depth > 0:
               if content[i] == '(':
-                  paren_depth += 1
+                  depth += 1
               elif content[i] == ')':
-                  paren_depth -= 1
-                  if paren_depth == 0:
-                      # This is the closing ')' of the entire deps expression
-                      break
+                  depth -= 1
               i += 1
 
-          if paren_depth != 0:
-              print("❌ Could not match parentheses in XNNPACK deps")
+          if depth != 0:
+              print("❌ Unbalanced parentheses in xnnpack_if_kleidiai_enabled call")
               exit(1)
 
-          closing_paren = i  # index of the ')'
+          closing_paren = i - 1
 
-          # Insert ' + select({...})' before the closing ')' but after any existing content.
-          # We'll replace the closing ')' with ' + select(...)\n    )' effectively.
-          insert = ' +\n    select({\n        "//build_config:aarch64": ["@KleidiAI//kai/ukernels/matmul"],\n        "//conditions:default": [],\n    })'
-
-          # We need to put the insertion right before the closing ')', but also keep the original ')'.
-          content = content[:closing_paren] + insert + content[closing_paren:]
-
+          # insert + select(...) right after the closing ')'
+          insert = ' + select({\n        "//build_config:aarch64": ["@KleidiAI//kai/ukernels/matmul"],\n        "//conditions:default": [],\n    })'
+          content = content[:closing_paren+1] + insert + content[closing_paren+1:]
           print("✅ Added matmul select to XNNPACK deps")
 
           with open("BUILD.bazel", "w") as f:
               f.write(content)
-          print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS")
           PYEOF
 
           echo "=== Modified MICROKERNEL_DEPS ==="
           grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
-          echo "=== Modified XNNPACK deps (tail) ==="
-          grep -A 20 'name = "XNNPACK"' BUILD.bazel | tail -25
+          echo "=== xnnpack_if_kleidiai_enabled with new select ==="
+          grep -A 5 'xnnpack_if_kleidiai_enabled' BUILD.bazel
 
       - name: Inject overrides into build script
         run: |
