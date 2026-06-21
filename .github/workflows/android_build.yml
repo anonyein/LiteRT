@@ -544,6 +544,8 @@ jobs:
       - name: Pre-build XNNPACK for arm64 (compile check)
         run: |
           echo "=== Warming Bazel cache for XNNPACK (arm64) ==="
+          # 强制 Bazel 重新读取已打补丁的 XNNPACK BUILD 文件
+          rm -rf $(bazel info output_base)/external/XNNPACK
           bazel build \
             --config=android_arm64 \
             --override_repository=XNNPACK=/tmp/xnnpack \
@@ -552,7 +554,7 @@ jobs:
             || { echo "❌ XNNPACK build failed"; exit 1; }
       
           echo "✅ XNNPACK (arm64) compiled successfully with KleidiAI enabled."
-      
+          
           # 其余架构预热（允许失败）
           for arch in android_arm android_x86 android_x86_64; do
             echo "Building @XNNPACK//:XNNPACK for $arch (warmup only)"
