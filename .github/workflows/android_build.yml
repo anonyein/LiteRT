@@ -129,17 +129,17 @@ jobs:
           )
           EOF
 
-          # kai/ukernels/matmul/BUILD.bazel：直接编译所有 matmul 源文件
+          # kai/ukernels/matmul/BUILD.bazel：使用相对于包目录的正确路径
           cat > $REPO/kai/ukernels/matmul/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
           cc_library(
               name = "matmul",
               srcs = glob([
-                  "src/kai/ukernels/matmul/**/*.c",
-                  "src/kai/ukernels/matmul/**/*.S",
+                  "../../../src/kai/ukernels/matmul/**/*.c",
+                  "../../../src/kai/ukernels/matmul/**/*.S",
               ]),
-              hdrs = glob(["src/kai/**/*.h"]),
-              includes = ["src"],
+              hdrs = [],
+              includes = ["../../../src"],
               alwayslink = 1,
               copts = [
                   "-Xclang", "-target-feature", "-Xclang", "+i8mm",
