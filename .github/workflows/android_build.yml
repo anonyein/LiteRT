@@ -616,17 +616,32 @@ jobs:
       - name: Run build_android_package.sh
         run: |
           OUTPUT_BASE=$(bazel info output_base)
-          # 确保 XNNPACK 使用修补过的 BUILD 文件
-          if [ -d "${OUTPUT_BASE}/external/XNNPACK" ]; then
-            cp /tmp/xnnpack/BUILD.bazel ${OUTPUT_BASE}/external/XNNPACK/BUILD.bazel
-            echo "✅ Patched BUILD file applied to cached XNNPACK"
+          
+          # 检查并更新 XNNPACK BUILD 文件
+          if [ -f "${OUTPUT_BASE}/external/XNNPACK/BUILD.bazel" ]; then
+            if ! cmp -s /tmp/xnnpack/BUILD.bazel "${OUTPUT_BASE}/external/XNNPACK/BUILD.bazel"; then
+              cp /tmp/xnnpack/BUILD.bazel "${OUTPUT_BASE}/external/XNNPACK/BUILD.bazel"
+              echo "✅ Patched BUILD file applied to cached XNNPACK"
+            else
+              echo "✅ XNNPACK BUILD files are identical, no copy needed"
+            fi
           else
-            echo "⚠️ XNNPACK directory not found, will rely on override_repository"
+            echo "⚠️ XNNPACK BUILD not found in cache, relying on override_repository"
           fi
-          # 重新复制整个 KleidiAI 仓库（因为头文件有变动）
-          rm -rf ${OUTPUT_BASE}/external/KleidiAI
-          cp -r /tmp/kleidiai_repo ${OUTPUT_BASE}/external/KleidiAI
-          echo "✅ KleidiAI updated in output_base"
+          
+          # 检查并更新 KleidiAI 目录
+          if [ -d "${OUTPUT_BASE}/external/KleidiAI" ]; then
+            if ! diff -rq /tmp/kleidiai_repo "${OUTPUT_BASE}/external/KleidiAI" > /dev/null 2>&1; then
+              rm -rf "${OUTPUT_BASE}/external/KleidiAI"
+              cp -r /tmp/kleidiai_repo "${OUTPUT_BASE}/external/KleidiAI"
+              echo "✅ KleidiAI cache updated"
+            else
+              echo "✅ KleidiAI directories are identical, no copy needed"
+            fi
+          else
+            echo "⚠️ KleidiAI directory not found in cache"
+          fi
+          
           chmod +x ./ci/build_android_package.sh
           echo "=== Final build commands (first 5) ==="
           grep -n 'bazel build' ci/build_android_package.sh | head -5
