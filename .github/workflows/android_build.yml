@@ -132,7 +132,7 @@ jobs:
             cat /tmp/qsi4cxp_files.txt
           fi
 
-      # ---------- 创建 BUILD 文件（唯一修改：common 使用 select 按架构区分） ----------
+      # ---------- 创建 BUILD 文件（关键修改：common 和 matmul 均使用 select 按架构隔离） ----------
       - name: Create BUILD files for @KleidiAI
         run: |
           REPO=/tmp/kleidiai_repo
@@ -171,21 +171,30 @@ jobs:
 
           cc_library(
               name = "matmul",
-              srcs = ["@KleidiAI//kai/ukernels/matmul:matmul_srcs"],
-              hdrs = ["@KleidiAI//kai/ukernels/matmul:matmul_hdrs"],
+              srcs = select({
+                  "@platforms//cpu:aarch64": ["@KleidiAI//kai/ukernels/matmul:matmul_srcs"],
+                  "//conditions:default": [],
+              }),
+              hdrs = select({
+                  "@platforms//cpu:aarch64": ["@KleidiAI//kai/ukernels/matmul:matmul_hdrs"],
+                  "//conditions:default": [],
+              }),
               includes = ["src"],
               alwayslink = 1,
-              copts = [
-                  "-Xclang", "-target-feature", "-Xclang", "+fp16",
-                  "-Xclang", "-target-feature", "-Xclang", "+dotprod",
-                  "-Xclang", "-target-feature", "-Xclang", "+i8mm",
-                  "-Xclang", "-target-feature", "-Xclang", "+sme2",
-                  "-Xclang", "-target-feature", "-Xclang", "+sve2",
-                  "-Xclang", "-target-feature", "-Xclang", "+sme",
-                  "-Xclang", "-target-feature", "-Xclang", "+bf16",
-                  "-fno-tree-vectorize",
-                  "-Wa,-march=armv8-a+sme2+fp16+dotprod",
-              ],
+              copts = select({
+                  "@platforms//cpu:aarch64": [
+                      "-Xclang", "-target-feature", "-Xclang", "+fp16",
+                      "-Xclang", "-target-feature", "-Xclang", "+dotprod",
+                      "-Xclang", "-target-feature", "-Xclang", "+i8mm",
+                      "-Xclang", "-target-feature", "-Xclang", "+sme2",
+                      "-Xclang", "-target-feature", "-Xclang", "+sve2",
+                      "-Xclang", "-target-feature", "-Xclang", "+sme",
+                      "-Xclang", "-target-feature", "-Xclang", "+bf16",
+                      "-fno-tree-vectorize",
+                      "-Wa,-march=armv8-a+sme2+fp16+dotprod",
+                  ],
+                  "//conditions:default": [],
+              }),
               deps = [":common"],
           )
           EOF
