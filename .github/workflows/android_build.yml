@@ -24,7 +24,7 @@ jobs:
       BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
-      KLEIDIAI_COMMIT: "51f7190558e51b7415d9ba24994fb477d7371446"  # 可后续从 cmake 提取
+      KLEIDIAI_COMMIT: "51f7190558e51b7415d9ba24994fb477d7371446"
 
     steps:
       - name: Checkout repository
@@ -63,7 +63,7 @@ jobs:
           echo "KLEIDIAI_COMMIT=$COMMIT" >> $GITHUB_ENV
           echo "✅ Using KleidiAI commit: $COMMIT"
 
-      # ---------- 克隆 KleidiAI (精确版本) ----------
+      # ---------- 克隆 KleidiAI ----------
       - name: Clone KleidiAI
         run: |
           git clone https://github.com/ARM-software/kleidiai.git /tmp/kleidiai
@@ -132,7 +132,7 @@ jobs:
             cat /tmp/qsi4cxp_files.txt
           fi
 
-      # ---------- 创建 BUILD 文件（唯一修改点：common 添加公共汇编源文件） ----------
+      # ---------- 创建 BUILD 文件（关键修改：matmul 添加 hdrs 声明） ----------
       - name: Create BUILD files for @KleidiAI
         run: |
           REPO=/tmp/kleidiai_repo
@@ -143,13 +143,13 @@ jobs:
           cc_library(
               name = "common",
               hdrs = glob(["src/kai/**/*.h"]),
-              srcs = [                                    # <-- 新增：包含公共汇编源文件
+              srcs = [
                   "src/kai/kai_common_sme_asm.S",
                   "src/kai/kai_common_sve_asm.S",
               ],
               includes = ["src"],
               alwayslink = 1,
-              copts = [                                   # <-- 新增：为 common 添加必要编译选项
+              copts = [
                   "-Xclang", "-target-feature", "-Xclang", "+fp16",
                   "-Xclang", "-target-feature", "-Xclang", "+i8mm",
                   "-Xclang", "-target-feature", "-Xclang", "+sme2",
@@ -163,7 +163,7 @@ jobs:
           cc_library(
               name = "matmul",
               srcs = ["@KleidiAI//kai/ukernels/matmul:matmul_srcs"],
-              hdrs = [],
+              hdrs = ["@KleidiAI//kai/ukernels/matmul:matmul_hdrs"],   # <-- 新增 hdrs 声明
               includes = ["src"],
               alwayslink = 1,
               copts = [
@@ -180,7 +180,7 @@ jobs:
           )
           EOF
 
-          # kai/ukernels/matmul/BUILD.bazel：filegroup 暴露当前包内所有源文件
+          # 子包 BUILD：新增 matmul_hdrs filegroup
           cat > $REPO/kai/ukernels/matmul/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
 
@@ -192,6 +192,10 @@ jobs:
               ),
           )
 
+          filegroup(                                  # <-- 新增：头文件集合
+              name = "matmul_hdrs",
+              srcs = glob(["**/*.h"]),
+          )
           # 保留别名，以支持 XNNPACK 的原有依赖路径
           alias(
               name = "matmul",
@@ -201,7 +205,7 @@ jobs:
 
           echo "=== @KleidiAI root BUILD ==="
           cat $REPO/BUILD.bazel
-          echo "=== @KleidiAI matmul filegroup BUILD ==="
+          echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
 
       # ---------- 以下步骤完全不变 ----------
@@ -241,7 +245,7 @@ jobs:
           echo "✅ Injected XNNPACK and KleidiAI overrides"
           grep -n 'bazel build' ci/build_android_package.sh | head -5
 
-      # ---------- 以下为环境配置与构建（同前） ----------
+      # ---------- 环境配置与构建 ----------
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
         with:
