@@ -140,8 +140,8 @@ jobs:
           echo "=== Generated BUILD.bazel ==="
           cat BUILD.bazel
 
-      # ---------- 关键步骤：直接修改 XNNPACK 的 BUILD，追加 Kai 依赖 ----------
-      - name: Patch XNNPACK BUILD to link Kai
+      # ---------- 核心修改：将 Kai 依赖注入 MICROKERNEL_DEPS ----------
+      - name: Patch XNNPACK BUILD to include Kai in MICROKERNEL_DEPS
         run: |
           cd /tmp/xnnpack
           python3 << 'PYEOF'
@@ -150,25 +150,27 @@ jobs:
           with open("BUILD.bazel", "r") as f:
               content = f.read()
 
-          # 在 xnnpack_if_kleidiai_enabled([...]) 后追加 + select(...)
-          # 匹配 xnnpack_if_kleidiai_enabled( [...] ) 整体
-          pattern = r'(xnnpack_if_kleidiai_enabled\()(\[[^\]]*\])(\))'
-          replacement = r'\1\2\3 + select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n        "//conditions:default": [],\n    })'
-
-          new_content, count = re.subn(pattern, replacement, content)
-          if count == 0:
-              print("❌ Could not find xnnpack_if_kleidiai_enabled in BUILD.bazel")
+          # 定位 MICROKERNEL_DEPS 列表的结束括号 ]
+          # 匹配 MICROKERNEL_DEPS = [ ... ] 整个块
+          pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\]\s*\n)'
+          match = re.search(pattern, content, flags=re.DOTALL)
+          if not match:
+              print("❌ Could not find MICROKERNEL_DEPS definition")
               exit(1)
-          if count > 1:
-              print("⚠️ Found more than one occurrence, this might be unexpected")
+
+          # 在 ] 之前插入 + select(...)
+          # 注意保持原有缩进和逗号
+          old_list = match.group(2)
+          new_list = old_list.rstrip() + '\n] + select({\n    "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n    "//conditions:default": [],\n})'
+          new_content = content[:match.start(2)] + new_list + content[match.end(3):]
 
           with open("BUILD.bazel", "w") as f:
               f.write(new_content)
-          print("✅ Successfully appended Kai select to XNNPACK deps.")
+          print("✅ MICROKERNEL_DEPS successfully patched with Kai dependency")
           PYEOF
 
-          echo "=== Modified XNNPACK deps (around xnnpack_if_kleidiai_enabled) ==="
-          grep -A 10 'xnnpack_if_kleidiai_enabled' BUILD.bazel | head -15
+          echo "=== Modified MICROKERNEL_DEPS area ==="
+          grep -A 25 'MICROKERNEL_DEPS' BUILD.bazel | head -30
 
       - name: Inject XNNPACK override into build script
         run: |
