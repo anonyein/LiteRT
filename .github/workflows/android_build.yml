@@ -154,6 +154,7 @@ jobs:
           cc_library(
               name = "matmul",
               deps = ["//:kai_matmul"],
+              alwayslink = 1,
           )
           EOF
 
@@ -210,6 +211,12 @@ jobs:
         run: |
           echo "build --features=-layering_check" >> .bazelrc
           echo "build:monolithic --features=-layering_check" >> .bazelrc
+
+      # ✅ 仅为 arm64 启用 KleidiAI，避免影响 x86
+      - name: Enable KleidiAI for arm64 only
+        run: |
+          echo "build:android_arm64 --define=xnn_enable_kleidiai=true" >> .bazelrc
+          echo "✅ Added arm64-specific KleidiAI flag"
 
       - name: Verify Android paths
         run: |
