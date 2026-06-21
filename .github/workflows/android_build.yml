@@ -412,11 +412,43 @@ jobs:
           grep -n 'with_xla_support' .bazelrc || echo "No with_xla_support lines found"
       # ================================================================
 
-      # ======================= 提前编译 XNNPACK 以预热缓存（四种架构） =======================
-      - name: Pre-build XNNPACK for all Android architectures (warm cache)
+      # ======================= 提前编译 XNNPACK 以预热缓存 + 符号检查 =======================
+      - name: Pre-build XNNPACK and verify critical symbols
         run: |
-          echo "=== Warming Bazel cache for XNNPACK (arm, arm64, x86, x86_64) ==="
-          for arch in android_arm android_arm64 android_x86 android_x86_64; do
+          echo "=== Warming Bazel cache for XNNPACK (arm64 only for symbol check) ==="
+          bazel build \
+            --config=android_arm64 \
+            --override_repository=XNNPACK=/tmp/xnnpack \
+            @XNNPACK//:XNNPACK \
+            || { echo "Prebuild failed"; exit 1; }
+
+          echo "=== Checking for required qsi4cxp symbols in libXNNPACK.a ==="
+          LIBA="bazel-bin/external/XNNPACK/libXNNPACK.a"
+          if [ ! -f "$LIBA" ]; then
+            echo "❌ libXNNPACK.a not found"
+            exit 1
+          fi
+
+          # 需要出现的符号（根据之前的链接错误列出）
+          SYMBOLS=(
+            "kai_get_mr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa"
+            "kai_get_nr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa"
+            "kai_run_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa"
+            "kai_run_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot"
+          )
+
+          for sym in "${SYMBOLS[@]}"; do
+            if nm "$LIBA" | grep -q "$sym"; then
+              echo "✅ Found symbol: $sym"
+            else
+              echo "❌ Symbol NOT FOUND: $sym"
+              exit 1
+            fi
+          done
+
+          echo "✅ All critical qsi4cxp symbols present. Cache warm complete."
+          # 其余架构预热（可选，不检查符号）
+          for arch in android_arm android_x86 android_x86_64; do
             echo "Building @XNNPACK//:XNNPACK for $arch"
             bazel build \
               --config=$arch \
