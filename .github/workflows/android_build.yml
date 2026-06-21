@@ -615,33 +615,38 @@ jobs:
           
       - name: Run build_android_package.sh
         run: |
-          OUTPUT_BASE=$(bazel info output_base)
-          
-          # 检查并更新 XNNPACK BUILD 文件
-          if [ -f "${OUTPUT_BASE}/external/XNNPACK/BUILD.bazel" ]; then
-            if ! cmp -s /tmp/xnnpack/BUILD.bazel "${OUTPUT_BASE}/external/XNNPACK/BUILD.bazel"; then
-              cp /tmp/xnnpack/BUILD.bazel "${OUTPUT_BASE}/external/XNNPACK/BUILD.bazel"
-              echo "✅ Patched BUILD file applied to cached XNNPACK"
-            else
-              echo "✅ XNNPACK BUILD files are identical, no copy needed"
-            fi
+          # 再次确认并确保 MICROKERNEL_DEPS 已包含 KleidiAI 依赖
+          # 若已存在则跳过，否则重新执行修补（幂等）
+          cd /tmp/xnnpack
+          if ! grep -q '@KleidiAI//:common' BUILD.bazel; then
+            echo "⚠️ MICROKERNEL_DEPS missing KleidiAI deps, re-patching..."
+            python3 << 'PYEOF'
+          import re
+          with open("BUILD.bazel", "r") as f:
+              content = f.read()
+          deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
+          m = re.search(deps_pattern, content, flags=re.DOTALL)
+          if m:
+              inner = m.group(2).rstrip()
+              if not inner.endswith(','):
+                  inner += ','
+              if '"@KleidiAI//:common"' not in inner:
+                  inner += '\n    "@KleidiAI//:common",\n    "@KleidiAI//:matmul",'
+              content = content[:m.start(2)] + inner + content[m.end(2):]
+          with open("BUILD.bazel", "w") as f:
+              f.write(content)
+          print("✅ Re-patched MICROKERNEL_DEPS")
+          PYEOF
           else
-            echo "⚠️ XNNPACK BUILD not found in cache, relying on override_repository"
+            echo "✅ MICROKERNEL_DEPS already contains KleidiAI deps"
           fi
-          
-          # 检查并更新 KleidiAI 目录
-          if [ -d "${OUTPUT_BASE}/external/KleidiAI" ]; then
-            if ! diff -rq /tmp/kleidiai_repo "${OUTPUT_BASE}/external/KleidiAI" > /dev/null 2>&1; then
-              rm -rf "${OUTPUT_BASE}/external/KleidiAI"
-              cp -r /tmp/kleidiai_repo "${OUTPUT_BASE}/external/KleidiAI"
-              echo "✅ KleidiAI cache updated"
-            else
-              echo "✅ KleidiAI directories are identical, no copy needed"
-            fi
-          else
-            echo "⚠️ KleidiAI directory not found in cache"
-          fi
-          
+
+          # 打印 MICROKERNEL_DEPS 最新内容，便于调试
+          echo "=== Current MICROKERNEL_DEPS ==="
+          grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
+
+          # 进入工作目录并运行打包脚本
+          cd -
           chmod +x ./ci/build_android_package.sh
           echo "=== Final build commands (first 5) ==="
           grep -n 'bazel build' ci/build_android_package.sh | head -5
