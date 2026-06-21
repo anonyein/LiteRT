@@ -113,6 +113,7 @@ jobs:
       - name: Create BUILD files for @KleidiAI
         run: |
           REPO=/tmp/kleidiai_repo
+          # 根 BUILD.bazel：提供 common 头文件库
           cat > $REPO/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
           cc_library(
@@ -120,8 +121,13 @@ jobs:
               hdrs = glob(["src/kai/**/*.h"]),
               includes = ["src"],
           )
+          EOF
+
+          # kai/ukernels/matmul/BUILD.bazel：直接编译所有 matmul 源文件
+          cat > $REPO/kai/ukernels/matmul/BUILD.bazel << 'EOF'
+          package(default_visibility = ["//visibility:public"])
           cc_library(
-              name = "kai_matmul",
+              name = "matmul",
               srcs = glob([
                   "src/kai/ukernels/matmul/**/*.c",
                   "src/kai/ukernels/matmul/**/*.S",
@@ -138,16 +144,7 @@ jobs:
                   "-fno-tree-vectorize",
                   "-Wa,-march=armv8-a+sme2",
               ],
-              deps = [":common"],
-          )
-          EOF
-
-          cat > $REPO/kai/ukernels/matmul/BUILD.bazel << 'EOF'
-          package(default_visibility = ["//visibility:public"])
-          cc_library(
-              name = "matmul",
-              deps = ["//:kai_matmul"],
-              alwayslink = 1,
+              deps = ["//:common"],
           )
           EOF
 
@@ -156,7 +153,7 @@ jobs:
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
 
-      - name: Patch XNNPACK BUILD – add common to MICROKERNEL_DEPS and kai_matmul to XNNPACK deps
+      - name: Patch XNNPACK BUILD – only add @KleidiAI//:common to MICROKERNEL_DEPS
         run: |
           cd /tmp/xnnpack
           python3 << 'PYEOF'
@@ -176,45 +173,9 @@ jobs:
               inner = inner.rstrip() + ','
           new_inner = inner + '\n    "@KleidiAI//:common",'
           content = content[:m.start(2)] + new_inner + content[m.end(2):]
-          print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS")
-
-          # 2. 修改 xnnpack_if_kleidiai_enabled 调用，在其参数列表中添加 kai_matmul
-          fn_call = 'xnnpack_if_kleidiai_enabled('
-          fn_idx = content.find(fn_call)
-          if fn_idx == -1:
-              print("❌ xnnpack_if_kleidiai_enabled not found")
-              exit(1)
-
-          start_paren = fn_idx + len(fn_call)
-          depth = 1
-          i = start_paren
-          while i < len(content) and depth > 0:
-              if content[i] == '(':
-                  depth += 1
-              elif content[i] == ')':
-                  depth -= 1
-              i += 1
-          if depth != 0:
-              print("❌ Unbalanced parentheses")
-              exit(1)
-          end = i - 1
-
-          inner_params = content[start_paren:end]
-          if '"@KleidiAI//:common"' not in inner_params:
-              print("❌ @KleidiAI//:common not found in params")
-              print("Params:", inner_params[:200])
-              exit(1)
-
-          # 在 "@KleidiAI//:common" 后面添加 ", "@KleidiAI//:kai_matmul""
-          new_inner = inner_params.replace(
-              '"@KleidiAI//:common"',
-              '"@KleidiAI//:common", "@KleidiAI//:kai_matmul"'
-          )
-          content = content[:start_paren] + new_inner + content[end:]
-          print("✅ Added @KleidiAI//:kai_matmul to xnnpack_if_kleidiai_enabled params")
-
           with open("BUILD.bazel", "w") as f:
               f.write(content)
+          print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS")
           PYEOF
 
           echo "=== Modified MICROKERNEL_DEPS ==="
