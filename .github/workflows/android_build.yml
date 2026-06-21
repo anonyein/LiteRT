@@ -540,28 +540,33 @@ jobs:
           grep -n 'with_xla_support' .bazelrc || echo "No with_xla_support lines found"
       # ================================================================
 
-      # ======================= 预热 XNNPACK（arm64 验证编译） =======================
+      # ======================= 预热 XNNPACK（完全匹配最终打包参数） =======================
       - name: Pre-build XNNPACK for arm64 (compile check)
         run: |
-          echo "=== Warming Bazel cache for XNNPACK (arm64) ==="
-          # 强制 Bazel 重新读取已打补丁的 XNNPACK BUILD 文件
-          rm -rf $(bazel info output_base)/external/XNNPACK
+          echo "=== Warming XNNPACK with same config as final package ==="
+          # 使用与最终打包完全一致的编译模式、架构参数
           bazel build \
-            --config=android_arm64 \
             --override_repository=XNNPACK=/tmp/xnnpack \
             --override_repository=KleidiAI=/tmp/kleidiai_repo \
+            -c opt \
+            --cxxopt=--std=c++17 \
+            --config=android_arm64 \
+            --fat_apk_cpu=x86,x86_64,arm64-v8a,armeabi-v7a \
             @XNNPACK//:XNNPACK \
             || { echo "❌ XNNPACK build failed"; exit 1; }
       
           echo "✅ XNNPACK (arm64) compiled successfully with KleidiAI enabled."
-          
-          # 其余架构预热（允许失败）
+      
+          # 其余架构预热同样使用相同模式
           for arch in android_arm android_x86 android_x86_64; do
             echo "Building @XNNPACK//:XNNPACK for $arch (warmup only)"
             bazel build \
-              --config=$arch \
               --override_repository=XNNPACK=/tmp/xnnpack \
               --override_repository=KleidiAI=/tmp/kleidiai_repo \
+              -c opt \
+              --cxxopt=--std=c++17 \
+              --config=$arch \
+              --fat_apk_cpu=x86,x86_64,arm64-v8a,armeabi-v7a \
               @XNNPACK//:XNNPACK \
               || echo "Prebuild for $arch completed with warnings (cache partial)"
           done
@@ -615,38 +620,12 @@ jobs:
           
       - name: Run build_android_package.sh
         run: |
-          # 再次确认并确保 MICROKERNEL_DEPS 已包含 KleidiAI 依赖
-          # 若已存在则跳过，否则重新执行修补（幂等）
-          cd /tmp/xnnpack
-          if ! grep -q '@KleidiAI//:common' BUILD.bazel; then
-            echo "⚠️ MICROKERNEL_DEPS missing KleidiAI deps, re-patching..."
-            python3 << 'PYEOF'
-          import re
-          with open("BUILD.bazel", "r") as f:
-              content = f.read()
-          deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
-          m = re.search(deps_pattern, content, flags=re.DOTALL)
-          if m:
-              inner = m.group(2).rstrip()
-              if not inner.endswith(','):
-                  inner += ','
-              if '"@KleidiAI//:common"' not in inner:
-                  inner += '\n    "@KleidiAI//:common",\n    "@KleidiAI//:matmul",'
-              content = content[:m.start(2)] + inner + content[m.end(2):]
-          with open("BUILD.bazel", "w") as f:
-              f.write(content)
-          print("✅ Re-patched MICROKERNEL_DEPS")
-          PYEOF
-          else
-            echo "✅ MICROKERNEL_DEPS already contains KleidiAI deps"
+          OUTPUT_BASE=$(bazel info output_base)
+          # 强制用修补后的 BUILD 覆盖缓存（如果存在）
+          if [ -d "${OUTPUT_BASE}/external/XNNPACK" ]; then
+            cp -f /tmp/xnnpack/BUILD.bazel "${OUTPUT_BASE}/external/XNNPACK/BUILD.bazel" 2>/dev/null || true
+            echo "✅ Ensured cached XNNPACK BUILD is the patched version"
           fi
-
-          # 打印 MICROKERNEL_DEPS 最新内容，便于调试
-          echo "=== Current MICROKERNEL_DEPS ==="
-          grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
-
-          # 进入工作目录并运行打包脚本
-          cd -
           chmod +x ./ci/build_android_package.sh
           echo "=== Final build commands (first 5) ==="
           grep -n 'bazel build' ci/build_android_package.sh | head -5
