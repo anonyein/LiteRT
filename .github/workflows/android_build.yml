@@ -156,65 +156,6 @@ jobs:
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
 
-      # ---------- 先配置 NDK、SDK、bazelrc，以便后续编译时使用正确的工具链 ----------
-      - name: Setup Bazel
-        uses: bazel-contrib/setup-bazel@0.9.0
-        with:
-          bazel-version: 7.0.0
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3 openjdk-17-jdk
-          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android NDK r27
-        run: |
-          wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
-          unzip -q android-ndk-${NDK_VERSION}-linux.zip -d /tmp
-          NDK_PATH=/tmp/android-ndk-${NDK_VERSION}
-          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
-          ls -la $NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/clang* || exit 1
-        env:
-          NDK_VERSION: ${{ env.NDK_VERSION }}
-
-      - name: Export Android environment
-        run: |
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
-
-      - name: Configure .bazelrc for NDK
-        run: |
-          echo "build --repo_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
-          echo "build --action_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
-
-      # ✅ 关键步骤：全局 + monolithic 配置双关闭 layering_check
-      - name: Disable layering_check globally and for monolithic config
-        run: |
-          echo "build --features=-layering_check" >> .bazelrc
-          echo "build:monolithic --features=-layering_check" >> .bazelrc
-
-      - name: Enable KleidiAI for arm64
-        run: |
-          echo "build:android_arm64 --define=xnn_enable_kleidiai=true" >> .bazelrc
-          echo "✅ Enabled KleidiAI for arm64"
-
-      # ---------- 现在工具链已就绪，单独编译 Kai ----------
-      - name: Pre-build Kai (verify compilation)
-        run: |
-          echo "=== Building @KleidiAI//:kai_matmul alone ==="
-          bazel build \
-            --config=android_arm64 \
-            --override_repository=KleidiAI=/tmp/kleidiai_repo \
-            @KleidiAI//:kai_matmul \
-            || { echo "❌ Kai compilation failed"; exit 1; }
-          echo "✅ Kai compiled successfully"
-
-      # ---------- 修改 XNNPACK BUILD，添加 Kai 依赖 ----------
       - name: Patch XNNPACK BUILD – add common to MICROKERNEL_DEPS and kai_matmul to XNNPACK deps
         run: |
           cd /tmp/xnnpack
@@ -267,7 +208,52 @@ jobs:
           echo "✅ Injected XNNPACK and KleidiAI overrides"
           grep -n 'bazel build' ci/build_android_package.sh | head -5
 
-      # ---------- 后续步骤保持不变 ----------
+      # ---------- 以下为环境配置与构建 ----------
+      - name: Setup Bazel
+        uses: bazel-contrib/setup-bazel@0.9.0
+        with:
+          bazel-version: 7.0.0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 openjdk-17-jdk
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK r27
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip
+          unzip -q android-ndk-${NDK_VERSION}-linux.zip -d /tmp
+          NDK_PATH=/tmp/android-ndk-${NDK_VERSION}
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
+          ls -la $NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/clang* || exit 1
+        env:
+          NDK_VERSION: ${{ env.NDK_VERSION }}
+
+      - name: Export Android environment
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
+
+      - name: Configure .bazelrc for NDK
+        run: |
+          echo "build --repo_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
+          echo "build --action_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
+
+      - name: Disable layering_check globally and for monolithic config
+        run: |
+          echo "build --features=-layering_check" >> .bazelrc
+          echo "build:monolithic --features=-layering_check" >> .bazelrc
+
+      - name: Enable KleidiAI for arm64
+        run: |
+          echo "build:android_arm64 --define=xnn_enable_kleidiai=true" >> .bazelrc
+          echo "✅ Enabled KleidiAI for arm64"
+
       - name: Verify Android paths
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"
