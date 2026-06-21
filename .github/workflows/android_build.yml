@@ -148,9 +148,7 @@ jobs:
           with open("BUILD.bazel", "r") as f:
               content = f.read()
 
-          # 1. Add "//third_party/kleidiai:kai_matmul" to MICROKERNEL_DEPS so
-          #    that all microkernel libs can find Kai headers.
-          #    We insert it before the closing bracket, handling the last comma.
+          # 1. Add "//third_party/kleidiai:kai_matmul" to MICROKERNEL_DEPS
           deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
           deps_match = re.search(deps_pattern, content, flags=re.DOTALL)
           if not deps_match:
@@ -158,24 +156,17 @@ jobs:
               exit(1)
 
           existing = deps_match.group(2)
-          # ensure last element has trailing comma
           if not existing.rstrip().endswith(','):
-              # add comma after the last item
               existing = existing.rstrip() + ','
           new_deps = existing + '\n    "//third_party/kleidiai:kai_matmul",'
-          # replace the inner part
           content = content[:deps_match.start(2)] + new_deps + content[deps_match.end(2):]
           print("✅ Added kai_matmul to MICROKERNEL_DEPS")
 
-          # 2. Also need to ensure kai_matmul is linked when building XNNPACK.
-          #    We'll modify the deps of XNNPACK target by appending a select
-          #    right after the xnnpack_if_kleidiai_enabled call.
-          #    Find the line that contains xnnpack_if_kleidiai_enabled inside XNNPACK.
+          # 2. Add kai_matmul to XNNPACK target deps via select
+          #    Locate the deps expression that contains xnnpack_if_kleidiai_enabled
           xnnpack_pattern = r'(deps\s*=\s*select\(\{.*?\}\s*\)\s*\+\s*xnnpack_if_kleidiai_enabled\(\[.*?\]\))\s*\)'
           xnnpack_match = re.search(xnnpack_pattern, content, flags=re.DOTALL)
           if not xnnpack_match:
-              # fallback: look for deps = ... + xnnpack_if_kleidiai_enabled([...])
-              # and insert select before the closing ) of the whole deps
               fallback = r'(deps\s*=\s*.*?xnnpack_if_kleidiai_enabled\(\[.*?\]\))\s*\)'
               fallback_match = re.search(fallback, content, flags=re.DOTALL)
               if not fallback_match:
@@ -199,7 +190,7 @@ jobs:
           grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
           echo "=== Modified XNNPACK deps area ==="
           grep -A 15 'name = "XNNPACK"' BUILD.bazel | head -20
-	  
+          
       # 注意：我们不再修改 XNNPACK 的 BUILD.bazel，保持其原样
       - name: Inject XNNPACK override into build script
         run: |
