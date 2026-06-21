@@ -165,7 +165,7 @@ jobs:
           with open("BUILD.bazel", "r") as f:
               content = f.read()
 
-          # 在 MICROKERNEL_DEPS 末尾添加两个依赖：头文件和实现
+          # 在 MICROKERNEL_DEPS 末尾添加两个依赖：头文件和实现（都来自 @KleidiAI）
           deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
           m = re.search(deps_pattern, content, flags=re.DOTALL)
           if not m:
@@ -173,11 +173,10 @@ jobs:
               exit(1)
 
           inner = m.group(2)
-          # 确保最后一个元素有逗号
           if not inner.rstrip().endswith(','):
               inner = inner.rstrip() + ','
-          # 添加两个依赖，注意使用 @KleidiAI//:common 作为头文件，以及直接引用实现库
-          new_inner = inner + '\n    "@KleidiAI//:common",\n    "//third_party/kleidiai:kai_matmul",'
+          # 使用 @KleidiAI//:common 提供头文件，@KleidiAI//:kai_matmul 提供实现（alwayslink=1）
+          new_inner = inner + '\n    "@KleidiAI//:common",\n    "@KleidiAI//:kai_matmul",'
           content = content[:m.start(2)] + new_inner + content[m.end(2):]
 
           with open("BUILD.bazel", "w") as f:
@@ -194,7 +193,7 @@ jobs:
           echo "✅ Injected XNNPACK and KleidiAI overrides"
           grep -n 'bazel build' ci/build_android_package.sh | head -5
 
-      # ---------- 以下所有步骤完全不变 ----------
+      # ---------- 以下步骤保持不变 ----------
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
         with:
