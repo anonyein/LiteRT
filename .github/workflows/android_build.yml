@@ -143,12 +143,12 @@ jobs:
         run: |
           cd /tmp/xnnpack
           python3 << 'PYEOF'
-          import re
+          import re, bisect
 
           with open("BUILD.bazel", "r") as f:
               content = f.read()
 
-          # 1. Add "//third_party/kleidiai:kai_matmul" to MICROKERNEL_DEPS
+          # ---------- 1. 修改 MICROKERNEL_DEPS ----------
           deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
           deps_match = re.search(deps_pattern, content, flags=re.DOTALL)
           if not deps_match:
@@ -162,28 +162,46 @@ jobs:
           content = content[:deps_match.start(2)] + new_deps + content[deps_match.end(2):]
           print("✅ Added kai_matmul to MICROKERNEL_DEPS")
 
-          # 2. Add kai_matmul to XNNPACK target deps via select
-          #    Locate the deps expression that contains xnnpack_if_kleidiai_enabled
-          xnnpack_pattern = r'(deps\s*=\s*select\(\{.*?\}\s*\)\s*\+\s*xnnpack_if_kleidiai_enabled\(\[.*?\]\))\s*\)'
-          xnnpack_match = re.search(xnnpack_pattern, content, flags=re.DOTALL)
-          if not xnnpack_match:
-              fallback = r'(deps\s*=\s*.*?xnnpack_if_kleidiai_enabled\(\[.*?\]\))\s*\)'
-              fallback_match = re.search(fallback, content, flags=re.DOTALL)
-              if not fallback_match:
-                  print("❌ Could not find XNNPACK deps to modify")
-                  exit(1)
-              insert = ' +\n    select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n        "//conditions:default": [],\n    })'
-              new_section = fallback_match.group(1) + insert
-              content = content[:fallback_match.start(1)] + new_section + content[fallback_match.end(1):]
-              print("✅ Added kai_matmul select to XNNPACK deps (fallback)")
-          else:
-              insert = ' +\n    select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n        "//conditions:default": [],\n    })'
-              new_section = xnnpack_match.group(1) + insert
-              content = content[:xnnpack_match.start(1)] + new_section + content[xnnpack_match.end(1):]
-              print("✅ Added kai_matmul select to XNNPACK deps")
+          # ---------- 2. 修改 XNNPACK 目标的 deps ----------
+          # 定位关键字行: "xnnpack_if_kleidiai_enabled(["
+          keyword = "xnnpack_if_kleidiai_enabled(["
+          idx = content.find(keyword)
+          if idx == -1:
+              print("❌ Could not find xnnpack_if_kleidiai_enabled in XNNPACK deps")
+              exit(1)
+
+          # 从该关键字位置开始，向后找到对应的闭合括号 ')'
+          # 该 ') ' 前面可能是 "    ])" 或 "    ])\n" 等
+          # 简单方法：从关键字后开始逐字符扫描，记录括号深度
+          # 关键字自身带有一个 '(', 我们找到该 '(' 的位置
+          paren_idx = content.find('(', idx)
+          if paren_idx == -1:
+              print("❌ Could not find opening parenthesis after keyword")
+              exit(1)
+
+          depth = 1
+          i = paren_idx + 1
+          while i < len(content) and depth > 0:
+              if content[i] == '(':
+                  depth += 1
+              elif content[i] == ')':
+                  depth -= 1
+              i += 1
+
+          if depth != 0:
+              print("❌ Unbalanced parentheses in XNNPACK deps")
+              exit(1)
+
+          closing_paren_idx = i - 1  # 这是 xnnpack_if_kleidiai_enabled( ... ) 的 ')'
+
+          # 在 closing_paren_idx 前面插入我们的 select 分支
+          insert = ' +\n    select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n        "//conditions:default": [],\n    })'
+          # 注意：插入位置是 closing_paren_idx 之前，保持原有 ')' 不变
+          new_content = content[:closing_paren_idx] + insert + content[closing_paren_idx:]
+          print("✅ Added kai_matmul select to XNNPACK deps")
 
           with open("BUILD.bazel", "w") as f:
-              f.write(content)
+              f.write(new_content)
           PYEOF
 
           echo "=== Modified MICROKERNEL_DEPS area ==="
