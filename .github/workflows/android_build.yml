@@ -166,17 +166,6 @@ jobs:
           echo "=== Patched build commands (first 5) ==="
           grep -n 'bazel build' ci/build_android_package.sh | head -5
 
-      # ======================= 新增：提前编译 XNNPACK 以预热缓存 =======================
-      - name: Pre-build XNNPACK for arm64 (warm cache)
-        run: |
-          echo "=== Warming Bazel cache for XNNPACK (arm64) ==="
-          bazel build \
-            --config=android_arm64 \
-            --override_repository=XNNPACK=/tmp/xnnpack \
-            @XNNPACK//:xnnpack \
-            || echo "Prebuild of @XNNPACK//:xnnpack completed with warnings (cache partial)"
-      # ================================================================================
-
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
         with:
@@ -397,7 +386,21 @@ jobs:
         run: |
           sed -i '/\/\/tflite\/java:tensorflow-lite-select-tf-ops/ s/$/ --features=-layering_check/' ci/build_android_package.sh
           echo "✅ Appended --features=-layering_check to select-tf-ops build line"
-      
+
+      # ======================= 提前编译 XNNPACK 以预热缓存（四种架构） =======================
+      - name: Pre-build XNNPACK for all Android architectures (warm cache)
+        run: |
+          echo "=== Warming Bazel cache for XNNPACK (arm, arm64, x86, x86_64) ==="
+          for arch in android_arm android_arm64 android_x86 android_x86_64; do
+            echo "Building @XNNPACK//:XNNPACK for $arch"
+            bazel build \
+              --config=$arch \
+              --override_repository=XNNPACK=/tmp/xnnpack \
+              @XNNPACK//:XNNPACK \
+              || echo "Prebuild for $arch completed with warnings (cache partial)"
+          done
+      # ========================================================================================
+
       - name: Add fixedpoint dep to existing deps list and print BUILD
         run: |
           OUTPUT_BASE=$(bazel info output_base)
