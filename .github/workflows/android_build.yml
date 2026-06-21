@@ -87,17 +87,30 @@ jobs:
             exit 1
           fi
 
-      # 将整理好的 KleidiAI 拷贝到工作目录，稍后将作为 @KleidiAI 仓库
+      # ---------- 准备 @KleidiAI 仓库（关键修正） ----------
       - name: Prepare @KleidiAI repository
         run: |
           rm -rf /tmp/kleidiai_repo
           cp -r /tmp/kleidiai /tmp/kleidiai_repo
+          # 将源文件复制到 kai/ukernels/matmul 包内，使其能被 filegroup 匹配
           mkdir -p /tmp/kleidiai_repo/kai/ukernels/matmul
+          cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/*.c /tmp/kleidiai_repo/kai/ukernels/matmul/ || true
+          cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/*.S /tmp/kleidiai_repo/kai/ukernels/matmul/ || true
+          # 同时复制 pack 子目录下的文件（如果需要）
+          if [ -d /tmp/kleidiai_repo/src/kai/ukernels/matmul/pack ]; then
+            mkdir -p /tmp/kleidiai_repo/kai/ukernels/matmul/pack
+            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/pack/*.c /tmp/kleidiai_repo/kai/ukernels/matmul/pack/ || true
+            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/pack/*.S /tmp/kleidiai_repo/kai/ukernels/matmul/pack/ || true
+          fi
+          # 子目录 imatmul_clamp_*, matmul_clamp_* 等（如果有多个子目录，也可类似处理，或统一用 glob）
+          for subdir in $(find /tmp/kleidiai_repo/src/kai/ukernels/matmul -mindepth 1 -maxdepth 1 -type d); do
+            subname=$(basename "$subdir")
+            mkdir -p "/tmp/kleidiai_repo/kai/ukernels/matmul/$subname"
+            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/$subname/*.c /tmp/kleidiai_repo/kai/ukernels/matmul/$subname/ 2>/dev/null || true
+            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/$subname/*.S /tmp/kleidiai_repo/kai/ukernels/matmul/$subname/ 2>/dev/null || true
+          done
 
-      # ------------------ 新增：打印 KleidiAI 目录结构，证明源文件位置正确 ------------------
-      - name: Print KleidiAI directory structure
-        run: |
-          echo "=== KleidiAI repo tree ==="
+          echo "=== KleidiAI repo tree after copy ==="
           find /tmp/kleidiai_repo -type f \( -name '*.h' -o -name '*.c' -o -name '*.S' -o -name 'BUILD*' \) | sort
 
       - name: Verify qsi4cxp sources exist
@@ -115,11 +128,11 @@ jobs:
             cat /tmp/qsi4cxp_files.txt
           fi
 
-      # ---------- 创建正确的 BUILD 文件（matmul 移到根目录，子目录用 alias） ----------
+      # ---------- 创建 BUILD 文件（根 + 子包 filegroup） ----------
       - name: Create BUILD files for @KleidiAI
         run: |
           REPO=/tmp/kleidiai_repo
-          # 根 BUILD.bazel：common 头文件库 + matmul 真正实现库
+          # 根 BUILD.bazel
           cat > $REPO/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
 
@@ -131,10 +144,7 @@ jobs:
 
           cc_library(
               name = "matmul",
-              srcs = glob([
-                  "src/kai/ukernels/matmul/**/*.c",
-                  "src/kai/ukernels/matmul/**/*.S",
-              ]),
+              srcs = ["@KleidiAI//kai/ukernels/matmul:matmul_srcs"],
               hdrs = [],
               includes = ["src"],
               alwayslink = 1,
@@ -151,10 +161,19 @@ jobs:
           )
           EOF
 
-          # kai/ukernels/matmul/BUILD.bazel：仅提供别名，使 @KleidiAI//kai/ukernels/matmul:matmul 可用
+          # kai/ukernels/matmul/BUILD.bazel：filegroup 暴露当前包内所有源文件
           cat > $REPO/kai/ukernels/matmul/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
 
+          filegroup(
+              name = "matmul_srcs",
+              srcs = glob(
+                  ["**/*.c", "**/*.S"],
+                  exclude = ["BUILD.bazel"],
+              ),
+          )
+
+          # 保留别名，以支持 XNNPACK 的原有依赖路径
           alias(
               name = "matmul",
               actual = "//:matmul",
@@ -163,7 +182,7 @@ jobs:
 
           echo "=== @KleidiAI root BUILD ==="
           cat $REPO/BUILD.bazel
-          echo "=== @KleidiAI matmul alias BUILD ==="
+          echo "=== @KleidiAI matmul filegroup BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
 
       - name: Patch XNNPACK BUILD – only add @KleidiAI//:common to MICROKERNEL_DEPS
