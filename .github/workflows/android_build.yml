@@ -151,32 +151,32 @@ jobs:
               alwayslink = 1,
               copts = [
                   "-Xclang", "-target-feature", "-Xclang", "+fp16",
-                  "-Xclang", "-target-feature", "-Xclang", "+dotprod",   # <-- 新增
+                  "-Xclang", "-target-feature", "-Xclang", "+dotprod",
                   "-Xclang", "-target-feature", "-Xclang", "+i8mm",
                   "-Xclang", "-target-feature", "-Xclang", "+sme2",
                   "-Xclang", "-target-feature", "-Xclang", "+sve2",
                   "-Xclang", "-target-feature", "-Xclang", "+sme",
                   "-Xclang", "-target-feature", "-Xclang", "+bf16",
-                  "-Wa,-march=armv8-a+sme2+fp16+dotprod",                # <-- 汇编器也加入 dotprod
+                  "-Wa,-march=armv8-a+sme2+fp16+dotprod",
               ],
           )
 
           cc_library(
               name = "matmul",
               srcs = ["@KleidiAI//kai/ukernels/matmul:matmul_srcs"],
-              hdrs = ["@KleidiAI//kai/ukernels/matmul:matmul_hdrs"],   # <-- 新增 hdrs 声明
+              hdrs = ["@KleidiAI//kai/ukernels/matmul:matmul_hdrs"],
               includes = ["src"],
               alwayslink = 1,
               copts = [
                   "-Xclang", "-target-feature", "-Xclang", "+fp16",
-                  "-Xclang", "-target-feature", "-Xclang", "+dotprod",   # <-- 新增
+                  "-Xclang", "-target-feature", "-Xclang", "+dotprod",
                   "-Xclang", "-target-feature", "-Xclang", "+i8mm",
                   "-Xclang", "-target-feature", "-Xclang", "+sme2",
                   "-Xclang", "-target-feature", "-Xclang", "+sve2",
                   "-Xclang", "-target-feature", "-Xclang", "+sme",
                   "-Xclang", "-target-feature", "-Xclang", "+bf16",
                   "-fno-tree-vectorize",
-                  "-Wa,-march=armv8-a+sme2+fp16+dotprod",                # <-- 汇编器也加入 dotprod
+                  "-Wa,-march=armv8-a+sme2+fp16+dotprod",
               ],
               deps = [":common"],
           )
@@ -194,10 +194,11 @@ jobs:
               ),
           )
 
-          filegroup(                                  # <-- 新增：头文件集合
+          filegroup(
               name = "matmul_hdrs",
               srcs = glob(["**/*.h"]),
           )
+
           # 保留别名，以支持 XNNPACK 的原有依赖路径
           alias(
               name = "matmul",
@@ -497,24 +498,22 @@ jobs:
       # ================================================================
 
       # ======================= 预热 XNNPACK 并验证 KleidiAI 符号 =======================
-      - name: Pre-build XNNPACK and verify critical symbols (arm64 only)
+      - name: Pre-build XNNPACK and verify KleidiAI symbols (arm64 only)
         run: |
-          echo "=== Warming Bazel cache for XNNPACK (arm64 + symbols check) ==="
+          echo "=== Building @KleidiAI//:matmul to verify symbols ==="
           bazel build \
             --config=android_arm64 \
-            --override_repository=XNNPACK=/tmp/xnnpack \
             --override_repository=KleidiAI=/tmp/kleidiai_repo \
-            @XNNPACK//:XNNPACK \
-            || { echo "Prebuild failed"; exit 1; }
+            @KleidiAI//:matmul \
+            || { echo "KleidiAI build failed"; exit 1; }
 
-          echo "=== Checking for required qsi4cxp symbols in libXNNPACK.a ==="
-          LIBA="bazel-bin/external/XNNPACK/libXNNPACK.a"
+          LIBA="bazel-bin/external/KleidiAI/libmatmul.a"
           if [ ! -f "$LIBA" ]; then
-            echo "❌ libXNNPACK.a not found"
+            echo "❌ libmatmul.a not found"
             exit 1
           fi
 
-          # 需要出现的符号（根据之前的链接错误列出）
+          echo "=== Checking for required qsi4cxp symbols in KleidiAI ==="
           REQUIRED_SYMBOLS=(
             "kai_get_mr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa"
             "kai_get_nr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa"
@@ -534,16 +533,23 @@ jobs:
 
           if [ $MISSING -eq 1 ]; then
             echo ""
-            echo "=== Debug: List KleidiAI objects in the archive ==="
-            nm "$LIBA" | grep -i kai || echo "No Kai symbols found at all"
-            echo ""
-            echo "=== Check if SME2 assembly was compiled ==="
-            # 如果汇编文件未编译，matmul 里就不会有 SME 函数
-            echo "This usually means the assembler does not support '+sme2' or the .S files were excluded."
+            echo "=== Debug: List Kai symbols in libmatmul.a ==="
+            nm "$LIBA" | grep -i kai || echo "No Kai symbols found"
             exit 1
           fi
 
-          echo "✅ All critical qsi4cxp symbols present. Cache warm complete."
+          echo "✅ All KleidiAI symbols present. Now warming XNNPACK..."
+
+          # 预热 XNNPACK（arm64）
+          echo "=== Building @XNNPACK//:XNNPACK (arm64) ==="
+          bazel build \
+            --config=android_arm64 \
+            --override_repository=XNNPACK=/tmp/xnnpack \
+            --override_repository=KleidiAI=/tmp/kleidiai_repo \
+            @XNNPACK//:XNNPACK \
+            || { echo "XNNPACK prebuild failed"; exit 1; }
+
+          echo "✅ XNNPACK prebuild completed."
 
           # 其余架构预热（允许失败）
           for arch in android_arm android_x86 android_x86_64; do
