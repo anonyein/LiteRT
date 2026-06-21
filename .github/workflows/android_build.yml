@@ -615,9 +615,18 @@ jobs:
           
       - name: Run build_android_package.sh
         run: |
-          # 强制 Bazel 在最终打包时使用修补后的 BUILD 文件
-          rm -rf $(bazel info output_base)/external/XNNPACK
-          rm -rf $(bazel info output_base)/external/KleidiAI
+          OUTPUT_BASE=$(bazel info output_base)
+          # 确保 XNNPACK 使用修补过的 BUILD 文件
+          if [ -d "${OUTPUT_BASE}/external/XNNPACK" ]; then
+            cp /tmp/xnnpack/BUILD.bazel ${OUTPUT_BASE}/external/XNNPACK/BUILD.bazel
+            echo "✅ Patched BUILD file applied to cached XNNPACK"
+          else
+            echo "⚠️ XNNPACK directory not found, will rely on override_repository"
+          fi
+          # 重新复制整个 KleidiAI 仓库（因为头文件有变动）
+          rm -rf ${OUTPUT_BASE}/external/KleidiAI
+          cp -r /tmp/kleidiai_repo ${OUTPUT_BASE}/external/KleidiAI
+          echo "✅ KleidiAI updated in output_base"
           chmod +x ./ci/build_android_package.sh
           echo "=== Final build commands (first 5) ==="
           grep -n 'bazel build' ci/build_android_package.sh | head -5
