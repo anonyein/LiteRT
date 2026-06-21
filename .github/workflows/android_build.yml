@@ -111,15 +111,26 @@ jobs:
             cat /tmp/qsi4cxp_files.txt
           fi
 
-      # ---------- 生成 BUILD.bazel（直接编译所有 KleidiAI 源码，包含 qsi4cxp） ----------
-      - name: Create BUILD.bazel for third_party/kleidiai
+      # ---------- 为 KleidiAI 创建 BUILD 文件，使其能被 @KleidiAI 引用 ----------
+      - name: Create BUILD files for @KleidiAI
         run: |
-          cd /tmp/xnnpack/third_party/kleidiai
-          cat > BUILD.bazel << 'BAZEL_EOF'
+          KLEIDIAI_ROOT=/tmp/xnnpack/third_party/kleidiai
+
+          # 根 BUILD.bazel：提供 common 库和实际编译的 kai_matmul 库
+          cat > $KLEIDIAI_ROOT/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
           cc_library(
-              name = "kai",
-              srcs = glob(["src/kai/**/*.c", "src/kai/**/*.S"]),
+              name = "common",
+              # 仅提供头文件即可，XNNPACK 只需要依赖存在
+              hdrs = glob(["src/kai/**/*.h"]),
+              includes = ["src"],
+          )
+          cc_library(
+              name = "kai_matmul",
+              srcs = glob([
+                  "src/kai/ukernels/matmul/**/*.c",
+                  "src/kai/ukernels/matmul/**/*.S",
+              ]),
               hdrs = glob(["src/kai/**/*.h"]),
               includes = ["src"],
               alwayslink = 1,
@@ -132,59 +143,33 @@ jobs:
                   "-fno-tree-vectorize",
                   "-Wa,-march=armv8-a+sme2",
               ],
+              deps = [":common"],
           )
-          BAZEL_EOF
-          echo "=== Generated BUILD.bazel ==="
-          cat BUILD.bazel
+          EOF
 
-      # ---------- 核心修改：直接给 XNNPACK 目标添加 Kai 依赖 ----------
-      - name: Ensure Kai library is linked into XNNPACK
+          # 创建 kai/ukernels/matmul 子包，提供 matmul 目标
+          mkdir -p $KLEIDIAI_ROOT/kai/ukernels/matmul
+          cat > $KLEIDIAI_ROOT/kai/ukernels/matmul/BUILD.bazel << 'EOF'
+          package(default_visibility = ["//visibility:public"])
+          cc_library(
+              name = "matmul",
+              deps = ["//:kai_matmul"],
+          )
+          EOF
+
+          echo "=== KleidiAI root BUILD ==="
+          cat $KLEIDIAI_ROOT/BUILD.bazel
+          echo "=== KleidiAI matmul BUILD ==="
+          cat $KLEIDIAI_ROOT/kai/ukernels/matmul/BUILD.bazel
+
+      - name: Inject XNNPACK and KleidiAI overrides into build script
         run: |
-          cd /tmp/xnnpack
-          python3 << 'PYEOF'
-          import re
-
-          with open("BUILD.bazel", "r") as f:
-              content = f.read()
-
-          # 在 XNNPACK 目标的 deps 末尾追加 Kai select
-          # 策略：找到 deps 中 "@pthreadpool" 这一行，在其后面的 ], 之前插入 + select(...)
-          # 简单而可靠的替换
-          old = '            "@pthreadpool",\n        ],\n    ) + xnnpack_if_kleidiai_enabled('
-          new = '            "@pthreadpool",\n        ] + select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai"],\n        "//conditions:default": [],\n    }),\n    ) + xnnpack_if_kleidiai_enabled('
-
-          if old in content:
-              content = content.replace(old, new)
-              print("✅ Successfully added Kai select to XNNPACK deps.")
-          else:
-              # 如果上面的替换没找到，尝试更灵活的方案：直接修改整个 deps 部分的结尾
-              # 匹配从 "deps = " 开始到下一个顶级属性之前的部分，并在最后一个 ] 前添加
-              pattern = r'(deps\s*=\s*.*?)(\]\s*,?\s*\n\s*\)\s*\+?\s*xnnpack_if_kleidiai_enabled\()'
-              match = re.search(pattern, content, flags=re.DOTALL)
-              if match:
-                  insert = '] + select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai"],\n        "//conditions:default": [],\n    })'
-                  new_snippet = match.group(1) + insert + '\n    ) + xnnpack_if_kleidiai_enabled('
-                  content = content[:match.start()] + new_snippet + content[match.end():]
-                  print("✅ Added Kai select to XNNPACK deps (fallback method).")
-              else:
-                  print("❌ Could not locate insertion point in XNNPACK deps.")
-                  exit(1)
-
-          with open("BUILD.bazel", "w") as f:
-              f.write(content)
-          PYEOF
-
-          echo "=== Modified XNNPACK deps area ==="
-          grep -A 30 'name = "XNNPACK"' BUILD.bazel | head -40
-
-      # ---------- 注入 XNNPACK 仓库覆盖 ----------
-      - name: Inject XNNPACK override into build script
-        run: |
-          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack /g' ci/build_android_package.sh
-          echo "✅ Injected XNNPACK override"
+          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack --override_repository=KleidiAI=\/tmp\/xnnpack\/third_party\/kleidiai /g' ci/build_android_package.sh
+          echo "✅ Injected XNNPACK and KleidiAI overrides"
           echo "=== Patched build commands (first 5) ==="
           grep -n 'bazel build' ci/build_android_package.sh | head -5
 
+      # ---------- 以下所有步骤完全不变 ----------
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
         with:
@@ -422,6 +407,7 @@ jobs:
           bazel build \
             --config=android_arm64 \
             --override_repository=XNNPACK=/tmp/xnnpack \
+            --override_repository=KleidiAI=/tmp/xnnpack/third_party/kleidiai \
             @XNNPACK//:XNNPACK \
             || { echo "Prebuild failed"; exit 1; }
 
