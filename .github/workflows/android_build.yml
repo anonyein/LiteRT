@@ -241,9 +241,11 @@ jobs:
       - name: Enable KleidiAI for arm64 (and disable for x86)
         run: |
           echo "build:android_arm64 --define=xnn_enable_kleidiai=true"   >> .bazelrc
+          echo "build:android_arm   --define=xnn_enable_kleidiai=false"  >> .bazelrc
           echo "build:android_x86   --define=xnn_enable_kleidiai=false"  >> .bazelrc
           echo "build:android_x86_64 --define=xnn_enable_kleidiai=false" >> .bazelrc
-          echo "✅ KleidiAI: arm64=true, x86/x86_64=false"
+          echo "build:kleidiai_query --define=xnn_enable_kleidiai=true"  >> .bazelrc
+          echo "✅ KleidiAI: arm64=true, x86/x86_64=false; query config added"
       # =============================================================== #
 
       - name: Verify Android paths
@@ -442,13 +444,13 @@ jobs:
           grep -n 'with_xla_support' .bazelrc || echo "No with_xla_support lines found"
       # ================================================================
 
-      # ============== 验证 KleidiAI 依赖链接（使用简化标志，避免 --cpu 错误） ==============
+      # ============== 验证 KleidiAI 依赖链接（使用查询专用 config） ==============
       - name: Verify KleidiAI dependency linkage
         run: |
           echo "=== Checking if @XNNPACK//:XNNPACK depends on @KleidiAI//kai/ukernels/matmul:matmul ==="
           bazel query 'deps(@XNNPACK//:XNNPACK)' \
             --config=android \
-            --define=xnn_enable_kleidiai=true \
+            --config=kleidiai_query \
             --override_repository=XNNPACK=/tmp/xnnpack \
             --override_repository=KleidiAI=/tmp/kleidiai_repo \
             | grep -i kleidi || echo "⚠️ No KleidiAI dependency found in deps"
@@ -457,7 +459,7 @@ jobs:
           echo "=== Checking path to matmul ==="
           bazel query 'somepath(@XNNPACK//:XNNPACK, @KleidiAI//kai/ukernels/matmul:matmul)' \
             --config=android \
-            --define=xnn_enable_kleidiai=true \
+            --config=kleidiai_query \
             --override_repository=XNNPACK=/tmp/xnnpack \
             --override_repository=KleidiAI=/tmp/kleidiai_repo \
             && echo "✅ matmul IS reachable from XNNPACK" \
