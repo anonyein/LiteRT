@@ -142,7 +142,7 @@ jobs:
 
           cc_library(
               name = "common",
-              hdrs = glob(["src/kai/**/*.h"]),
+              hdrs = glob(["src/kai/**/*.h", "kai/ukernels/**/*.h"]),
               # 仅在 ARM64 架构时包含汇编源文件，其他架构为空，避免编译错误
               srcs = select({
                   "@platforms//cpu:aarch64": [
@@ -228,8 +228,8 @@ jobs:
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
 
-      # ---------- 修补 XNNPACK BUILD（最小增强：双保险） ----------
-      - name: Patch XNNPACK BUILD – only add @KleidiAI//:common to MICROKERNEL_DEPS
+      # ---------- 修补 XNNPACK BUILD（同时添加 :common 和 :matmul） ----------
+      - name: Patch XNNPACK BUILD – add KleidiAI deps to MICROKERNEL_DEPS
         run: |
           cd /tmp/xnnpack
           python3 << 'PYEOF'
@@ -238,21 +238,24 @@ jobs:
           with open("BUILD.bazel", "r") as f:
               content = f.read()
 
-          # 1. 添加 @KleidiAI//:common 到 MICROKERNEL_DEPS
+          # 查找 MICROKERNEL_DEPS 定义
           deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
           m = re.search(deps_pattern, content, flags=re.DOTALL)
           if not m:
               print("❌ MICROKERNEL_DEPS not found")
               exit(1)
           inner = m.group(2)
-          if not inner.rstrip().endswith(','):
-              inner = inner.rstrip() + ','
-          new_inner = inner + '\n    "@KleidiAI//:common",'
+          # 确保以逗号结尾
+          inner = inner.rstrip()
+          if not inner.endswith(','):
+              inner = inner + ','
+          # 追加两个依赖
+          new_inner = inner + '\n    "@KleidiAI//:common",\n    "@KleidiAI//:matmul",'
           content = content[:m.start(2)] + new_inner + content[m.end(2):]
 
           with open("BUILD.bazel", "w") as f:
               f.write(content)
-          print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS and forced deps for all microkernels")
+          print("✅ Added @KleidiAI//:common and @KleidiAI//:matmul to MICROKERNEL_DEPS")
           PYEOF
 
           echo "=== Modified MICROKERNEL_DEPS ==="
