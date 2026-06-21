@@ -444,28 +444,6 @@ jobs:
           grep -n 'with_xla_support' .bazelrc || echo "No with_xla_support lines found"
       # ================================================================
 
-      # ============== 验证 KleidiAI 依赖链接（使用查询专用 config） ==============
-      - name: Verify KleidiAI dependency linkage
-        run: |
-          echo "=== Checking if @XNNPACK//:XNNPACK depends on @KleidiAI//kai/ukernels/matmul:matmul ==="
-          bazel query 'deps(@XNNPACK//:XNNPACK)' \
-            --config=android \
-            --config=kleidiai_query \
-            --override_repository=XNNPACK=/tmp/xnnpack \
-            --override_repository=KleidiAI=/tmp/kleidiai_repo \
-            | grep -i kleidi || echo "⚠️ No KleidiAI dependency found in deps"
-
-          echo ""
-          echo "=== Checking path to matmul ==="
-          bazel query 'somepath(@XNNPACK//:XNNPACK, @KleidiAI//kai/ukernels/matmul:matmul)' \
-            --config=android \
-            --config=kleidiai_query \
-            --override_repository=XNNPACK=/tmp/xnnpack \
-            --override_repository=KleidiAI=/tmp/kleidiai_repo \
-            && echo "✅ matmul IS reachable from XNNPACK" \
-            || { echo "❌ matmul NOT reachable! KleidiAI will not be linked."; exit 1; }
-      # =========================================================================================
-
       # ======================= 预热 XNNPACK 并验证 KleidiAI 符号 =======================
       - name: Pre-build XNNPACK and verify critical symbols (arm64 only)
         run: |
