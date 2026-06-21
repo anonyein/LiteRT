@@ -178,20 +178,40 @@ jobs:
           content = content[:m.start(2)] + new_inner + content[m.end(2):]
           print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS")
 
-          # 2. 精确替换 xnnpack_if_kleidiai_enabled(...) 调用，追加 select
-          old_str = 'xnnpack_if_kleidiai_enabled(["@KleidiAI//:common"])'
-          new_str = 'xnnpack_if_kleidiai_enabled(["@KleidiAI//:common"]) + select({\n        "//build_config:aarch64": ["@KleidiAI//:kai_matmul"],\n        "//conditions:default": [],\n    })'
-          if old_str in content:
-              content = content.replace(old_str, new_str)
-              print("✅ Appended Kai matmul select to XNNPACK deps")
-          else:
-              print("❌ The expected string not found in BUILD.bazel")
-              print("Looked for:", old_str)
-              idx = content.find('xnnpack_if_kleidiai_enabled')
-              if idx != -1:
-                  print("Found xnnpack_if_kleidiai_enabled at index", idx)
-                  print(content[idx:idx+100])
+          # 2. 修改 xnnpack_if_kleidiai_enabled 调用，在其参数列表中添加 kai_matmul
+          fn_call = 'xnnpack_if_kleidiai_enabled('
+          fn_idx = content.find(fn_call)
+          if fn_idx == -1:
+              print("❌ xnnpack_if_kleidiai_enabled not found")
               exit(1)
+
+          start_paren = fn_idx + len(fn_call)
+          depth = 1
+          i = start_paren
+          while i < len(content) and depth > 0:
+              if content[i] == '(':
+                  depth += 1
+              elif content[i] == ')':
+                  depth -= 1
+              i += 1
+          if depth != 0:
+              print("❌ Unbalanced parentheses")
+              exit(1)
+          end = i - 1
+
+          inner_params = content[start_paren:end]
+          if '"@KleidiAI//:common"' not in inner_params:
+              print("❌ @KleidiAI//:common not found in params")
+              print("Params:", inner_params[:200])
+              exit(1)
+
+          # 在 "@KleidiAI//:common" 后面添加 ", "@KleidiAI//:kai_matmul""
+          new_inner = inner_params.replace(
+              '"@KleidiAI//:common"',
+              '"@KleidiAI//:common", "@KleidiAI//:kai_matmul"'
+          )
+          content = content[:start_paren] + new_inner + content[end:]
+          print("✅ Added @KleidiAI//:kai_matmul to xnnpack_if_kleidiai_enabled params")
 
           with open("BUILD.bazel", "w") as f:
               f.write(content)
@@ -208,7 +228,7 @@ jobs:
           echo "✅ Injected XNNPACK and KleidiAI overrides"
           grep -n 'bazel build' ci/build_android_package.sh | head -5
 
-      # ---------- 以下为环境配置与构建 ----------
+      # ---------- 以下为环境配置与构建（同前） ----------
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
         with:
@@ -485,6 +505,7 @@ jobs:
             bazel build \
               --config=$arch \
               --override_repository=XNNPACK=/tmp/xnnpack \
+              --override_repository=KleidiAI=/tmp/kleidiai_repo \
               @XNNPACK//:XNNPACK \
               || echo "Prebuild for $arch completed with warnings (cache partial)"
           done
