@@ -228,8 +228,8 @@ jobs:
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
 
-      # ---------- 修补 XNNPACK BUILD（同时添加 :common 和 :matmul） ----------
-      - name: Patch XNNPACK BUILD – add KleidiAI deps to MICROKERNEL_DEPS
+      # ---------- 修补 XNNPACK BUILD（关键修复） ----------
+      - name: Patch XNNPACK BUILD – force @KleidiAI//:common on all microkernel targets
         run: |
           cd /tmp/xnnpack
           python3 << 'PYEOF'
@@ -238,30 +238,48 @@ jobs:
           with open("BUILD.bazel", "r") as f:
               content = f.read()
 
-          # 查找 MICROKERNEL_DEPS 定义
+          # 1. 更新 MICROKERNEL_DEPS，加入两个 KleidiAI 库（兜底）
           deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
           m = re.search(deps_pattern, content, flags=re.DOTALL)
-          if not m:
-              print("❌ MICROKERNEL_DEPS not found")
-              exit(1)
-          inner = m.group(2)
-          # 确保以逗号结尾
-          inner = inner.rstrip()
-          if not inner.endswith(','):
-              inner = inner + ','
-          # 追加两个依赖
-          new_inner = inner + '\n    "@KleidiAI//:common",\n    "@KleidiAI//:matmul",'
-          content = content[:m.start(2)] + new_inner + content[m.end(2):]
+          if m:
+              inner = m.group(2).rstrip()
+              if not inner.endswith(','):
+                  inner += ','
+              if '"@KleidiAI//:common"' not in inner:
+                  inner += '\n    "@KleidiAI//:common",\n    "@KleidiAI//:matmul",'
+              content = content[:m.start(2)] + inner + content[m.end(2):]
+              print("✅ Updated MICROKERNEL_DEPS")
+
+          # 2. 遍历所有以 _prod_microkernels 结尾的 cc_library，强制注入 @KleidiAI//:common
+          def ensure_kleidiai_dep(rule_text):
+              if '"@KleidiAI//:common"' in rule_text:
+                  return rule_text  # 已经存在，跳过
+              # 查找 deps 属性
+              deps_match = re.search(r'(deps\s*=\s*\[)(.*?)(\])', rule_text, flags=re.DOTALL)
+              if deps_match:
+                  inner_deps = deps_match.group(2).rstrip()
+                  if not inner_deps.endswith(','):
+                      inner_deps += ','
+                  new_deps = inner_deps + '\n        "@KleidiAI//:common",'
+                  rule_text = rule_text[:deps_match.start(2)] + new_deps + rule_text[deps_match.end(2):]
+                  return rule_text
+              else:
+                  # 规则没有 deps，在最后一个参数后插入 deps
+                  # 简单处理：在规则结束的 ')' 前插入 deps = [...]
+                  rule_text = rule_text.rstrip().rstrip(')') + '\n    deps = ["@KleidiAI//:common"],\n)'
+                  return rule_text
+
+          # 匹配形如 cc_library( ... name = "xxx_prod_microkernels" ... ) 的块（非贪婪）
+          pattern = r'(cc_library\s*\(.*?name\s*=\s*"[^"]*_prod_microkernels".*?\)\n\})'
+          content = re.sub(pattern, lambda m: ensure_kleidiai_dep(m.group(0)), content, flags=re.DOTALL)
 
           with open("BUILD.bazel", "w") as f:
               f.write(content)
-          print("✅ Added @KleidiAI//:common and @KleidiAI//:matmul to MICROKERNEL_DEPS")
+          print("✅ Injected @KleidiAI//:common into every _prod_microkernels target")
           PYEOF
 
-          echo "=== Modified MICROKERNEL_DEPS ==="
-          grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
-          echo "=== xnnpack_if_kleidiai_enabled call ==="
-          grep 'xnnpack_if_kleidiai_enabled' BUILD.bazel
+          echo "=== Verify injection (first 3 targets) ==="
+          grep -A 15 'name = ".*_prod_microkernels"' BUILD.bazel | grep -E '(name|deps|KleidiAI)' | head -30
 
       # ---------- Inject overrides into build script（保留，双重保险） ----------
       - name: Inject overrides into build script
