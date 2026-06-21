@@ -156,7 +156,7 @@ jobs:
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
 
-      - name: Patch XNNPACK BUILD – add common to MICROKERNEL_DEPS and matmul to XNNPACK deps
+      - name: Patch XNNPACK BUILD – add common to MICROKERNEL_DEPS and replace xnnpack_if_kleidiai_enabled in XNNPACK
         run: |
           cd /tmp/xnnpack
           # 1. 添加 @KleidiAI//:common 到 MICROKERNEL_DEPS
@@ -179,15 +179,34 @@ jobs:
           content = content[:m.start(2)] + new_inner + content[m.end(2):]
           print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS")
 
-          # 2. Append a select to XNNPACK's deps after xnnpack_if_kleidiai_enabled call
-          fn_call = 'xnnpack_if_kleidiai_enabled('
-          idx = content.find(fn_call)
-          if idx == -1:
-              print("❌ xnnpack_if_kleidiai_enabled not found")
+          # 2. In the XNNPACK target, replace the xnnpack_if_kleidiai_enabled call
+          #    with a simple select that includes the matmul target.
+          #    We locate the XNNPACK rule and modify its deps attribute.
+          xnnpack_start = content.find('name = "XNNPACK"')
+          if xnnpack_start == -1:
+              print("❌ XNNPACK target not found")
               exit(1)
 
-          # find closing parenthesis of this function call
-          start_paren = idx + len(fn_call)
+          # Find the deps attribute within the XNNPACK rule
+          deps_attr_start = content.find('    deps =', xnnpack_start)
+          if deps_attr_start == -1:
+              print("❌ deps attribute not found in XNNPACK")
+              exit(1)
+
+          # Find the end of the deps attribute (the closing ')' of the outermost expression)
+          # We'll scan from the start of deps value, counting parentheses.
+          # The deps attribute is assigned an expression like:
+          #    deps = select({...}) + xnnpack_if_kleidiai_enabled([...])
+          # We need to find the final ')'.
+          # We can locate the xnnpack_if_kleidiai_enabled call within this attribute.
+          fn_call = 'xnnpack_if_kleidiai_enabled('
+          fn_idx = content.find(fn_call, deps_attr_start)
+          if fn_idx == -1:
+              print("❌ xnnpack_if_kleidiai_enabled not found in XNNPACK deps")
+              exit(1)
+
+          # Find the closing parenthesis of this function call
+          start_paren = fn_idx + len(fn_call)
           depth = 1
           i = start_paren
           while i < len(content) and depth > 0:
@@ -196,17 +215,26 @@ jobs:
               elif content[i] == ')':
                   depth -= 1
               i += 1
-
           if depth != 0:
-              print("❌ Unbalanced parentheses in xnnpack_if_kleidiai_enabled call")
+              print("❌ Unbalanced parentheses")
+              exit(1)
+          fn_end = i - 1  # index of the closing ')'
+
+          # The entire deps expression may include a "+ xnnpack_if_kleidiai_enabled(...)"
+          # We need to remove the "+ xnnpack_if_kleidiai_enabled(...)" part and replace it
+          # with a "+ select({...})". To do this, we find the start of the addition, which
+          # is the "+ xnnpack_if_kleidiai_enabled" text.
+          plus_idx = content.rfind('+', fn_idx, fn_end)
+          if plus_idx == -1:
+              # Maybe there is no '+' before it; then we need to handle differently.
+              # But in XNNPACK there is always a '+'.
+              print("❌ Could not find '+' before xnnpack_if_kleidiai_enabled")
               exit(1)
 
-          closing_paren = i - 1
-
-          # insert + select(...) right after the closing ')'
-          insert = ' + select({\n        "//build_config:aarch64": ["@KleidiAI//kai/ukernels/matmul"],\n        "//conditions:default": [],\n    })'
-          content = content[:closing_paren+1] + insert + content[closing_paren+1:]
-          print("✅ Added matmul select to XNNPACK deps")
+          # Replace from the '+' to the end of the function call with our new select
+          new_expression = '+ select({\n        "//build_config:aarch64": ["@KleidiAI//kai/ukernels/matmul"],\n        "//conditions:default": [],\n    })'
+          content = content[:plus_idx] + new_expression + content[fn_end+1:]
+          print("✅ Replaced xnnpack_if_kleidiai_enabled with Kai matmul select in XNNPACK deps")
 
           with open("BUILD.bazel", "w") as f:
               f.write(content)
@@ -214,8 +242,8 @@ jobs:
 
           echo "=== Modified MICROKERNEL_DEPS ==="
           grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
-          echo "=== xnnpack_if_kleidiai_enabled with new select ==="
-          grep -A 5 'xnnpack_if_kleidiai_enabled' BUILD.bazel
+          echo "=== XNNPACK deps after replacement ==="
+          grep -A 20 'name = "XNNPACK"' BUILD.bazel | grep -A 10 'deps' | head -20
 
       - name: Inject overrides into build script
         run: |
