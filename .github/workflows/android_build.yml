@@ -498,7 +498,7 @@ jobs:
       # ================================================================
 
       # ======================= 预热 XNNPACK 并验证 KleidiAI 集成 =======================
-      - name: Pre-build XNNPACK and verify KleidiAI symbols (arm64 only)
+      - name: Pre-build XNNPACK and verify KleidiAI integration (arm64 only)
         run: |
           echo "=== Warming Bazel cache for XNNPACK (arm64) ==="
           bazel build \
@@ -508,22 +508,26 @@ jobs:
             @XNNPACK//:XNNPACK \
             || { echo "Prebuild failed"; exit 1; }
       
-          echo "=== Checking for any kai_ symbols in libXNNPACK.a ==="
+          echo "=== Checking for kai_ symbols in libXNNPACK.a ==="
           LIBA="bazel-bin/external/XNNPACK/libXNNPACK.a"
           if [ ! -f "$LIBA" ]; then
             echo "❌ libXNNPACK.a not found"
             exit 1
           fi
       
-          # 打印所有包含 kai_ 的符号（已定义 T 或未定义 U 等）
-          KAI_SYMBOLS=$(nm "$LIBA" | grep "kai_")
-          if [ -z "$KAI_SYMBOLS" ]; then
-            echo "❌ No kai_ symbols found in libXNNPACK.a – KleidiAI is NOT integrated."
-            exit 1
-          else
-            echo "✅ Kai symbols found (list below):"
-            echo "$KAI_SYMBOLS"
+          # 打印所有包含 kai_ 的符号（T=已定义，U=未定义等）
+          echo "All kai_ symbols found:"
+          nm "$LIBA" | grep "kai_" || echo "(none)"
+      
+          # 检查未定义符号中是否有 kai_ 引用
+          UNDEF_KAI=$(nm -u "$LIBA" | grep "kai_")
+          if [ -n "$UNDEF_KAI" ]; then
+            echo "✅ XNNPACK references KleidiAI functions (undefined symbols found):"
+            echo "$UNDEF_KAI"
             echo "✅ KleidiAI integration confirmed."
+          else
+            echo "❌ No undefined kai_ symbols – KleidiAI may not be linked."
+            exit 1
           fi
       
           # 其余架构预热（允许失败）
