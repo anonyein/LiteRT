@@ -156,7 +156,7 @@ jobs:
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
 
-      - name: Patch XNNPACK BUILD – only add Kai deps to MICROKERNEL_DEPS
+      - name: Patch XNNPACK BUILD – add common to MICROKERNEL_DEPS and append matmul select
         run: |
           cd /tmp/xnnpack
           python3 << 'PYEOF'
@@ -165,27 +165,54 @@ jobs:
           with open("BUILD.bazel", "r") as f:
               content = f.read()
 
-          # 在 MICROKERNEL_DEPS 末尾添加两个依赖：头文件和实现（都来自 @KleidiAI）
+          # 1. 添加 @KleidiAI//:common 到 MICROKERNEL_DEPS（头文件）
           deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
           m = re.search(deps_pattern, content, flags=re.DOTALL)
           if not m:
               print("❌ MICROKERNEL_DEPS not found")
               exit(1)
-
           inner = m.group(2)
           if not inner.rstrip().endswith(','):
               inner = inner.rstrip() + ','
-          # 使用 @KleidiAI//:common 提供头文件，@KleidiAI//:kai_matmul 提供实现（alwayslink=1）
-          new_inner = inner + '\n    "@KleidiAI//:common",\n    "@KleidiAI//:kai_matmul",'
+          new_inner = inner + '\n    "@KleidiAI//:common",'
           content = content[:m.start(2)] + new_inner + content[m.end(2):]
+          print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS")
+
+          # 2. 在 XNNPACK 的 deps 中，xnnpack_if_kleidiai_enabled(...) 后追加 + select(...)
+          fn_call = 'xnnpack_if_kleidiai_enabled('
+          fn_idx = content.find(fn_call)
+          if fn_idx == -1:
+              print("❌ xnnpack_if_kleidiai_enabled not found")
+              exit(1)
+
+          # 找到函数调用的闭括号
+          start_paren = fn_idx + len(fn_call)
+          depth = 1
+          i = start_paren
+          while i < len(content) and depth > 0:
+              if content[i] == '(':
+                  depth += 1
+              elif content[i] == ')':
+                  depth -= 1
+              i += 1
+          if depth != 0:
+              print("❌ Unbalanced parentheses")
+              exit(1)
+          closing_paren = i - 1
+
+          # 在闭括号后插入 + select(...)（保留原有逗号等）
+          insert = ' + select({\n        "//build_config:aarch64": ["@KleidiAI//:kai_matmul"],\n        "//conditions:default": [],\n    })'
+          content = content[:closing_paren+1] + insert + content[closing_paren+1:]
+          print("✅ Appended Kai matmul select to XNNPACK deps")
 
           with open("BUILD.bazel", "w") as f:
               f.write(content)
-          print("✅ Added Kai deps to MICROKERNEL_DEPS")
           PYEOF
 
           echo "=== Modified MICROKERNEL_DEPS ==="
           grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
+          echo "=== XNNPACK deps after insertion ==="
+          grep -A 10 'xnnpack_if_kleidiai_enabled' BUILD.bazel | head -15
 
       - name: Inject overrides into build script
         run: |
