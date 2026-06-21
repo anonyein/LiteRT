@@ -112,19 +112,11 @@ jobs:
           fi
 
       # ---------- 为 KleidiAI 创建 BUILD 文件，使其能被 @KleidiAI 引用 ----------
-      - name: Create BUILD files for @KleidiAI
+      - name: Create BUILD.bazel for third_party/kleidiai
         run: |
-          KLEIDIAI_ROOT=/tmp/xnnpack/third_party/kleidiai
-
-          # 根 BUILD.bazel：提供 common 库和实际编译的 kai_matmul 库
-          cat > $KLEIDIAI_ROOT/BUILD.bazel << 'EOF'
+          cd /tmp/xnnpack/third_party/kleidiai
+          cat > BUILD.bazel << 'BAZEL_EOF'
           package(default_visibility = ["//visibility:public"])
-          cc_library(
-              name = "common",
-              # 仅提供头文件即可，XNNPACK 只需要依赖存在
-              hdrs = glob(["src/kai/**/*.h"]),
-              includes = ["src"],
-          )
           cc_library(
               name = "kai_matmul",
               srcs = glob([
@@ -143,30 +135,54 @@ jobs:
                   "-fno-tree-vectorize",
                   "-Wa,-march=armv8-a+sme2",
               ],
-              deps = [":common"],
           )
-          EOF
+          BAZEL_EOF
+          echo "=== Generated BUILD.bazel ==="
+          cat BUILD.bazel
 
-          # 创建 kai/ukernels/matmul 子包，提供 matmul 目标
-          mkdir -p $KLEIDIAI_ROOT/kai/ukernels/matmul
-          cat > $KLEIDIAI_ROOT/kai/ukernels/matmul/BUILD.bazel << 'EOF'
-          package(default_visibility = ["//visibility:public"])
-          cc_library(
-              name = "matmul",
-              deps = ["//:kai_matmul"],
-              alwayslink = 1,
-          )
-          EOF
-
-          echo "=== KleidiAI root BUILD ==="
-          cat $KLEIDIAI_ROOT/BUILD.bazel
-          echo "=== KleidiAI matmul BUILD ==="
-          cat $KLEIDIAI_ROOT/kai/ukernels/matmul/BUILD.bazel
-
-      - name: Inject XNNPACK and KleidiAI overrides into build script
+      # ---------- 直接修改 XNNPACK 的 BUILD.bazel，将 Kai 加入 XNNPACK 目标的 deps ----------
+      - name: Patch XNNPACK BUILD to link Kai
         run: |
-          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack --override_repository=KleidiAI=\/tmp\/xnnpack\/third_party\/kleidiai /g' ci/build_android_package.sh
-          echo "✅ Injected XNNPACK and KleidiAI overrides"
+          cd /tmp/xnnpack
+          python3 << 'PYEOF'
+          import re
+
+          with open("BUILD.bazel", "r") as f:
+              content = f.read()
+
+          # 定位 XNNPACK 目标中 deps 属性的末尾，并追加 select
+          # 匹配从 "deps = " 开始，到下一个顶级属性（如 ) 结束）之前的最后一个 "],"
+          # 更简单的方法：直接在 "@pthreadpool", 后面插入我们的 select
+          old = '            "@pthreadpool",\n        ],\n    )'
+          new = '            "@pthreadpool",\n        ],\n    ) + select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n        "//conditions:default": [],\n    })'
+
+          if old in content:
+              content = content.replace(old, new)
+              print("✅ Successfully added Kai select to XNNPACK deps.")
+          else:
+              # 如果上述模式不存在，尝试匹配 XNNPACK 规则，并替换整个 deps 部分
+              pattern = r'(name\s*=\s*"XNNPACK".*?deps\s*=\s*)(.*?)(\n\s*\)\s*,?\s*\n)' 
+              match = re.search(pattern, content, flags=re.DOTALL)
+              if match:
+                  original_deps = match.group(2)
+                  new_deps = original_deps.rstrip() + ' + select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n        "//conditions:default": [],\n    })'
+                  content = content[:match.start(2)] + new_deps + content[match.end(2):]
+                  print("✅ Added Kai select using fallback method.")
+              else:
+                  print("❌ Could not locate XNNPACK deps to patch.")
+                  exit(1)
+
+          with open("BUILD.bazel", "w") as f:
+              f.write(content)
+          PYEOF
+
+          echo "=== Modified XNNPACK deps area ==="
+          grep -A 30 'name = "XNNPACK"' BUILD.bazel | head -40
+
+      - name: Inject XNNPACK override into build script
+        run: |
+          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack /g' ci/build_android_package.sh
+          echo "✅ Injected XNNPACK override"
           echo "=== Patched build commands (first 5) ==="
           grep -n 'bazel build' ci/build_android_package.sh | head -5
 
@@ -211,12 +227,6 @@ jobs:
         run: |
           echo "build --features=-layering_check" >> .bazelrc
           echo "build:monolithic --features=-layering_check" >> .bazelrc
-
-      # ✅ 仅为 arm64 启用 KleidiAI，避免影响 x86
-      - name: Enable KleidiAI for arm64 only
-        run: |
-          echo "build:android_arm64 --define=xnn_enable_kleidiai=true" >> .bazelrc
-          echo "✅ Added arm64-specific KleidiAI flag"
 
       - name: Verify Android paths
         run: |
@@ -414,7 +424,6 @@ jobs:
           bazel build \
             --config=android_arm64 \
             --override_repository=XNNPACK=/tmp/xnnpack \
-            --override_repository=KleidiAI=/tmp/xnnpack/third_party/kleidiai \
             @XNNPACK//:XNNPACK \
             || { echo "Prebuild failed"; exit 1; }
 
