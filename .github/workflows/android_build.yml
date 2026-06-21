@@ -115,31 +115,28 @@ jobs:
             cat /tmp/qsi4cxp_files.txt
           fi
 
-      # 创建符合 XNNPACK 期望的 @KleidiAI 仓库的 BUILD 文件
+      # ---------- 创建正确的 BUILD 文件（matmul 移到根目录，子目录用 alias） ----------
       - name: Create BUILD files for @KleidiAI
         run: |
           REPO=/tmp/kleidiai_repo
-          # 根 BUILD.bazel：提供 common 头文件库
+          # 根 BUILD.bazel：common 头文件库 + matmul 真正实现库
           cat > $REPO/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
+
           cc_library(
               name = "common",
               hdrs = glob(["src/kai/**/*.h"]),
               includes = ["src"],
           )
-          EOF
 
-          # kai/ukernels/matmul/BUILD.bazel：使用相对于包目录的正确路径
-          cat > $REPO/kai/ukernels/matmul/BUILD.bazel << 'EOF'
-          package(default_visibility = ["//visibility:public"])
           cc_library(
               name = "matmul",
               srcs = glob([
-                  "../../../src/kai/ukernels/matmul/**/*.c",
-                  "../../../src/kai/ukernels/matmul/**/*.S",
+                  "src/kai/ukernels/matmul/**/*.c",
+                  "src/kai/ukernels/matmul/**/*.S",
               ]),
               hdrs = [],
-              includes = ["../../../src"],
+              includes = ["src"],
               alwayslink = 1,
               copts = [
                   "-Xclang", "-target-feature", "-Xclang", "+i8mm",
@@ -150,13 +147,23 @@ jobs:
                   "-fno-tree-vectorize",
                   "-Wa,-march=armv8-a+sme2",
               ],
-              deps = ["//:common"],
+              deps = [":common"],
+          )
+          EOF
+
+          # kai/ukernels/matmul/BUILD.bazel：仅提供别名，使 @KleidiAI//kai/ukernels/matmul:matmul 可用
+          cat > $REPO/kai/ukernels/matmul/BUILD.bazel << 'EOF'
+          package(default_visibility = ["//visibility:public"])
+
+          alias(
+              name = "matmul",
+              actual = "//:matmul",
           )
           EOF
 
           echo "=== @KleidiAI root BUILD ==="
           cat $REPO/BUILD.bazel
-          echo "=== @KleidiAI matmul BUILD ==="
+          echo "=== @KleidiAI matmul alias BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
 
       - name: Patch XNNPACK BUILD – only add @KleidiAI//:common to MICROKERNEL_DEPS
@@ -245,7 +252,7 @@ jobs:
           echo "build:android_x86   --define=xnn_enable_kleidiai=false"  >> .bazelrc
           echo "build:android_x86_64 --define=xnn_enable_kleidiai=false" >> .bazelrc
           echo "build:kleidiai_query --define=xnn_enable_kleidiai=true"  >> .bazelrc
-          echo "✅ KleidiAI: arm64=true, x86/x86_64=false; query config added"
+          echo "✅ KleidiAI: arm64=true, x86/x86_64=false"
       # =============================================================== #
 
       - name: Verify Android paths
