@@ -95,6 +95,22 @@ jobs:
           cp -r /tmp/kleidiai /tmp/xnnpack/third_party/kleidiai
           echo "KleidiAI installed at /tmp/xnnpack/third_party/kleidiai"
 
+      # ✅ 关键检查：确保 qsi4cxp 实现文件存在
+      - name: Verify qsi4cxp sources exist
+        run: |
+          cd /tmp/xnnpack/third_party/kleidiai/src/kai
+          echo "=== Searching for qsi4cxp files ==="
+          find . -type f \( -name '*qsi4cxp*.c' -o -name '*qsi4cxp*.S' \) | tee /tmp/qsi4cxp_files.txt
+          if [ ! -s /tmp/qsi4cxp_files.txt ]; then
+            echo "❌ FATAL: No qsi4cxp implementation files found!"
+            echo "This KleidiAI commit does not contain qsi4cxp."
+            echo "Please update KLEIDIAI_COMMIT to a version that includes it."
+            exit 1
+          else
+            echo "✅ qsi4cxp files found:"
+            cat /tmp/qsi4cxp_files.txt
+          fi
+
       # ---------- 生成 BUILD.bazel（直接编译所有 KleidiAI 源码，包含 qsi4cxp） ----------
       - name: Create BUILD.bazel for third_party/kleidiai
         run: |
