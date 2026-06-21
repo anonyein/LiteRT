@@ -112,11 +112,20 @@ jobs:
           fi
 
       # ---------- 为 KleidiAI 创建 BUILD 文件，使其能被 @KleidiAI 引用 ----------
-      - name: Create BUILD.bazel for third_party/kleidiai
+      - name: Create BUILD.bazel for KleidiAI with common and kai_matmul
         run: |
-          cd /tmp/xnnpack/third_party/kleidiai
-          cat > BUILD.bazel << 'BAZEL_EOF'
+          KLEIDIAI_ROOT=/tmp/xnnpack/third_party/kleidiai
+          cat > $KLEIDIAI_ROOT/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
+
+          # Only header library to expose include paths
+          cc_library(
+              name = "common",
+              hdrs = glob(["src/kai/**/*.h"]),
+              includes = ["src"],
+          )
+
+          # Actual implementation, alwayslink to preserve symbols
           cc_library(
               name = "kai_matmul",
               srcs = glob([
@@ -135,13 +144,14 @@ jobs:
                   "-fno-tree-vectorize",
                   "-Wa,-march=armv8-a+sme2",
               ],
+              deps = [":common"],
           )
-          BAZEL_EOF
-          echo "=== Generated BUILD.bazel ==="
-          cat BUILD.bazel
+          EOF
+          echo "=== KleidiAI BUILD.bazel ==="
+          cat $KLEIDIAI_ROOT/BUILD.bazel
 
       # ---------- 核心修改：将 Kai 依赖注入 MICROKERNEL_DEPS ----------
-      - name: Patch XNNPACK BUILD (MICROKERNEL_DEPS and XNNPACK deps)
+      - name: Patch XNNPACK BUILD – add common to MICROKERNEL_DEPS and kai_matmul to XNNPACK
         run: |
           cd /tmp/xnnpack
           python3 << 'PYEOF'
@@ -150,48 +160,53 @@ jobs:
           with open("BUILD.bazel", "r") as f:
               content = f.read()
 
-          # 1. 修改 MICROKERNEL_DEPS，在其末尾的 ] 后添加 + select(...)
-          # 匹配整个 MICROKERNEL_DEPS = [ ... ]，并捕获 ] 及之后的换行
-          pattern1 = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])(\s*\n)'
-          match1 = re.search(pattern1, content, flags=re.DOTALL)
-          if not match1:
+          # 1. Add "//third_party/kleidiai:common" to MICROKERNEL_DEPS (unconditional)
+          deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
+          deps_match = re.search(deps_pattern, content, flags=re.DOTALL)
+          if not deps_match:
               print("❌ Could not find MICROKERNEL_DEPS")
               exit(1)
 
-          select_clause = (
-              '] + select({\n' +
-              '        "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n' +
-              '        "//conditions:default": [],\n' +
-              '    })'
-          )
-          content = (
-              content[:match1.start(3)] +
-              select_clause +
-              match1.group(4) +
-              content[match1.end(4):]
-          )
-          print("✅ MICROKERNEL_DEPS patched")
+          # Insert the new dep before the closing bracket, keep existing formatting
+          existing_deps = deps_match.group(2)
+          # Add a comma if not empty and not already ending with comma
+          if existing_deps.strip() and not existing_deps.rstrip().endswith(','):
+              existing_deps += ','
+          new_deps = existing_deps + '\n    "//third_party/kleidiai:common",'
+          content = content[:deps_match.start(2)] + new_deps + content[deps_match.end(2):]
+          print("✅ Added common to MICROKERNEL_DEPS")
 
-          # 2. 在 xnnpack_if_kleidiai_enabled([...]) 后追加 + select(...)
-          # 匹配函数调用，捕获整个调用，并在 ) 后插入
-          pattern2 = r'(xnnpack_if_kleidiai_enabled\()(\[[^\]]*\])(\))'
-          match2 = re.search(pattern2, content)
-          if not match2:
-              print("❌ Could not find xnnpack_if_kleidiai_enabled")
+          # 2. Append kai_matmul for aarch64 to XNNPACK target deps
+          #    We locate the closing ) of the XNNPACK rule just after the xnnpack_if_kleidiai_enabled line
+          xnnpack_rule_pattern = r'(name\s*=\s*"XNNPACK".*?)(\)\s*,?\s*\n\s*\n\s*)'
+          xnnpack_match = re.search(xnnpack_rule_pattern, content, flags=re.DOTALL)
+          if not xnnpack_match:
+              print("❌ Could not find XNNPACK rule")
               exit(1)
 
-          insert_select = r'\1\2\3 + select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n        "//conditions:default": [],\n    })'
-          content = content[:match2.start()] + insert_select + content[match2.end():]
-          print("✅ XNNPACK deps patched")
+          # Insert before the closing ')' the extra select
+          insertion = (
+              '    ) +\n' +
+              '    select({\n' +
+              '        "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n' +
+              '        "//conditions:default": [],\n' +
+              '    })\n'
+          )
+          # We need to replace the closing ')', but keep the rest of the file after it.
+          # The group(2) is the closing ')', we want to put the insertion right before it.
+          before_close = content[:xnnpack_match.start(2)]
+          after_close = content[xnnpack_match.start(2):]
+          content = before_close + insertion + after_close
+          print("✅ Added kai_matmul select to XNNPACK deps")
 
           with open("BUILD.bazel", "w") as f:
               f.write(content)
           PYEOF
 
-          echo "=== Modified MICROKERNEL_DEPS ==="
-          grep -A 15 'MICROKERNEL_DEPS' BUILD.bazel | head -20
-          echo "=== Modified XNNPACK deps (around xnnpack_if_kleidiai_enabled) ==="
-          grep -A 10 'xnnpack_if_kleidiai_enabled' BUILD.bazel | tail -15
+          echo "=== Modified MICROKERNEL_DEPS area ==="
+          grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
+          echo "=== Modified XNNPACK deps area ==="
+          grep -A 10 'name = "XNNPACK"' BUILD.bazel | head -15
 
       - name: Inject XNNPACK override into build script
         run: |
