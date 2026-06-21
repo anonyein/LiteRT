@@ -21,7 +21,7 @@ jobs:
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
       # 保持原有的编译选项，不在这里添加 override_repository
-      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL --per_file_copt=@XNNPACK//.*@-includekai/kai_compat.h"
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
       # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
@@ -87,25 +87,6 @@ jobs:
             exit 1
           fi
 
-      # ---------- 生成 qsi4cxp → qsi8cxp 兼容头文件 ----------
-      - name: Generate compat header for missing qsi4cxp symbols
-        run: |
-          cd /tmp/kleidiai
-          cat > src/kai/kai_compat.h << 'EOF'
-          #ifndef KAI_COMPAT_H
-          #define KAI_COMPAT_H
-
-          // 将缺失的 qsi4cxp 符号映射到已有的 qsi8cxp 实现
-          #define kai_get_mr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa   kai_get_mr_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme_mopa
-          #define kai_get_nr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa   kai_get_nr_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme_mopa
-          #define kai_run_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa     kai_run_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme_mopa
-          #define kai_run_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot           kai_run_matmul_clamp_f32_qai8dxp1x4_qsi8cxp4vlx4_1x4vl_sme_dot
-
-          #endif
-          EOF
-          echo "=== Compat header ==="
-          cat src/kai/kai_compat.h
-
       # ---------- 将 KleidiAI 放入 XNNPACK 的 third_party ----------
       - name: Install KleidiAI into XNNPACK third_party
         run: |
@@ -114,15 +95,7 @@ jobs:
           cp -r /tmp/kleidiai /tmp/xnnpack/third_party/kleidiai
           echo "KleidiAI installed at /tmp/xnnpack/third_party/kleidiai"
 
-      # ---------- 在 XNNPACK 根目录创建 kai/ 目录并复制兼容头 ----------
-      - name: Copy compat header to XNNPACK root kai/
-        run: |
-          mkdir -p /tmp/xnnpack/kai
-          cp /tmp/xnnpack/third_party/kleidiai/src/kai/kai_compat.h /tmp/xnnpack/kai/
-          echo "=== Headers in /tmp/xnnpack/kai/ ==="
-          ls -l /tmp/xnnpack/kai/
-
-      # ---------- 生成 BUILD.bazel（alwayslink=1，无 -include） ----------
+      # ---------- 生成 BUILD.bazel（直接编译所有 KleidiAI 源码，包含 qsi4cxp） ----------
       - name: Create BUILD.bazel for third_party/kleidiai
         run: |
           cd /tmp/xnnpack/third_party/kleidiai
@@ -193,7 +166,17 @@ jobs:
           echo "=== Patched build commands (first 5) ==="
           grep -n 'bazel build' ci/build_android_package.sh | head -5
 
-      # ======================= 以下为原有的 Android 构建环境及所有补丁（完全不变） =======================
+      # ======================= 新增：提前编译 XNNPACK 以预热缓存 =======================
+      - name: Pre-build XNNPACK for arm64 (warm cache)
+        run: |
+          echo "=== Warming Bazel cache for XNNPACK (arm64) ==="
+          bazel build \
+            --config=android_arm64 \
+            --override_repository=XNNPACK=/tmp/xnnpack \
+            @XNNPACK//:xnnpack \
+            || echo "Prebuild of @XNNPACK//:xnnpack completed with warnings (cache partial)"
+      # ================================================================================
+
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
         with:
