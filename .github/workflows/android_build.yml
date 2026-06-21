@@ -470,7 +470,7 @@ jobs:
           fi
 
           # 需要出现的符号（根据之前的链接错误列出）
-          SYMBOLS=(
+          REQUIRED_SYMBOLS=(
             "kai_get_mr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa"
             "kai_get_nr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa"
             "kai_run_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa"
