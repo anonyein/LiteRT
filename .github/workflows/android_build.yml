@@ -615,6 +615,9 @@ jobs:
           
       - name: Run build_android_package.sh
         run: |
+          # 强制 Bazel 在最终打包时使用修补后的 BUILD 文件
+          rm -rf $(bazel info output_base)/external/XNNPACK
+          rm -rf $(bazel info output_base)/external/KleidiAI
           chmod +x ./ci/build_android_package.sh
           echo "=== Final build commands (first 5) ==="
           grep -n 'bazel build' ci/build_android_package.sh | head -5
