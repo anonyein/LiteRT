@@ -151,12 +151,13 @@ jobs:
               alwayslink = 1,
               copts = [
                   "-Xclang", "-target-feature", "-Xclang", "+fp16",
+                  "-Xclang", "-target-feature", "-Xclang", "+dotprod",   # <-- 新增
                   "-Xclang", "-target-feature", "-Xclang", "+i8mm",
                   "-Xclang", "-target-feature", "-Xclang", "+sme2",
                   "-Xclang", "-target-feature", "-Xclang", "+sve2",
                   "-Xclang", "-target-feature", "-Xclang", "+sme",
                   "-Xclang", "-target-feature", "-Xclang", "+bf16",
-                  "-Wa,-march=armv8-a+sme2+fp16",
+                  "-Wa,-march=armv8-a+sme2+fp16+dotprod",                # <-- 汇编器也加入 dotprod
               ],
           )
 
@@ -168,13 +169,14 @@ jobs:
               alwayslink = 1,
               copts = [
                   "-Xclang", "-target-feature", "-Xclang", "+fp16",
+                  "-Xclang", "-target-feature", "-Xclang", "+dotprod",   # <-- 新增
                   "-Xclang", "-target-feature", "-Xclang", "+i8mm",
                   "-Xclang", "-target-feature", "-Xclang", "+sme2",
                   "-Xclang", "-target-feature", "-Xclang", "+sve2",
                   "-Xclang", "-target-feature", "-Xclang", "+sme",
                   "-Xclang", "-target-feature", "-Xclang", "+bf16",
                   "-fno-tree-vectorize",
-                  "-Wa,-march=armv8-a+sme2+fp16",
+                  "-Wa,-march=armv8-a+sme2+fp16+dotprod",                # <-- 汇编器也加入 dotprod
               ],
               deps = [":common"],
           )
