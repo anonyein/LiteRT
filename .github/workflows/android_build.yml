@@ -94,6 +94,12 @@ jobs:
           cp -r /tmp/kleidiai /tmp/kleidiai_repo
           mkdir -p /tmp/kleidiai_repo/kai/ukernels/matmul
 
+      # ------------------ 新增：打印 KleidiAI 目录结构，证明源文件位置正确 ------------------
+      - name: Print KleidiAI directory structure
+        run: |
+          echo "=== KleidiAI repo tree ==="
+          find /tmp/kleidiai_repo -type f \( -name '*.h' -o -name '*.c' -o -name '*.S' -o -name 'BUILD*' \) | sort
+
       - name: Verify qsi4cxp sources exist
         run: |
           cd /tmp/kleidiai_repo/src/kai
@@ -377,6 +383,7 @@ jobs:
                        "#endif" > "$MKL_UTIL_H"
           echo "Created empty $MKL_UTIL_H"
 
+      # 修复 hwloc
       - name: Fetch hwloc and apply fixes
         run: |
           bazel fetch @hwloc//... || true
@@ -414,7 +421,7 @@ jobs:
             echo "hwloc directory not found, skipping"
           fi
 
-      # ✅ 关键步骤：在 select-tf-ops 构建命令的末尾强制追加 --features=-layering_check
+      # select-tf-ops 禁用 layering_check
       - name: Force disable layering_check for select-tf-ops build
         run: |
           sed -i '/\/\/tflite\/java:tensorflow-lite-select-tf-ops/ s/$/ --features=-layering_check/' ci/build_android_package.sh
@@ -429,7 +436,27 @@ jobs:
           grep -n 'with_xla_support' .bazelrc || echo "No with_xla_support lines found"
       # ================================================================
 
-      # ======================= 预热 XNNPACK（仅 arm64 进行符号验证） =======================
+      # ============================== 新增：验证 KleidiAI 依赖链接 ==============================
+      - name: Verify KleidiAI dependency linkage (query only)
+        run: |
+          echo "=== Checking if @XNNPACK//:XNNPACK depends on @KleidiAI//kai/ukernels/matmul:matmul ==="
+          bazel query 'deps(@XNNPACK//:XNNPACK)' \
+            --config=android_arm64 \
+            --override_repository=XNNPACK=/tmp/xnnpack \
+            --override_repository=KleidiAI=/tmp/kleidiai_repo \
+            | grep -i kleidi || echo "⚠️ No KleidiAI dependency found in deps"
+
+          echo ""
+          echo "=== Checking path to matmul ==="
+          bazel query 'somepath(@XNNPACK//:XNNPACK, @KleidiAI//kai/ukernels/matmul:matmul)' \
+            --config=android_arm64 \
+            --override_repository=XNNPACK=/tmp/xnnpack \
+            --override_repository=KleidiAI=/tmp/kleidiai_repo \
+            && echo "✅ matmul IS reachable from XNNPACK" \
+            || { echo "❌ matmul NOT reachable! KleidiAI will not be linked."; exit 1; }
+      # =========================================================================================
+
+      # ======================= 预热 XNNPACK 并验证 KleidiAI 符号 =======================
       - name: Pre-build XNNPACK and verify critical symbols (arm64 only)
         run: |
           echo "=== Warming Bazel cache for XNNPACK (arm64 + symbols check) ==="
@@ -455,18 +482,30 @@ jobs:
             "kai_run_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot"
           )
 
-          for sym in "${SYMBOLS[@]}"; do
+          MISSING=0
+          for sym in "${REQUIRED_SYMBOLS[@]}"; do
             if nm "$LIBA" | grep -q "$sym"; then
-              echo "✅ Found symbol: $sym"
+              echo "✅ Found: $sym"
             else
-              echo "❌ Symbol NOT FOUND: $sym"
-              exit 1
+              echo "❌ Missing: $sym"
+              MISSING=1
             fi
           done
 
+          if [ $MISSING -eq 1 ]; then
+            echo ""
+            echo "=== Debug: List KleidiAI objects in the archive ==="
+            nm "$LIBA" | grep -i kai || echo "No Kai symbols found at all"
+            echo ""
+            echo "=== Check if SME2 assembly was compiled ==="
+            # 如果汇编文件未编译，matmul 里就不会有 SME 函数
+            echo "This usually means the assembler does not support '+sme2' or the .S files were excluded."
+            exit 1
+          fi
+
           echo "✅ All critical qsi4cxp symbols present. Cache warm complete."
 
-          # 其余架构预热（不检查符号，允许失败以加快流程）
+          # 其余架构预热（允许失败）
           for arch in android_arm android_x86 android_x86_64; do
             echo "Building @XNNPACK//:XNNPACK for $arch (warmup only)"
             bazel build \
