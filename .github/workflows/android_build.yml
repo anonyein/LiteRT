@@ -153,13 +153,14 @@ jobs:
               includes = ["src"],
               alwayslink = 1,
               copts = [
+                  "-Xclang", "-target-feature", "-Xclang", "+fp16",          # <-- 添加 FP16 特性
                   "-Xclang", "-target-feature", "-Xclang", "+i8mm",
                   "-Xclang", "-target-feature", "-Xclang", "+sme2",
                   "-Xclang", "-target-feature", "-Xclang", "+sve2",
                   "-Xclang", "-target-feature", "-Xclang", "+sme",
                   "-Xclang", "-target-feature", "-Xclang", "+bf16",
                   "-fno-tree-vectorize",
-                  "-Wa,-march=armv8-a+sme2",
+                  "-Wa,-march=armv8-a+sme2+fp16",                             # <-- 汇编器也加入 +fp16
               ],
               deps = [":common"],
           )
