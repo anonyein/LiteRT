@@ -296,10 +296,13 @@ jobs:
           echo "ANDROID_SDK_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
 
-      - name: Configure .bazelrc for NDK
+      - name: Configure .bazelrc for NDK and overrides   # <-- 修改：在此统一配置 NDK 和仓库覆盖
         run: |
           echo "build --repo_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
           echo "build --action_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
+          # 将覆盖仓库写入 .bazelrc，确保所有构建自动应用
+          echo "build --override_repository=XNNPACK=/tmp/xnnpack" >> .bazelrc
+          echo "build --override_repository=KleidiAI=/tmp/kleidiai_repo" >> .bazelrc
 
       - name: Disable layering_check globally and for monolithic config
         run: |
