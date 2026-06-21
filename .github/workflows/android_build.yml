@@ -387,6 +387,15 @@ jobs:
           sed -i '/\/\/tflite\/java:tensorflow-lite-select-tf-ops/ s/$/ --features=-layering_check/' ci/build_android_package.sh
           echo "✅ Appended --features=-layering_check to select-tf-ops build line"
 
+      # ======================= 强制启用 XLA 支持 =======================
+      - name: Enable XLA support for Android
+        run: |
+          echo "=== Enabling XLA for Android builds ==="
+          sed -i 's/--define=with_xla_support=false/--define=with_xla_support=true/' .bazelrc
+          echo "=== Modified .bazelrc (android config line) ==="
+          grep -n 'with_xla_support' .bazelrc || echo "No with_xla_support lines found"
+      # ================================================================
+
       # ======================= 提前编译 XNNPACK 以预热缓存（四种架构） =======================
       - name: Pre-build XNNPACK for all Android architectures (warm cache)
         run: |
