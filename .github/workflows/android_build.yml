@@ -96,14 +96,14 @@ jobs:
           mkdir -p /tmp/kleidiai_repo/kai/ukernels/matmul
           cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/*.c /tmp/kleidiai_repo/kai/ukernels/matmul/ 2>/dev/null || true
           cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/*.S /tmp/kleidiai_repo/kai/ukernels/matmul/ 2>/dev/null || true
-          cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/*.h /tmp/kleidiai_repo/kai/ukernels/matmul/ 2>/dev/null || true   # <-- 新增复制 .h
+          cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/*.h /tmp/kleidiai_repo/kai/ukernels/matmul/ 2>/dev/null || true
 
           # 同时复制 pack 子目录下的文件（如果需要）
           if [ -d /tmp/kleidiai_repo/src/kai/ukernels/matmul/pack ]; then
             mkdir -p /tmp/kleidiai_repo/kai/ukernels/matmul/pack
             cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/pack/*.c /tmp/kleidiai_repo/kai/ukernels/matmul/pack/ 2>/dev/null || true
             cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/pack/*.S /tmp/kleidiai_repo/kai/ukernels/matmul/pack/ 2>/dev/null || true
-            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/pack/*.h /tmp/kleidiai_repo/kai/ukernels/matmul/pack/ 2>/dev/null || true   # <-- 新增复制 .h
+            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/pack/*.h /tmp/kleidiai_repo/kai/ukernels/matmul/pack/ 2>/dev/null || true
           fi
           # 子目录 imatmul_clamp_*, matmul_clamp_* 等（如果有多个子目录，也可类似处理，或统一用 glob）
           for subdir in $(find /tmp/kleidiai_repo/src/kai/ukernels/matmul -mindepth 1 -maxdepth 1 -type d); do
@@ -111,7 +111,7 @@ jobs:
             mkdir -p "/tmp/kleidiai_repo/kai/ukernels/matmul/$subname"
             cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/$subname/*.c "/tmp/kleidiai_repo/kai/ukernels/matmul/$subname/" 2>/dev/null || true
             cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/$subname/*.S "/tmp/kleidiai_repo/kai/ukernels/matmul/$subname/" 2>/dev/null || true
-            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/$subname/*.h "/tmp/kleidiai_repo/kai/ukernels/matmul/$subname/" 2>/dev/null || true   # <-- 新增复制 .h
+            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/$subname/*.h "/tmp/kleidiai_repo/kai/ukernels/matmul/$subname/" 2>/dev/null || true
           done
 
           echo "=== KleidiAI repo tree after copy ==="
@@ -132,7 +132,7 @@ jobs:
             cat /tmp/qsi4cxp_files.txt
           fi
 
-      # ---------- 创建 BUILD 文件（根 + 子包 filegroup） ----------
+      # ---------- 创建 BUILD 文件（唯一修改点：common 添加公共汇编源文件） ----------
       - name: Create BUILD files for @KleidiAI
         run: |
           REPO=/tmp/kleidiai_repo
@@ -143,7 +143,21 @@ jobs:
           cc_library(
               name = "common",
               hdrs = glob(["src/kai/**/*.h"]),
+              srcs = [                                    # <-- 新增：包含公共汇编源文件
+                  "src/kai/kai_common_sme_asm.S",
+                  "src/kai/kai_common_sve_asm.S",
+              ],
               includes = ["src"],
+              alwayslink = 1,
+              copts = [                                   # <-- 新增：为 common 添加必要编译选项
+                  "-Xclang", "-target-feature", "-Xclang", "+fp16",
+                  "-Xclang", "-target-feature", "-Xclang", "+i8mm",
+                  "-Xclang", "-target-feature", "-Xclang", "+sme2",
+                  "-Xclang", "-target-feature", "-Xclang", "+sve2",
+                  "-Xclang", "-target-feature", "-Xclang", "+sme",
+                  "-Xclang", "-target-feature", "-Xclang", "+bf16",
+                  "-Wa,-march=armv8-a+sme2+fp16",
+              ],
           )
 
           cc_library(
@@ -153,14 +167,14 @@ jobs:
               includes = ["src"],
               alwayslink = 1,
               copts = [
-                  "-Xclang", "-target-feature", "-Xclang", "+fp16",          # <-- 添加 FP16 特性
+                  "-Xclang", "-target-feature", "-Xclang", "+fp16",
                   "-Xclang", "-target-feature", "-Xclang", "+i8mm",
                   "-Xclang", "-target-feature", "-Xclang", "+sme2",
                   "-Xclang", "-target-feature", "-Xclang", "+sve2",
                   "-Xclang", "-target-feature", "-Xclang", "+sme",
                   "-Xclang", "-target-feature", "-Xclang", "+bf16",
                   "-fno-tree-vectorize",
-                  "-Wa,-march=armv8-a+sme2+fp16",                             # <-- 汇编器也加入 +fp16
+                  "-Wa,-march=armv8-a+sme2+fp16",
               ],
               deps = [":common"],
           )
@@ -190,6 +204,7 @@ jobs:
           echo "=== @KleidiAI matmul filegroup BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
 
+      # ---------- 以下步骤完全不变 ----------
       - name: Patch XNNPACK BUILD – only add @KleidiAI//:common to MICROKERNEL_DEPS
         run: |
           cd /tmp/xnnpack
