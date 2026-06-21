@@ -141,7 +141,7 @@ jobs:
           cat BUILD.bazel
 
       # ---------- 核心修改：将 Kai 依赖注入 MICROKERNEL_DEPS ----------
-      - name: Patch XNNPACK BUILD to force link Kai into XNNPACK target
+      - name: Patch XNNPACK BUILD (MICROKERNEL_DEPS and XNNPACK deps)
         run: |
           cd /tmp/xnnpack
           python3 << 'PYEOF'
@@ -150,25 +150,48 @@ jobs:
           with open("BUILD.bazel", "r") as f:
               content = f.read()
 
-          # 在 xnnpack_if_kleidiai_enabled([...]) 后面追加 + select(...)
-          # 匹配函数调用 xnnpack_if_kleidiai_enabled( [...] ) 并捕获闭括号 )
-          pattern = r'(xnnpack_if_kleidiai_enabled\()(\[[^\]]*\])(\))'
-          replacement = r'\1\2\3 + select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n        "//conditions:default": [],\n    })'
-
-          new_content, count = re.subn(pattern, replacement, content)
-          if count == 0:
-              print("❌ Could not find xnnpack_if_kleidiai_enabled in BUILD.bazel")
+          # 1. 修改 MICROKERNEL_DEPS，在其末尾的 ] 后添加 + select(...)
+          # 匹配整个 MICROKERNEL_DEPS = [ ... ]，并捕获 ] 及之后的换行
+          pattern1 = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])(\s*\n)'
+          match1 = re.search(pattern1, content, flags=re.DOTALL)
+          if not match1:
+              print("❌ Could not find MICROKERNEL_DEPS")
               exit(1)
-          if count > 1:
-              print("⚠️ Found more than one occurrence, this might be unexpected")
+
+          select_clause = (
+              '] + select({\n' +
+              '        "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n' +
+              '        "//conditions:default": [],\n' +
+              '    })'
+          )
+          content = (
+              content[:match1.start(3)] +
+              select_clause +
+              match1.group(4) +
+              content[match1.end(4):]
+          )
+          print("✅ MICROKERNEL_DEPS patched")
+
+          # 2. 在 xnnpack_if_kleidiai_enabled([...]) 后追加 + select(...)
+          # 匹配函数调用，捕获整个调用，并在 ) 后插入
+          pattern2 = r'(xnnpack_if_kleidiai_enabled\()(\[[^\]]*\])(\))'
+          match2 = re.search(pattern2, content)
+          if not match2:
+              print("❌ Could not find xnnpack_if_kleidiai_enabled")
+              exit(1)
+
+          insert_select = r'\1\2\3 + select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n        "//conditions:default": [],\n    })'
+          content = content[:match2.start()] + insert_select + content[match2.end():]
+          print("✅ XNNPACK deps patched")
 
           with open("BUILD.bazel", "w") as f:
-              f.write(new_content)
-          print("✅ Successfully appended Kai select to XNNPACK deps.")
+              f.write(content)
           PYEOF
 
+          echo "=== Modified MICROKERNEL_DEPS ==="
+          grep -A 15 'MICROKERNEL_DEPS' BUILD.bazel | head -20
           echo "=== Modified XNNPACK deps (around xnnpack_if_kleidiai_enabled) ==="
-          grep -A 15 'xnnpack_if_kleidiai_enabled' BUILD.bazel | head -20
+          grep -A 10 'xnnpack_if_kleidiai_enabled' BUILD.bazel | tail -15
 
       - name: Inject XNNPACK override into build script
         run: |
