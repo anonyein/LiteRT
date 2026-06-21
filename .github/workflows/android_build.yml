@@ -137,8 +137,8 @@ jobs:
           echo "=== Generated BUILD.bazel ==="
           cat BUILD.bazel
 
-      # ---------- 条件添加 Kai 依赖（安全追加，并打印结果） ----------
-      - name: Ensure Kai library is linked into xnnpack
+      # ---------- 核心修改：直接给 XNNPACK 目标添加 Kai 依赖 ----------
+      - name: Ensure Kai library is linked into XNNPACK
         run: |
           cd /tmp/xnnpack
           # 强制将 Kai 作为 xnnpack 的依赖，通过修改 BUILD.bazel 中 xnnpack 目标的 deps
@@ -148,30 +148,38 @@ jobs:
           with open("BUILD.bazel", "r") as f:
               content = f.read()
 
-          # 找到 xnnpack 目标并插入依赖
-          # 匹配 cc_library(name = "xnnpack"
-          pattern = r'(cc_library\s*\([^)]*name\s*=\s*"xnnpack"[^)]*deps\s*=\s*\[)(.*?)(\])'
-          replacement = r'\1\2,\n        "//third_party/kleidiai:kai",\n    ] + select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai"],\n        "//conditions:default": [],\n    })'
+          # 匹配目标名为 "XNNPACK" 的 cc_library 规则（注意大小写）
+          # 已有的 deps 可能形式多样，我们匹配到 deps = [ ... ] 的结束括号 ] 前插入依赖
+          pattern = r'(cc_library\s*\([^)]*name\s*=\s*"XNNPACK"[^)]*deps\s*=\s*\[)(.*?)(\]\s*,?\s*\n)' 
+          replacement = r'\1\2\n        "//third_party/kleidiai:kai",\n    ] + select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai"],\n        "//conditions:default": [],\n    })\3'
+          
           new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
           if count == 0:
-              # 如果没有 deps，则添加 deps
-              pattern2 = r'(cc_library\s*\([^)]*name\s*=\s*"xnnpack"[^)]*\))'
+              # 尝试另一种可能的 deps 声明：deps = XNNPACK_DEPS + ...
+              # 但这种可能较复杂，我们也可以直接在整个文件末尾插入（不推荐）
+              # 更稳妥：在 XNNPACK 的 deps 属性后追加 select
+              # 如果找不到，可以尝试匹配整个规则并强行设置 deps
+              pattern2 = r'(cc_library\s*\([^)]*name\s*=\s*"XNNPACK"[^)]*\))'
               def add_deps(match):
                   block = match.group(1)
-                  if 'deps' not in block:
-                      block = block.rstrip(')') + '\n    deps = select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai"],\n        "//conditions:default": [],\n    })\n)'
-                  return block
+                  if 'deps' in block:
+                      # 已有 deps，在最后一个 ] 前加入
+                      # 简化处理：直接替换为添加了 select 的版本
+                      return block.replace('deps = [', 'deps = [\n        "//third_party/kleidiai:kai",\n    ] + select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai"],\n        "//conditions:default": [],\n    }) + [')
+                  else:
+                      # 没有 deps，添加
+                      return block.rstrip(')') + '\n    deps = select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai"],\n        "//conditions:default": [],\n    })\n)'
               new_content, count2 = re.subn(pattern2, add_deps, content, flags=re.DOTALL)
               if count2 == 0:
-                  print("❌ Could not modify xnnpack target")
+                  print("❌ Could not modify XNNPACK target")
                   exit(1)
           with open("BUILD.bazel", "w") as f:
               f.write(new_content)
-          print("✅ xnnpack deps modified to include Kai")
+          print("✅ XNNPACK deps modified to include Kai")
           PYEOF
 
-          echo "=== Modified xnnpack deps ==="
-          grep -A 40 'name = "xnnpack"' BUILD.bazel | head -50
+          echo "=== Modified XNNPACK deps ==="
+          grep -A 50 'name = "XNNPACK"' BUILD.bazel | head -60
 
       # ---------- 注入 XNNPACK 仓库覆盖 ----------
       - name: Inject XNNPACK override into build script
