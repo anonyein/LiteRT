@@ -230,10 +230,15 @@ jobs:
           echo "build --features=-layering_check" >> .bazelrc
           echo "build:monolithic --features=-layering_check" >> .bazelrc
 
-      - name: Enable KleidiAI for arm64
+      # ======================= XNNPACK 专用配置 ======================= #
+      # 仅 ARM64 启用 KleidiAI，x86 显式禁用，杜绝任何误判
+      - name: Enable KleidiAI for arm64 (and disable for x86)
         run: |
-          echo "build:android_arm64 --define=xnn_enable_kleidiai=true" >> .bazelrc
-          echo "✅ Enabled KleidiAI for arm64"
+          echo "build:android_arm64 --define=xnn_enable_kleidiai=true"   >> .bazelrc
+          echo "build:android_x86   --define=xnn_enable_kleidiai=false"  >> .bazelrc  # <-- XNNPACK 修改
+          echo "build:android_x86_64 --define=xnn_enable_kleidiai=false" >> .bazelrc  # <-- XNNPACK 修改
+          echo "✅ KleidiAI: arm64=true, x86/x86_64=false"
+      # =============================================================== #
 
       - name: Verify Android paths
         run: |
@@ -424,10 +429,10 @@ jobs:
           grep -n 'with_xla_support' .bazelrc || echo "No with_xla_support lines found"
       # ================================================================
 
-      # ======================= 提前编译 XNNPACK 以预热缓存 + 符号检查 =======================
-      - name: Pre-build XNNPACK and verify critical symbols
+      # ======================= 预热 XNNPACK（仅 arm64 进行符号验证） =======================
+      - name: Pre-build XNNPACK and verify critical symbols (arm64 only)
         run: |
-          echo "=== Warming Bazel cache for XNNPACK (arm64 only for symbol check) ==="
+          echo "=== Warming Bazel cache for XNNPACK (arm64 + symbols check) ==="
           bazel build \
             --config=android_arm64 \
             --override_repository=XNNPACK=/tmp/xnnpack \
@@ -460,9 +465,10 @@ jobs:
           done
 
           echo "✅ All critical qsi4cxp symbols present. Cache warm complete."
-          # 其余架构预热（可选，不检查符号）
+
+          # 其余架构预热（不检查符号，允许失败以加快流程）
           for arch in android_arm android_x86 android_x86_64; do
-            echo "Building @XNNPACK//:XNNPACK for $arch"
+            echo "Building @XNNPACK//:XNNPACK for $arch (warmup only)"
             bazel build \
               --config=$arch \
               --override_repository=XNNPACK=/tmp/xnnpack \
