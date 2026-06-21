@@ -156,71 +156,7 @@ jobs:
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
 
-      - name: Pre-build Kai (verify compilation)
-        run: |
-          echo "=== Building @KleidiAI//:kai_matmul alone ==="
-          bazel build \
-            --config=android_arm64 \
-            --override_repository=KleidiAI=/tmp/kleidiai_repo \
-            @KleidiAI//:kai_matmul \
-            || { echo "❌ Kai compilation failed"; exit 1; }
-          echo "✅ Kai compiled successfully"
-
-      - name: Patch XNNPACK BUILD – add common to MICROKERNEL_DEPS and kai_matmul to XNNPACK deps
-        run: |
-          cd /tmp/xnnpack
-          python3 << 'PYEOF'
-          import re
-
-          with open("BUILD.bazel", "r") as f:
-              content = f.read()
-
-          # 1. 添加 @KleidiAI//:common 到 MICROKERNEL_DEPS
-          deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
-          m = re.search(deps_pattern, content, flags=re.DOTALL)
-          if not m:
-              print("❌ MICROKERNEL_DEPS not found")
-              exit(1)
-          inner = m.group(2)
-          if not inner.rstrip().endswith(','):
-              inner = inner.rstrip() + ','
-          new_inner = inner + '\n    "@KleidiAI//:common",'
-          content = content[:m.start(2)] + new_inner + content[m.end(2):]
-          print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS")
-
-          # 2. 精确替换 xnnpack_if_kleidiai_enabled(...) 调用，追加 select
-          old_str = 'xnnpack_if_kleidiai_enabled(["@KleidiAI//:common"])'
-          new_str = 'xnnpack_if_kleidiai_enabled(["@KleidiAI//:common"]) + select({\n        "//build_config:aarch64": ["@KleidiAI//:kai_matmul"],\n        "//conditions:default": [],\n    })'
-          if old_str in content:
-              content = content.replace(old_str, new_str)
-              print("✅ Appended Kai matmul select to XNNPACK deps")
-          else:
-              # 如果精确匹配失败，打印错误并退出
-              print("❌ The expected string not found in BUILD.bazel")
-              print("Looked for:", old_str)
-              # 打印上下文帮助调试
-              idx = content.find('xnnpack_if_kleidiai_enabled')
-              if idx != -1:
-                  print("Found xnnpack_if_kleidiai_enabled at index", idx)
-                  print(content[idx:idx+100])
-              exit(1)
-
-          with open("BUILD.bazel", "w") as f:
-              f.write(content)
-          PYEOF
-
-          echo "=== Modified MICROKERNEL_DEPS ==="
-          grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
-          echo "=== xnnpack_if_kleidiai_enabled call ==="
-          grep 'xnnpack_if_kleidiai_enabled' BUILD.bazel
-
-      - name: Inject overrides into build script
-        run: |
-          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack --override_repository=KleidiAI=\/tmp\/kleidiai_repo /g' ci/build_android_package.sh
-          echo "✅ Injected XNNPACK and KleidiAI overrides"
-          grep -n 'bazel build' ci/build_android_package.sh | head -5
-
-      # ---------- 以下步骤保持不变 ----------
+      # ---------- 先配置 NDK、SDK、bazelrc，以便后续编译时使用正确的工具链 ----------
       - name: Setup Bazel
         uses: bazel-contrib/setup-bazel@0.9.0
         with:
@@ -267,6 +203,71 @@ jobs:
           echo "build:android_arm64 --define=xnn_enable_kleidiai=true" >> .bazelrc
           echo "✅ Enabled KleidiAI for arm64"
 
+      # ---------- 现在工具链已就绪，单独编译 Kai ----------
+      - name: Pre-build Kai (verify compilation)
+        run: |
+          echo "=== Building @KleidiAI//:kai_matmul alone ==="
+          bazel build \
+            --config=android_arm64 \
+            --override_repository=KleidiAI=/tmp/kleidiai_repo \
+            @KleidiAI//:kai_matmul \
+            || { echo "❌ Kai compilation failed"; exit 1; }
+          echo "✅ Kai compiled successfully"
+
+      # ---------- 修改 XNNPACK BUILD，添加 Kai 依赖 ----------
+      - name: Patch XNNPACK BUILD – add common to MICROKERNEL_DEPS and kai_matmul to XNNPACK deps
+        run: |
+          cd /tmp/xnnpack
+          python3 << 'PYEOF'
+          import re
+
+          with open("BUILD.bazel", "r") as f:
+              content = f.read()
+
+          # 1. 添加 @KleidiAI//:common 到 MICROKERNEL_DEPS
+          deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
+          m = re.search(deps_pattern, content, flags=re.DOTALL)
+          if not m:
+              print("❌ MICROKERNEL_DEPS not found")
+              exit(1)
+          inner = m.group(2)
+          if not inner.rstrip().endswith(','):
+              inner = inner.rstrip() + ','
+          new_inner = inner + '\n    "@KleidiAI//:common",'
+          content = content[:m.start(2)] + new_inner + content[m.end(2):]
+          print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS")
+
+          # 2. 精确替换 xnnpack_if_kleidiai_enabled(...) 调用，追加 select
+          old_str = 'xnnpack_if_kleidiai_enabled(["@KleidiAI//:common"])'
+          new_str = 'xnnpack_if_kleidiai_enabled(["@KleidiAI//:common"]) + select({\n        "//build_config:aarch64": ["@KleidiAI//:kai_matmul"],\n        "//conditions:default": [],\n    })'
+          if old_str in content:
+              content = content.replace(old_str, new_str)
+              print("✅ Appended Kai matmul select to XNNPACK deps")
+          else:
+              print("❌ The expected string not found in BUILD.bazel")
+              print("Looked for:", old_str)
+              idx = content.find('xnnpack_if_kleidiai_enabled')
+              if idx != -1:
+                  print("Found xnnpack_if_kleidiai_enabled at index", idx)
+                  print(content[idx:idx+100])
+              exit(1)
+
+          with open("BUILD.bazel", "w") as f:
+              f.write(content)
+          PYEOF
+
+          echo "=== Modified MICROKERNEL_DEPS ==="
+          grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
+          echo "=== xnnpack_if_kleidiai_enabled call ==="
+          grep 'xnnpack_if_kleidiai_enabled' BUILD.bazel
+
+      - name: Inject overrides into build script
+        run: |
+          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack --override_repository=KleidiAI=\/tmp\/kleidiai_repo /g' ci/build_android_package.sh
+          echo "✅ Injected XNNPACK and KleidiAI overrides"
+          grep -n 'bazel build' ci/build_android_package.sh | head -5
+
+      # ---------- 后续步骤保持不变 ----------
       - name: Verify Android paths
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"
