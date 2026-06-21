@@ -228,7 +228,7 @@ jobs:
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
 
-      # ---------- 以下步骤完全不变 ----------
+      # ---------- 修补 XNNPACK BUILD（最小增强：双保险） ----------
       - name: Patch XNNPACK BUILD – only add @KleidiAI//:common to MICROKERNEL_DEPS
         run: |
           cd /tmp/xnnpack
@@ -249,9 +249,20 @@ jobs:
               inner = inner.rstrip() + ','
           new_inner = inner + '\n    "@KleidiAI//:common",'
           content = content[:m.start(2)] + new_inner + content[m.end(2):]
+
+          # 2. 将所有直接引用 MICROKERNEL_DEPS 的 deps 都显式追加依赖（新增两行，最小修改）
+          content = content.replace(
+              'deps = MICROKERNEL_DEPS,',
+              'deps = MICROKERNEL_DEPS + ["@KleidiAI//:common"],'
+          )
+          content = content.replace(
+              'deps = MICROKERNEL_DEPS\n',
+              'deps = MICROKERNEL_DEPS + ["@KleidiAI//:common"]\n'
+          )
+
           with open("BUILD.bazel", "w") as f:
               f.write(content)
-          print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS")
+          print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS and forced deps for all microkernels")
           PYEOF
 
           echo "=== Modified MICROKERNEL_DEPS ==="
@@ -259,6 +270,7 @@ jobs:
           echo "=== xnnpack_if_kleidiai_enabled call ==="
           grep 'xnnpack_if_kleidiai_enabled' BUILD.bazel
 
+      # ---------- Inject overrides（保留，与 .bazelrc 双重覆盖） ----------
       - name: Inject overrides into build script
         run: |
           sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack --override_repository=KleidiAI=\/tmp\/kleidiai_repo /g' ci/build_android_package.sh
