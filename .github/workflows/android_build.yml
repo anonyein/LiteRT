@@ -117,16 +117,10 @@ jobs:
           cd /tmp/xnnpack/third_party/kleidiai
           cat > BUILD.bazel << 'BAZEL_EOF'
           package(default_visibility = ["//visibility:public"])
-
           cc_library(
               name = "kai",
-              srcs = glob([
-                  "src/kai/**/*.c",
-                  "src/kai/**/*.S",
-              ]),
-              hdrs = glob([
-                  "src/kai/**/*.h",
-              ]),
+              srcs = glob(["src/kai/**/*.c", "src/kai/**/*.S"]),
+              hdrs = glob(["src/kai/**/*.h"]),
               includes = ["src"],
               alwayslink = 1,
               copts = [
@@ -144,35 +138,40 @@ jobs:
           cat BUILD.bazel
 
       # ---------- 条件添加 Kai 依赖（安全追加，并打印结果） ----------
-      - name: Add KleidiAI conditionally to MICROKERNEL_DEPS
+      - name: Ensure Kai library is linked into xnnpack
         run: |
           cd /tmp/xnnpack
-          BUILD_FILE="BUILD.bazel"
-          cp "$BUILD_FILE" "$BUILD_FILE.bak"
-
+          # 强制将 Kai 作为 xnnpack 的依赖，通过修改 BUILD.bazel 中 xnnpack 目标的 deps
           python3 << 'PYEOF'
           import re
 
           with open("BUILD.bazel", "r") as f:
               content = f.read()
 
-          # 在原 MICROKERNEL_DEPS 列表的 ] 后追加 + select(...)
-          pattern = r'(MICROKERNEL_DEPS\s*=\s*\[.*?\])(\s*\n)'
-          replacement = r'\1 + select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai"],\n        "//conditions:default": [],\n    })\2'
+          # 找到 xnnpack 目标并插入依赖
+          # 匹配 cc_library(name = "xnnpack"
+          pattern = r'(cc_library\s*\([^)]*name\s*=\s*"xnnpack"[^)]*deps\s*=\s*\[)(.*?)(\])'
+          replacement = r'\1\2,\n        "//third_party/kleidiai:kai",\n    ] + select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai"],\n        "//conditions:default": [],\n    })'
           new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
-
           if count == 0:
-              print("❌ Could not find MICROKERNEL_DEPS block")
-              exit(1)
-
+              # 如果没有 deps，则添加 deps
+              pattern2 = r'(cc_library\s*\([^)]*name\s*=\s*"xnnpack"[^)]*\))'
+              def add_deps(match):
+                  block = match.group(1)
+                  if 'deps' not in block:
+                      block = block.rstrip(')') + '\n    deps = select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai"],\n        "//conditions:default": [],\n    })\n)'
+                  return block
+              new_content, count2 = re.subn(pattern2, add_deps, content, flags=re.DOTALL)
+              if count2 == 0:
+                  print("❌ Could not modify xnnpack target")
+                  exit(1)
           with open("BUILD.bazel", "w") as f:
               f.write(new_content)
-          print("✅ MICROKERNEL_DEPS modified with conditional Kai dependency")
+          print("✅ xnnpack deps modified to include Kai")
           PYEOF
 
-          # 🔽 打印修改后的区域，方便验证
-          echo "=== Modified MICROKERNEL_DEPS area ==="
-          grep -A 20 "MICROKERNEL_DEPS" "$BUILD_FILE" | head -25
+          echo "=== Modified xnnpack deps ==="
+          grep -A 40 'name = "xnnpack"' BUILD.bazel | head -50
 
       # ---------- 注入 XNNPACK 仓库覆盖 ----------
       - name: Inject XNNPACK override into build script
