@@ -150,19 +150,27 @@ jobs:
           with open("BUILD.bazel", "r") as f:
               content = f.read()
 
-          # 定位 MICROKERNEL_DEPS 列表的结束括号 ]
-          # 匹配 MICROKERNEL_DEPS = [ ... ] 整个块
-          pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\]\s*\n)'
+          # 匹配 MICROKERNEL_DEPS = [ ... ] 整个块，捕获 ] 及之后的换行
+          pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])(\s*\n)'
           match = re.search(pattern, content, flags=re.DOTALL)
           if not match:
               print("❌ Could not find MICROKERNEL_DEPS definition")
               exit(1)
 
-          # 在 ] 之前插入 + select(...)
-          # 注意保持原有缩进和逗号
-          old_list = match.group(2)
-          new_list = old_list.rstrip() + '\n] + select({\n    "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n    "//conditions:default": [],\n})'
-          new_content = content[:match.start(2)] + new_list + content[match.end(3):]
+          # 构建新的列表结尾：将 ] 替换为 ] + select(...)，保留其后的换行
+          select_clause = (
+              '] + select({\n' +
+              '        "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n' +
+              '        "//conditions:default": [],\n' +
+              '    })'
+          )
+          # 拼接：MICROKERNEL_DEPS = [ + 原列表内容 + 新结尾 + 原换行及后续内容
+          new_content = (
+              content[:match.start(3)] +
+              select_clause +
+              match.group(4) +   # 原 ] 后面的换行
+              content[match.end(4):]
+          )
 
           with open("BUILD.bazel", "w") as f:
               f.write(new_content)
@@ -170,7 +178,7 @@ jobs:
           PYEOF
 
           echo "=== Modified MICROKERNEL_DEPS area ==="
-          grep -A 25 'MICROKERNEL_DEPS' BUILD.bazel | head -30
+          grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
 
       - name: Inject XNNPACK override into build script
         run: |
