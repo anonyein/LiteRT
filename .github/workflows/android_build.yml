@@ -159,6 +159,7 @@ jobs:
       - name: Patch XNNPACK BUILD – add common to MICROKERNEL_DEPS and matmul to xnnpack_if_kleidiai_enabled
         run: |
           cd /tmp/xnnpack
+          # 1. 添加 @KleidiAI//:common 到 MICROKERNEL_DEPS
           python3 << 'PYEOF'
           import re
 
@@ -171,41 +172,24 @@ jobs:
           if not m:
               print("❌ MICROKERNEL_DEPS not found")
               exit(1)
-
           inner = m.group(2)
           if not inner.rstrip().endswith(','):
               inner = inner.rstrip() + ','
           new_inner = inner + '\n    "@KleidiAI//:common",'
           content = content[:m.start(2)] + new_inner + content[m.end(2):]
-          print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS")
-
-          # 2. 修改 xnnpack_if_kleidiai_enabled 的参数，添加 matmul 目标
-          #    原内容: xnnpack_if_kleidiai_enabled(["@KleidiAI//:common"])
-          #    替换为: xnnpack_if_kleidiai_enabled(["@KleidiAI//:common", "@KleidiAI//kai/ukernels/matmul"])
-          old_call = 'xnnpack_if_kleidiai_enabled(["@KleidiAI//:common"])'
-          new_call = 'xnnpack_if_kleidiai_enabled(["@KleidiAI//:common", "@KleidiAI//kai/ukernels/matmul"])'
-          if old_call in content:
-              content = content.replace(old_call, new_call)
-              print("✅ Updated xnnpack_if_kleidiai_enabled with matmul")
-          else:
-              # 如果格式不完全一致，尝试更宽松的替换
-              # 匹配 xnnpack_if_kleidiai_enabled([... "@KleidiAI//:common" ...])
-              pattern = r'(xnnpack_if_kleidiai_enabled\(\[)"@KleidiAI//:common"(\]\))'
-              replacement = r'\1"@KleidiAI//:common", "@KleidiAI//kai/ukernels/matmul"\2'
-              new_content, count = re.subn(pattern, replacement, content)
-              if count == 0:
-                  print("❌ Could not find xnnpack_if_kleidiai_enabled with @KleidiAI//:common")
-                  exit(1)
-              content = new_content
-              print("✅ Updated xnnpack_if_kleidiai_enabled (relaxed)")
 
           with open("BUILD.bazel", "w") as f:
               f.write(content)
+          print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS")
           PYEOF
+
+          # 2. 在 xnnpack_if_kleidiai_enabled 参数中添加 matmul 目标
+          sed -i 's|"@KleidiAI//:common"|"@KleidiAI//:common", "@KleidiAI//kai/ukernels/matmul"|g' BUILD.bazel
+          echo "✅ Updated xnnpack_if_kleidiai_enabled"
 
           echo "=== Modified MICROKERNEL_DEPS ==="
           grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
-          echo "=== Modified xnnpack_if_kleidiai_enabled ==="
+          echo "=== xnnpack_if_kleidiai_enabled call ==="
           grep 'xnnpack_if_kleidiai_enabled' BUILD.bazel
 
       - name: Inject overrides into build script
