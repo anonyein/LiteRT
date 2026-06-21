@@ -88,16 +88,15 @@ jobs:
           fi
 
       # 将整理好的 KleidiAI 拷贝到工作目录，稍后将作为 @KleidiAI 仓库
-      - name: Install KleidiAI into XNNPACK third_party
+      - name: Prepare @KleidiAI repository
         run: |
-          mkdir -p /tmp/xnnpack/third_party
-          rm -rf /tmp/xnnpack/third_party/kleidiai
-          cp -r /tmp/kleidiai /tmp/xnnpack/third_party/kleidiai
-          echo "KleidiAI installed at /tmp/xnnpack/third_party/kleidiai"
+          rm -rf /tmp/kleidiai_repo
+          cp -r /tmp/kleidiai /tmp/kleidiai_repo
+          mkdir -p /tmp/kleidiai_repo/kai/ukernels/matmul
 
       - name: Verify qsi4cxp sources exist
         run: |
-          cd /tmp/xnnpack/third_party/kleidiai/src/kai
+          cd /tmp/kleidiai_repo/src/kai
           echo "=== Searching for qsi4cxp files ==="
           find . -type f \( -name '*qsi4cxp*.c' -o -name '*qsi4cxp*.S' \) | tee /tmp/qsi4cxp_files.txt
           if [ ! -s /tmp/qsi4cxp_files.txt ]; then
@@ -111,11 +110,16 @@ jobs:
           fi
 
       # 创建符合 XNNPACK 期望的 @KleidiAI 仓库的 BUILD 文件
-      - name: Create BUILD.bazel for third_party/kleidiai
+      - name: Create BUILD files for @KleidiAI
         run: |
-          cd /tmp/xnnpack/third_party/kleidiai
-          cat > BUILD.bazel << 'BAZEL_EOF'
+          REPO=/tmp/kleidiai_repo
+          cat > $REPO/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
+          cc_library(
+              name = "common",
+              hdrs = glob(["src/kai/**/*.h"]),
+              includes = ["src"],
+          )
           cc_library(
               name = "kai_matmul",
               srcs = glob([
@@ -134,87 +138,58 @@ jobs:
                   "-fno-tree-vectorize",
                   "-Wa,-march=armv8-a+sme2",
               ],
+              deps = [":common"],
           )
-          BAZEL_EOF
-          echo "=== Generated BUILD.bazel ==="
-          cat BUILD.bazel
+          EOF
 
-      - name: Patch XNNPACK BUILD to link Kai into XNNPACK target
+          cat > $REPO/kai/ukernels/matmul/BUILD.bazel << 'EOF'
+          package(default_visibility = ["//visibility:public"])
+          cc_library(
+              name = "matmul",
+              deps = ["//:kai_matmul"],
+              alwayslink = 1,
+          )
+          EOF
+
+          echo "=== @KleidiAI root BUILD ==="
+          cat $REPO/BUILD.bazel
+          echo "=== @KleidiAI matmul BUILD ==="
+          cat $REPO/kai/ukernels/matmul/BUILD.bazel
+
+      - name: Patch XNNPACK BUILD only at MICROKERNEL_DEPS
         run: |
           cd /tmp/xnnpack
           python3 << 'PYEOF'
-          import re, bisect
+          import re
 
           with open("BUILD.bazel", "r") as f:
               content = f.read()
 
-          # ---------- 1. 修改 MICROKERNEL_DEPS ----------
-          deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
-          deps_match = re.search(deps_pattern, content, flags=re.DOTALL)
-          if not deps_match:
-              print("❌ Could not find MICROKERNEL_DEPS")
+          # 在 MICROKERNEL_DEPS 末尾添加 @KleidiAI//:common 以提供头文件
+          pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
+          m = re.search(pattern, content, flags=re.DOTALL)
+          if not m:
+              print("❌ MICROKERNEL_DEPS not found")
               exit(1)
 
-          existing = deps_match.group(2)
-          if not existing.rstrip().endswith(','):
-              existing = existing.rstrip() + ','
-          new_deps = existing + '\n    "//third_party/kleidiai:kai_matmul",'
-          content = content[:deps_match.start(2)] + new_deps + content[deps_match.end(2):]
-          print("✅ Added kai_matmul to MICROKERNEL_DEPS")
-
-          # ---------- 2. 修改 XNNPACK 目标的 deps ----------
-          # 定位关键字行: "xnnpack_if_kleidiai_enabled(["
-          keyword = "xnnpack_if_kleidiai_enabled(["
-          idx = content.find(keyword)
-          if idx == -1:
-              print("❌ Could not find xnnpack_if_kleidiai_enabled in XNNPACK deps")
-              exit(1)
-
-          # 从该关键字位置开始，向后找到对应的闭合括号 ')'
-          # 该 ') ' 前面可能是 "    ])" 或 "    ])\n" 等
-          # 简单方法：从关键字后开始逐字符扫描，记录括号深度
-          # 关键字自身带有一个 '(', 我们找到该 '(' 的位置
-          paren_idx = content.find('(', idx)
-          if paren_idx == -1:
-              print("❌ Could not find opening parenthesis after keyword")
-              exit(1)
-
-          depth = 1
-          i = paren_idx + 1
-          while i < len(content) and depth > 0:
-              if content[i] == '(':
-                  depth += 1
-              elif content[i] == ')':
-                  depth -= 1
-              i += 1
-
-          if depth != 0:
-              print("❌ Unbalanced parentheses in XNNPACK deps")
-              exit(1)
-
-          closing_paren_idx = i - 1  # 这是 xnnpack_if_kleidiai_enabled( ... ) 的 ')'
-
-          # 在 closing_paren_idx 前面插入我们的 select 分支
-          insert = ' +\n    select({\n        "//build_config:aarch64": ["//third_party/kleidiai:kai_matmul"],\n        "//conditions:default": [],\n    })'
-          # 注意：插入位置是 closing_paren_idx 之前，保持原有 ')' 不变
-          new_content = content[:closing_paren_idx] + insert + content[closing_paren_idx:]
-          print("✅ Added kai_matmul select to XNNPACK deps")
+          inner = m.group(2)
+          if not inner.rstrip().endswith(','):
+              inner = inner.rstrip() + ','
+          new_inner = inner + '\n    "@KleidiAI//:common",'
+          content = content[:m.start(2)] + new_inner + content[m.end(2):]
 
           with open("BUILD.bazel", "w") as f:
-              f.write(new_content)
+              f.write(content)
+          print("✅ Added @KleidiAI//:common to MICROKERNEL_DEPS")
           PYEOF
 
-          echo "=== Modified MICROKERNEL_DEPS area ==="
+          echo "=== Modified MICROKERNEL_DEPS ==="
           grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
-          echo "=== Modified XNNPACK deps area ==="
-          grep -A 15 'name = "XNNPACK"' BUILD.bazel | head -20
-          
-      # 注意：我们不再修改 XNNPACK 的 BUILD.bazel，保持其原样
-      - name: Inject XNNPACK override into build script
+
+      - name: Inject overrides into build script
         run: |
-          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack /g' ci/build_android_package.sh
-          echo "✅ Injected XNNPACK override"
-          echo "=== Patched build commands (first 5) ==="
+          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack --override_repository=KleidiAI=\/tmp\/kleidiai_repo /g' ci/build_android_package.sh
+          echo "✅ Injected XNNPACK and KleidiAI overrides"
           grep -n 'bazel build' ci/build_android_package.sh | head -5
 
       # ---------- 以下所有步骤完全不变 ----------
@@ -258,6 +233,11 @@ jobs:
         run: |
           echo "build --features=-layering_check" >> .bazelrc
           echo "build:monolithic --features=-layering_check" >> .bazelrc
+
+      - name: Enable KleidiAI for arm64
+        run: |
+          echo "build:android_arm64 --define=xnn_enable_kleidiai=true" >> .bazelrc
+          echo "✅ Enabled KleidiAI for arm64"
 
       - name: Verify Android paths
         run: |
@@ -455,6 +435,7 @@ jobs:
           bazel build \
             --config=android_arm64 \
             --override_repository=XNNPACK=/tmp/xnnpack \
+            --override_repository=KleidiAI=/tmp/kleidiai_repo \
             @XNNPACK//:XNNPACK \
             || { echo "Prebuild failed"; exit 1; }
 
