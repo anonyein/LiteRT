@@ -87,27 +87,31 @@ jobs:
             exit 1
           fi
 
-      # ---------- 准备 @KleidiAI 仓库（关键修正） ----------
+      # ---------- 准备 @KleidiAI 仓库（关键修正：新增 .h 复制） ----------
       - name: Prepare @KleidiAI repository
         run: |
           rm -rf /tmp/kleidiai_repo
           cp -r /tmp/kleidiai /tmp/kleidiai_repo
           # 将源文件复制到 kai/ukernels/matmul 包内，使其能被 filegroup 匹配
           mkdir -p /tmp/kleidiai_repo/kai/ukernels/matmul
-          cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/*.c /tmp/kleidiai_repo/kai/ukernels/matmul/ || true
-          cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/*.S /tmp/kleidiai_repo/kai/ukernels/matmul/ || true
+          cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/*.c /tmp/kleidiai_repo/kai/ukernels/matmul/ 2>/dev/null || true
+          cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/*.S /tmp/kleidiai_repo/kai/ukernels/matmul/ 2>/dev/null || true
+          cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/*.h /tmp/kleidiai_repo/kai/ukernels/matmul/ 2>/dev/null || true   # <-- 新增复制 .h
+
           # 同时复制 pack 子目录下的文件（如果需要）
           if [ -d /tmp/kleidiai_repo/src/kai/ukernels/matmul/pack ]; then
             mkdir -p /tmp/kleidiai_repo/kai/ukernels/matmul/pack
-            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/pack/*.c /tmp/kleidiai_repo/kai/ukernels/matmul/pack/ || true
-            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/pack/*.S /tmp/kleidiai_repo/kai/ukernels/matmul/pack/ || true
+            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/pack/*.c /tmp/kleidiai_repo/kai/ukernels/matmul/pack/ 2>/dev/null || true
+            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/pack/*.S /tmp/kleidiai_repo/kai/ukernels/matmul/pack/ 2>/dev/null || true
+            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/pack/*.h /tmp/kleidiai_repo/kai/ukernels/matmul/pack/ 2>/dev/null || true   # <-- 新增复制 .h
           fi
           # 子目录 imatmul_clamp_*, matmul_clamp_* 等（如果有多个子目录，也可类似处理，或统一用 glob）
           for subdir in $(find /tmp/kleidiai_repo/src/kai/ukernels/matmul -mindepth 1 -maxdepth 1 -type d); do
             subname=$(basename "$subdir")
             mkdir -p "/tmp/kleidiai_repo/kai/ukernels/matmul/$subname"
-            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/$subname/*.c /tmp/kleidiai_repo/kai/ukernels/matmul/$subname/ 2>/dev/null || true
-            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/$subname/*.S /tmp/kleidiai_repo/kai/ukernels/matmul/$subname/ 2>/dev/null || true
+            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/$subname/*.c "/tmp/kleidiai_repo/kai/ukernels/matmul/$subname/" 2>/dev/null || true
+            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/$subname/*.S "/tmp/kleidiai_repo/kai/ukernels/matmul/$subname/" 2>/dev/null || true
+            cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/$subname/*.h "/tmp/kleidiai_repo/kai/ukernels/matmul/$subname/" 2>/dev/null || true   # <-- 新增复制 .h
           done
 
           echo "=== KleidiAI repo tree after copy ==="
