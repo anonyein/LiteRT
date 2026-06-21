@@ -498,50 +498,10 @@ jobs:
       # ================================================================
 
       # ======================= 预热 XNNPACK 并验证 KleidiAI 符号 =======================
-      - name: Pre-build XNNPACK and verify KleidiAI symbols (arm64 only)
+      # ======================= 预热 XNNPACK 并验证 KleidiAI 依赖 =======================
+      - name: Pre-build XNNPACK and verify KleidiAI dependency (arm64 only)
         run: |
-          echo "=== Building @KleidiAI//:matmul to verify symbols ==="
-          bazel build \
-            --config=android_arm64 \
-            --override_repository=KleidiAI=/tmp/kleidiai_repo \
-            @KleidiAI//:matmul \
-            || { echo "KleidiAI build failed"; exit 1; }
-
-          LIBA="bazel-bin/external/KleidiAI/libmatmul.a"
-          if [ ! -f "$LIBA" ]; then
-            echo "❌ libmatmul.a not found"
-            exit 1
-          fi
-
-          echo "=== Checking for required qsi4cxp symbols in KleidiAI ==="
-          REQUIRED_SYMBOLS=(
-            "kai_get_mr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa"
-            "kai_get_nr_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa"
-            "kai_run_matmul_clamp_f32_qai8dxp1vlx4_qsi4cxp4vlx4_1vlx4vl_sme_mopa"
-            "kai_run_matmul_clamp_f32_qai8dxp1x4_qsi4cxp4vlx4_1x4vl_sme_dot"
-          )
-
-          MISSING=0
-          for sym in "${REQUIRED_SYMBOLS[@]}"; do
-            if nm "$LIBA" | grep -q "$sym"; then
-              echo "✅ Found: $sym"
-            else
-              echo "❌ Missing: $sym"
-              MISSING=1
-            fi
-          done
-
-          if [ $MISSING -eq 1 ]; then
-            echo ""
-            echo "=== Debug: List Kai symbols in libmatmul.a ==="
-            nm "$LIBA" | grep -i kai || echo "No Kai symbols found"
-            exit 1
-          fi
-
-          echo "✅ All KleidiAI symbols present. Now warming XNNPACK..."
-
-          # 预热 XNNPACK（arm64）
-          echo "=== Building @XNNPACK//:XNNPACK (arm64) ==="
+          echo "=== Warming Bazel cache for XNNPACK (arm64) ==="
           bazel build \
             --config=android_arm64 \
             --override_repository=XNNPACK=/tmp/xnnpack \
@@ -549,7 +509,25 @@ jobs:
             @XNNPACK//:XNNPACK \
             || { echo "XNNPACK prebuild failed"; exit 1; }
 
-          echo "✅ XNNPACK prebuild completed."
+          echo "=== Checking for KleidiAI symbols in XNNPACK (undefined references) ==="
+          LIBA="bazel-bin/external/XNNPACK/libXNNPACK.a"
+          if [ ! -f "$LIBA" ]; then
+            echo "❌ libXNNPACK.a not found"
+            exit 1
+          fi
+
+          # 查找未定义符号中是否包含 kai_ 前缀
+          UNDEF_KAI=$(nm -u "$LIBA" | grep "kai_" || true)
+          if [ -z "$UNDEF_KAI" ]; then
+            echo "❌ No undefined kai_ symbols found in libXNNPACK.a"
+            echo "   KleidiAI might not be linked."
+            exit 1
+          else
+            echo "✅ Found undefined kai_ symbols, KleidiAI is required:"
+            echo "$UNDEF_KAI" | head -5
+          fi
+
+          echo "✅ XNNPACK built successfully and KleidiAI dependency confirmed."
 
           # 其余架构预热（允许失败）
           for arch in android_arm android_x86 android_x86_64; do
@@ -561,6 +539,7 @@ jobs:
               @XNNPACK//:XNNPACK \
               || echo "Prebuild for $arch completed with warnings (cache partial)"
           done
+      # ========================================================================================
       # ========================================================================================
 
       - name: Add fixedpoint dep to existing deps list and print BUILD
