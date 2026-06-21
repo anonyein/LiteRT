@@ -132,7 +132,7 @@ jobs:
             cat /tmp/qsi4cxp_files.txt
           fi
 
-      # ---------- 创建 BUILD 文件（关键修改：matmul 添加 hdrs 声明） ----------
+      # ---------- 创建 BUILD 文件（唯一修改：common 使用 select 按架构区分） ----------
       - name: Create BUILD files for @KleidiAI
         run: |
           REPO=/tmp/kleidiai_repo
@@ -143,22 +143,30 @@ jobs:
           cc_library(
               name = "common",
               hdrs = glob(["src/kai/**/*.h"]),
-              srcs = [
-                  "src/kai/kai_common_sme_asm.S",
-                  "src/kai/kai_common_sve_asm.S",
-              ],
+              # 仅在 ARM64 架构时包含汇编源文件，其他架构为空，避免编译错误
+              srcs = select({
+                  "@platforms//cpu:aarch64": [
+                      "src/kai/kai_common_sme_asm.S",
+                      "src/kai/kai_common_sve_asm.S",
+                  ],
+                  "//conditions:default": [],
+              }),
               includes = ["src"],
               alwayslink = 1,
-              copts = [
-                  "-Xclang", "-target-feature", "-Xclang", "+fp16",
-                  "-Xclang", "-target-feature", "-Xclang", "+dotprod",
-                  "-Xclang", "-target-feature", "-Xclang", "+i8mm",
-                  "-Xclang", "-target-feature", "-Xclang", "+sme2",
-                  "-Xclang", "-target-feature", "-Xclang", "+sve2",
-                  "-Xclang", "-target-feature", "-Xclang", "+sme",
-                  "-Xclang", "-target-feature", "-Xclang", "+bf16",
-                  "-Wa,-march=armv8-a+sme2+fp16+dotprod",
-              ],
+              # 仅 ARM64 架构使用 ARM 专用编译选项
+              copts = select({
+                  "@platforms//cpu:aarch64": [
+                      "-Xclang", "-target-feature", "-Xclang", "+fp16",
+                      "-Xclang", "-target-feature", "-Xclang", "+dotprod",
+                      "-Xclang", "-target-feature", "-Xclang", "+i8mm",
+                      "-Xclang", "-target-feature", "-Xclang", "+sme2",
+                      "-Xclang", "-target-feature", "-Xclang", "+sve2",
+                      "-Xclang", "-target-feature", "-Xclang", "+sme",
+                      "-Xclang", "-target-feature", "-Xclang", "+bf16",
+                      "-Wa,-march=armv8-a+sme2+fp16+dotprod",
+                  ],
+                  "//conditions:default": [],
+              }),
           )
 
           cc_library(
