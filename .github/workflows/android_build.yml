@@ -623,11 +623,87 @@ jobs:
       - name: Run build_android_package.sh
         run: |
           OUTPUT_BASE=$(bazel info output_base)
-          # 强制用修补后的 BUILD 覆盖缓存（如果存在）
-          if [ -d "${OUTPUT_BASE}/external/XNNPACK" ]; then
-            cp -f /tmp/xnnpack/BUILD.bazel "${OUTPUT_BASE}/external/XNNPACK/BUILD.bazel" 2>/dev/null || true
-            echo "✅ Ensured cached XNNPACK BUILD is the patched version"
+          CACHED_BUILD="${OUTPUT_BASE}/external/XNNPACK/BUILD.bazel"
+
+          # 1. 确保缓存目录存在，并覆盖为修补后的 BUILD
+          if [ -f "$CACHED_BUILD" ]; then
+            cp -f /tmp/xnnpack/BUILD.bazel "$CACHED_BUILD" 2>/dev/null || true
+            echo "✅ Overwrote cached XNNPACK BUILD"
+          else
+            echo "⚠️ Cached BUILD not found, relying on override_repository"
           fi
+
+          # 2. 强制给所有 _prod_microkernels 目标注入 common 和 matmul
+          python3 << 'PYEOF'
+          import re
+
+          with open("${CACHED_BUILD}", "r") as f:
+              content = f.read()
+
+          # 2a. 更新 MICROKERNEL_DEPS（双保险）
+          deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
+          m = re.search(deps_pattern, content, flags=re.DOTALL)
+          if m:
+              inner = m.group(2).rstrip()
+              if not inner.endswith(','):
+                  inner += ','
+              for dep in ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']:
+                  if dep not in inner:
+                      inner += f'\n    {dep},'
+              content = content[:m.start(2)] + inner + content[m.end(2):]
+
+          # 2b. 查找所有 _prod_microkernels 目标，确保其 deps 包含 common 和 matmul
+          def inject_into_microkernel(match):
+              rule = match.group(0)
+              needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
+              if all(d in rule for d in needed):
+                  return rule
+              deps_match = re.search(r'(deps\s*=\s*\[)(.*?)(\])', rule, flags=re.DOTALL)
+              if deps_match:
+                  inner = deps_match.group(2).rstrip()
+                  if inner and not inner.endswith(','):
+                      inner += ','
+                  for d in needed:
+                      if d not in inner:
+                          inner += f'\n        {d},'
+                  rule = rule[:deps_match.start(2)] + inner + rule[deps_match.end(2):]
+              else:
+                  # 没有 deps，添加
+                  deps_str = '\n    deps = [' + ', '.join(needed) + '],'
+                  rule = rule.rstrip().rstrip(')') + deps_str + '\n)'
+              return rule
+
+          pattern = r'(cc_library\s*\(.*?name\s*=\s*"[^"]*_prod_microkernels".*?\)\n\})'
+          content = re.sub(pattern, inject_into_microkernel, content, flags=re.DOTALL)
+
+          # 2c. 修补 packing 和 pack_lh 的 xnnpack_if_kleidiai_enabled 列表
+          def add_matmul_to_kleidiai(m):
+              inner = m.group(2)
+              needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
+              for d in needed:
+                  if d not in inner:
+                      if inner.rstrip() and not inner.rstrip().endswith(','):
+                          inner = inner.rstrip() + ','
+                      inner += d
+              return m.group(1) + inner + m.group(3)
+
+          pattern2 = r'(xnnpack_if_kleidiai_enabled\s*\(\s*\[)([^\]]*?)(\])'
+          content = re.sub(pattern2, add_matmul_to_kleidiai, content, flags=re.DOTALL)
+
+          with open("${CACHED_BUILD}", "w") as f:
+              f.write(content)
+          print("✅ Injected common/matmul into all relevant targets in cached BUILD")
+          PYEOF
+
+          # 3. 验证
+          if grep -q '@KleidiAI//:matmul' "$CACHED_BUILD"; then
+            echo "✅ matmul dependency present in cached BUILD"
+          else
+            echo "❌ Failed to inject matmul dependency"
+            exit 1
+          fi
+
+          # 4. 执行最终打包
           chmod +x ./ci/build_android_package.sh
           echo "=== Final build commands (first 5) ==="
           grep -n 'bazel build' ci/build_android_package.sh | head -5
