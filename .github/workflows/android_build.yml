@@ -24,7 +24,8 @@ jobs:
       BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL"
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
-      # BUILD_LITERT_KOTLIN_API: "true"   # 如需 Kotlin API
+      # 因为 android_arm64 可能被覆盖，我们把它需要的标志存为环境变量，后面直接使用
+      ARM64_BAZEL_FLAGS: "--config=android --cpu=arm64-v8a --fat_apk_cpu=arm64-v8a --platforms=@org_tensorflow//tensorflow/tools/toolchains/android:arm64-v8a --define=xnn_enable_kleidiai=true"
 
     steps:
       - name: Checkout repository
@@ -237,12 +238,12 @@ jobs:
           echo "build:monolithic --features=-layering_check" >> .bazelrc
 
       # ======================= XNNPACK 专用配置 ======================= #
-      # 仅 ARM64 启用 KleidiAI，x86 显式禁用，杜绝任何误判
+      # 仍写入 .bazelrc，但也存入环境变量以备后用
       - name: Enable KleidiAI for arm64 (and disable for x86)
         run: |
           echo "build:android_arm64 --define=xnn_enable_kleidiai=true"   >> .bazelrc
-          echo "build:android_x86   --define=xnn_enable_kleidiai=false"  >> .bazelrc  # <-- XNNPACK 修改
-          echo "build:android_x86_64 --define=xnn_enable_kleidiai=false" >> .bazelrc  # <-- XNNPACK 修改
+          echo "build:android_x86   --define=xnn_enable_kleidiai=false"  >> .bazelrc
+          echo "build:android_x86_64 --define=xnn_enable_kleidiai=false" >> .bazelrc
           echo "✅ KleidiAI: arm64=true, x86/x86_64=false"
       # =============================================================== #
 
@@ -270,6 +271,12 @@ jobs:
           ANDROID_API_LEVEL: ${{ env.ANDROID_API_LEVEL }}
           TF_NEED_ANDROID: 1
           TF_SET_ANDROID_WORKSPACE: 1
+
+      # 打印当前的 .bazelrc 以便调试
+      - name: Dump .bazelrc after configure
+        run: |
+          echo "=== Current .bazelrc ==="
+          cat .bazelrc
 
       - name: Show api_level before fix
         run: |
@@ -436,12 +443,12 @@ jobs:
           grep -n 'with_xla_support' .bazelrc || echo "No with_xla_support lines found"
       # ================================================================
 
-      # ============================== 新增：验证 KleidiAI 依赖链接 ==============================
-      - name: Verify KleidiAI dependency linkage (query only)
+      # ============== 验证 KleidiAI 依赖链接（使用显式标志） ==============
+      - name: Verify KleidiAI dependency linkage
         run: |
           echo "=== Checking if @XNNPACK//:XNNPACK depends on @KleidiAI//kai/ukernels/matmul:matmul ==="
           bazel query 'deps(@XNNPACK//:XNNPACK)' \
-            --config=android_arm64 \
+            $ARM64_BAZEL_FLAGS \
             --override_repository=XNNPACK=/tmp/xnnpack \
             --override_repository=KleidiAI=/tmp/kleidiai_repo \
             | grep -i kleidi || echo "⚠️ No KleidiAI dependency found in deps"
@@ -449,7 +456,7 @@ jobs:
           echo ""
           echo "=== Checking path to matmul ==="
           bazel query 'somepath(@XNNPACK//:XNNPACK, @KleidiAI//kai/ukernels/matmul:matmul)' \
-            --config=android_arm64 \
+            $ARM64_BAZEL_FLAGS \
             --override_repository=XNNPACK=/tmp/xnnpack \
             --override_repository=KleidiAI=/tmp/kleidiai_repo \
             && echo "✅ matmul IS reachable from XNNPACK" \
@@ -461,7 +468,7 @@ jobs:
         run: |
           echo "=== Warming Bazel cache for XNNPACK (arm64 + symbols check) ==="
           bazel build \
-            --config=android_arm64 \
+            $ARM64_BAZEL_FLAGS \
             --override_repository=XNNPACK=/tmp/xnnpack \
             --override_repository=KleidiAI=/tmp/kleidiai_repo \
             @XNNPACK//:XNNPACK \
