@@ -720,7 +720,8 @@ jobs:
           file = "tflite/java/BUILD"
           with open(file, "r") as f:
               content = f.read()
-          pattern = r'(name\s*=\s*"libtensorflowlite_jni\.so".*?deps\s*=\s*\[)([^\]]*?)(\])'
+          # 用 \b 确保只匹配 deps 而不匹配 tflite_deps
+          pattern = r'(name\s*=\s*"libtensorflowlite_jni\.so".*?\bdeps\s*=\s*\[)([^\]]*?)(\])'
           def add_deps(m):
               inner = m.group(2).strip()
               needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
@@ -739,7 +740,7 @@ jobs:
           print("✅ Added KleidiAI deps to libtensorflowlite_jni.so")
           PYEOF
           echo "=== Verify ==="
-          grep -A 25 'name = "libtensorflowlite_jni.so"' "$JNI_BUILD" | head -30
+          grep -A 30 'name = "libtensorflowlite_jni.so"' "$JNI_BUILD" | head -35
 
       - name: Run build_android_package.sh
         run: |
