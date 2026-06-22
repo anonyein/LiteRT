@@ -219,20 +219,12 @@ jobs:
           p = Path('BUILD.bazel')
           s = p.read_text()
       
+          # 需要添加的依赖
+          deps_needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
+      
           # 辅助函数：向指定名称的 cc_library 目标注入 deps（若不存在则添加）
           def inject_deps_to_target(content, target_name, deps_list):
-              # 找到 cc_library 规则中 name = "target_name" 的部分
-              # 注意：匹配可能跨多行，且规则可能包含其他属性
-              pattern = r'(cc_library\s*\([^)]*?name\s*=\s*"' + re.escape(target_name) + r'"\s*[,)][^)]*?\))'
-              # 使用更健壮的方式：先找到目标名所在位置，再向前/向后匹配
-              # 简单起见，用正则查找整个块（假设规则中 name 附近有合适的括号）
-              # 但为了避免嵌套问题，我们查找以 "cc_library(" 开头，直到匹配的 ")"（可嵌套）
-              # 这里采用更简单的方法：寻找 name = "X" 并用正则提取整个块（假设括号平衡）
-              # 由于 XNNPACK 的 BUILD 文件结构清晰，我们可以用以下方法：
-              # 分割出每个 cc_library 块，然后处理包含目标名的块
-              blocks = re.split(r'(cc_library\s*\()', content)
-              # 但更简单的是直接替换 deps 列表，我们可以在原文本中修改
-              # 本脚本采用 Copilot 提供的策略：先定位目标开始的索引，再修改 deps
+              # 查找 name = "target_name" 的位置
               start = content.find(f'name = "{target_name}"')
               if start == -1:
                   return content, False
@@ -240,8 +232,7 @@ jobs:
               lib_start = content.rfind('cc_library(', 0, start)
               if lib_start == -1:
                   return content, False
-              # 找到匹配的右括号（简易方法，假设括号平衡）
-              # 从 lib_start 开始数括号
+              # 找到匹配的右括号
               depth = 0
               end = lib_start
               while end < len(content):
@@ -271,8 +262,7 @@ jobs:
                   new_inner = inner
                   new_rule = rule_block[:deps_re.start(2)] + new_inner + rule_block[deps_re.end(2):]
               else:
-                  # 插入新的 deps 块，放在属性列表末尾，闭合括号前
-                  # 找最后一个 ')' 前的位置
+                  # 插入新的 deps 块
                   last_paren = new_rule.rfind(')')
                   if last_paren == -1:
                       return content, False
@@ -281,9 +271,6 @@ jobs:
               # 替换原块
               content = content[:lib_start] + new_rule + content[end+1:]
               return content, True
-      
-          # 需要添加的依赖
-          deps_needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
       
           # 1. 更新 MICROKERNEL_DEPS
           deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
@@ -298,7 +285,7 @@ jobs:
               s = s[:m.start(2)] + inner + s[m.end(2):]
               print("✅ Updated MICROKERNEL_DEPS")
       
-          # 2. 在 xnnpack_if_kleidiai_enabled 块中添加依赖（先前的做法，保留）
+          # 2. 在 xnnpack_if_kleidiai_enabled 块中添加依赖（保留原逻辑）
           pattern2 = r'(xnnpack_if_kleidiai_enabled\s*\(\s*\[)([^\]]*?)(\])'
           def add_deps(m):
               inner_list = m.group(2)
@@ -312,9 +299,15 @@ jobs:
               return m.group(1) + inner_list + m.group(3)
           s = re.sub(pattern2, add_deps, s, flags=re.DOTALL)
       
-          # 3. 显式向 packing、pack_lh 和 XNNPACK 目标注入 deps
+          # 3. 显式向 packing、pack_lh、XNNPACK 以及所有 *_prod_microkernels 目标注入 deps
           changed = False
-          for target in ['packing', 'pack_lh', 'XNNPACK']:
+          # 预定义目标
+          targets_extra = ['packing', 'pack_lh', 'XNNPACK']
+          # 找出所有包含 "_prod_microkernels" 的 cc_library 名称
+          pattern_names = r'name\s*=\s*"([^"]*_prod_microkernels[^"]*)"'
+          found_names = set(re.findall(pattern_names, s))
+          all_targets = set(targets_extra) | found_names
+          for target in all_targets:
               s, did = inject_deps_to_target(s, target, deps_needed)
               if did:
                   changed = True
@@ -333,6 +326,8 @@ jobs:
           grep -A 30 'name = "pack_lh"' BUILD.bazel | head -35
           echo "=== Verify XNNPACK main deps ==="
           grep -A 30 'name = "XNNPACK"' BUILD.bazel | head -35
+          echo "=== Verify a prod_microkernels target (e.g., neonsme2) ==="
+          grep -A 30 'name = "neonsme2_prod_microkernels"' BUILD.bazel | head -35
           echo "=== MICROKERNEL_DEPS ==="
           grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
 
@@ -381,6 +376,7 @@ jobs:
           # 将覆盖仓库写入 .bazelrc，确保所有构建自动应用
           echo "build --override_repository=XNNPACK=/tmp/xnnpack" >> .bazelrc
           echo "build --override_repository=KleidiAI=/tmp/kleidiai_repo" >> .bazelrc
+          echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
 
       - name: Disable layering_check globally and for monolithic config
         run: |
