@@ -781,22 +781,21 @@ jobs:
           grep -A 30 'name = "libtensorflowlite_jni.so"' "$JNI_BUILD" | head -35
       # ========================================================================================
 
-      - name: DEBUG - Show actual link command for libtensorflowlite_jni.so
+      - name: Capture full link command for libtensorflowlite_jni.so
+        if: always()
         run: |
-          # 强制重新链接，并打印所有执行的命令
+          # 重新链接一次，但这次要求 Bazel 打印完整命令行，并保留所有临时文件
           bazel build --config=android_arm64 \
             --override_repository=XNNPACK=/tmp/xnnpack \
             --override_repository=KleidiAI=/tmp/kleidiai_repo \
             -c opt \
             --subcommands=pretty_print \
-            //tflite/java:libtensorflowlite_jni.so 2>&1 | tee /tmp/build.log
+            --sandbox_debug \
+            --verbose_failures \
+            //tflite/java:libtensorflowlite_jni.so 2>&1 | tee /tmp/link.log
 
-          # 提取链接命令行（可能被参数文件隐藏，所以同时检查参数文件）
-          echo "=== Link command containing 'libtensorflowlite_jni.so' ==="
-          grep -E 'clang.*-o .*libtensorflowlite_jni\.so' /tmp/build.log | head -5
-
-          echo "=== Params file content (if used) ==="
-          find bazel-out/ -name 'libtensorflowlite_jni.so-2.params' -exec cat {} \;
+          echo "=== Full link command (searching for KleidiAI) ==="
+          grep -E 'clang|kleidiai|libmatmul|libcommon' /tmp/link.log | head -20
 
       - name: Run build_android_package.sh
         run: |
