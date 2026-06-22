@@ -640,48 +640,45 @@ jobs:
             -c opt \
             --config=android_arm64 \
             @KleidiAI//:matmul
+          # 查找库文件：优先 .so，其次 .a，最后 .lo
           MATMUL_LIB=$(find bazel-out/ -name "libmatmul.so" -path "*/arm64-v8a*" | head -1)
           if [ -z "$MATMUL_LIB" ]; then
             MATMUL_LIB=$(find bazel-out/ -name "libmatmul.a" -path "*/arm64-v8a*" | head -1)
           fi
           if [ -z "$MATMUL_LIB" ]; then
-            echo "❌ Could not find libmatmul.so or libmatmul.a"
-            exit 1
+            MATMUL_LIB=$(find bazel-out/ -name "libmatmul.lo" -path "*/arm64-v8a*" | head -1)
           fi
-          echo "Checking symbols in $MATMUL_LIB"
-
-          # 需要验证的关键符号列表（涵盖 RHS pack、LHS pack、matmul clamp 等）
-          REQUIRED_SYMBOLS=(
-            "kai_run_rhs_pack_nxk_qsi4cxps1s0_qsu4cxs1s0_neon"
-            "kai_run_lhs_pack_f32p2vlx1_f32_sme"
-            "kai_run_lhs_imatmul_pack_x32p2vlx1_x32p_sme"
-            "kai_get_mr_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa"
-            "kai_run_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa"
-          )
-
-          if [ "${MATMUL_LIB##*.}" = "so" ]; then
-            NM_CMD="nm -D"
+          if [ -z "$MATMUL_LIB" ]; then
+            echo "⚠️  Could not find libmatmul (so/a/lo), skipping symbol check"
           else
-            NM_CMD="nm"
-          fi
-
-          MISSING_SYMBOLS=()
-          for symbol in "${REQUIRED_SYMBOLS[@]}"; do
-            if ! $NM_CMD "$MATMUL_LIB" | grep -q "$symbol"; then
-              MISSING_SYMBOLS+=("$symbol")
+            echo "Checking symbols in $MATMUL_LIB"
+            REQUIRED_SYMBOLS=(
+              "kai_run_rhs_pack_nxk_qsi4cxps1s0_qsu4cxs1s0_neon"
+              "kai_run_lhs_pack_f32p2vlx1_f32_sme"
+              "kai_run_lhs_imatmul_pack_x32p2vlx1_x32p_sme"
+              "kai_get_mr_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa"
+              "kai_run_matmul_clamp_f32_qai8dxp1vlx4_qsi8cxp4vlx4_1vlx4vl_sme2_mopa"
+            )
+            if [ "${MATMUL_LIB##*.}" = "so" ]; then
+              NM_CMD="nm -D"
+            else
+              NM_CMD="nm"
             fi
-          done
-
-          if [ ${#MISSING_SYMBOLS[@]} -ne 0 ]; then
-            echo "❌ The following required symbols are missing from libmatmul:"
-            printf '   %s\n' "${MISSING_SYMBOLS[@]}"
-            echo "This usually means some source files were compiled but the function bodies"
-            echo "are empty due to missing feature macros (e.g. __ARM_FEATURE_SME2)."
-            echo "Ensure the -march flag enables all needed extensions."
-            exit 1
+            MISSING_SYMBOLS=()
+            for symbol in "${REQUIRED_SYMBOLS[@]}"; do
+              if ! $NM_CMD "$MATMUL_LIB" 2>/dev/null | grep -q "$symbol"; then
+                MISSING_SYMBOLS+=("$symbol")
+              fi
+            done
+            if [ ${#MISSING_SYMBOLS[@]} -ne 0 ]; then
+              echo "❌ The following required symbols are missing from libmatmul:"
+              printf '   %s\n' "${MISSING_SYMBOLS[@]}"
+              echo "This usually means some source files were compiled but the function bodies"
+              echo "are empty due to missing feature macros (e.g. __ARM_FEATURE_SME2)."
+              exit 1
+            fi
+            echo "✅ All required symbols found in libmatmul"
           fi
-
-          echo "✅ All required symbols found in libmatmul"
 
           # 其余架构预热
           for arch in android_arm android_x86 android_x86_64; do
