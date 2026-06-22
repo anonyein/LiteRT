@@ -412,12 +412,14 @@ jobs:
           echo "build:kleidiai_query --define=xnn_enable_kleidiai=true"  >> .bazelrc
           echo "✅ KleidiAI: arm64=true, x86/x86_64=false"
 
-      # 修复：解决静态库链接顺序导致的 undefined symbol 问题
-      - name: Add linker group flags for symbol resolution
+      # ====== 关键修改：添加 --whole-archive 强制包含所有静态库符号 ======
+      - name: Add linker flags to force include all static symbols
         run: |
+          echo "build:android_arm64 --linkopt=-Wl,--whole-archive" >> .bazelrc
+          echo "build:android_arm64 --linkopt=-Wl,--no-whole-archive" >> .bazelrc
           echo "build:android_arm64 --linkopt=-Wl,--start-group" >> .bazelrc
           echo "build:android_arm64 --linkopt=-Wl,--end-group"    >> .bazelrc
-          echo "✅ Added --start-group/--end-group for android_arm64"
+          echo "✅ Added --whole-archive, --start-group/--end-group for android_arm64"
       # =============================================================== #
 
       - name: Verify Android paths
