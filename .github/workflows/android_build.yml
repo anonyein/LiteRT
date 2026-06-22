@@ -221,14 +221,13 @@ jobs:
       
           deps_needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
       
-          def inject_deps_and_alwayslink(content, target_name, deps_list, force_alwayslink=False):
-              # 查找目标
+          def inject_deps_and_alwayslink_fixed(content, target_name, deps_list, force_alwayslink):
               start = content.find(f'name = "{target_name}"')
               if start == -1:
-                  return content, False
+                  return content, False, None
               lib_start = content.rfind('cc_library(', 0, start)
               if lib_start == -1:
-                  return content, False
+                  return content, False, None
               depth = 0
               end = lib_start
               while end < len(content):
@@ -240,30 +239,33 @@ jobs:
                           break
                   end += 1
               if depth != 0:
-                  return content, False
-              rule_block = content[lib_start:end+1]
-      
+                  return content, False, None
+              rule = content[lib_start:end+1]
               modified = False
-              # 1. 处理 deps
-              deps_re = re.search(r'(deps\s*=\s*\[)(.*?)(\])', rule_block, re.DOTALL)
-              if deps_re:
-                  inner = deps_re.group(2).rstrip()
-                  if inner and not inner.endswith(','):
-                      inner += ','
+              new_rule = rule
+      
+              # 处理 deps
+              deps_match = re.search(r'(deps\s*=\s*\[)([^\]]*)(\])', rule, re.DOTALL)
+              if deps_match:
+                  inner = deps_match.group(2)
+                  if inner.strip():
+                      if not inner.rstrip().endswith(','):
+                          inner += ','
                   for dep in deps_list:
                       if dep not in inner:
                           inner += f'\n        {dep},'
-                  new_rule = rule_block[:deps_re.start(2)] + inner + rule_block[deps_re.end(2):]
+                  new_deps = deps_match.group(1) + inner + deps_match.group(3)
+                  new_rule = rule[:deps_match.start(1)] + new_deps + rule[deps_match.end(3):]
                   modified = True
               else:
-                  # 插入新的 deps 块
-                  last_paren = rule_block.rfind(')')
+                  last_paren = rule.rfind(')')
                   if last_paren == -1:
-                      return content, False
+                      return content, False, None
                   deps_str = '\n    deps = [\n        ' + ',\n        '.join(deps_list) + ',\n    ],'
-                  new_rule = rule_block[:last_paren] + deps_str + rule_block[last_paren:]
+                  new_rule = rule[:last_paren] + deps_str + rule[last_paren:]
                   modified = True
-
+      
+              # 处理 alwayslink
               if force_alwayslink and 'alwayslink' not in new_rule:
                   if 'deps' in new_rule:
                       deps_end = new_rule.rfind('],')
@@ -271,18 +273,25 @@ jobs:
                           deps_end = new_rule.rfind(']')
                       if deps_end != -1:
                           insert_pos = deps_end + 1
-                          new_rule = new_rule[:insert_pos] + '\n    alwayslink = 1,' + new_rule[insert_pos:]
+                          if insert_pos < len(new_rule) and new_rule[insert_pos] == ',':
+                              new_rule = new_rule[:insert_pos] + '\n    alwayslink = 1,' + new_rule[insert_pos+1:]
+                          else:
+                              new_rule = new_rule[:insert_pos] + ',\n    alwayslink = 1,' + new_rule[insert_pos:]
                           modified = True
                   else:
-                      last_attr_end = new_rule.rfind(',')
-                      if last_attr_end == -1:
-                          last_attr_end = new_rule.rfind('(') + 1
-                      new_rule = new_rule[:last_attr_end] + '\n    alwayslink = 1,' + new_rule[last_attr_end:]
-                      modified = True
-
+                      last_paren = new_rule.rfind(')')
+                      if last_paren != -1:
+                          before = new_rule[:last_paren].rstrip()
+                          if before.endswith(','):
+                              insert_str = '\n    alwayslink = 1,'
+                          else:
+                              insert_str = ',\n    alwayslink = 1'
+                          new_rule = new_rule[:last_paren] + insert_str + new_rule[last_paren:]
+                          modified = True
+      
               if modified:
                   content = content[:lib_start] + new_rule + content[end+1:]
-              return content, modified
+              return content, modified, new_rule
       
           # 1. 更新 MICROKERNEL_DEPS
           deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
@@ -312,34 +321,32 @@ jobs:
           s = re.sub(pattern2, add_deps, s, flags=re.DOTALL)
       
           # 3. 对所有相关目标注入 deps 和 alwayslink
-          # 需要 alwayslink 的目标
           alwayslink_targets = ['packing', 'pack_lh', 'XNNPACK']
-          # 所有 _prod_microkernels 目标（只注入 deps，不强制 alwayslink）
           pattern_names = r'name\s*=\s*"([^"]*_prod_microkernels[^"]*)"'
           found_names = set(re.findall(pattern_names, s))
           all_targets = set(alwayslink_targets) | found_names
       
           changed = False
+          modified_blocks = {}
           for target in all_targets:
               force = target in alwayslink_targets
-              s, did = inject_deps_and_alwayslink(s, target, deps_needed, force)
+              s, did, new_rule = inject_deps_and_alwayslink_fixed(s, target, deps_needed, force)
               if did:
                   changed = True
+                  modified_blocks[target] = new_rule
                   print(f"✅ Patched target {target} (alwayslink={force})")
       
           if changed:
               p.write_text(s)
               print("✅ Finished patching XNNPACK BUILD.bazel")
+              # 打印修改过的目标规则块
+              for target, rule in modified_blocks.items():
+                  print(f"\n=== Modified rule for {target} ===")
+                  print(rule)
           else:
               print("⚠️ No changes made (targets already have deps or not found)")
           PYEOF
-
-          echo "=== Verify packing target (full rule) ==="
-          sed -n '/^cc_library(/,/^)/p' BUILD.bazel | grep -A 50 'name = "packing"' | head -60
-          echo "=== Check alwayslink in packing ==="
-          grep -A 50 'name = "packing"' BUILD.bazel | grep alwayslink || echo "⚠️ alwayslink NOT found in packing"
-          echo "=== Check alwayslink in pack_lh ==="
-          grep -A 50 'name = "pack_lh"' BUILD.bazel | grep alwayslink || echo "⚠️ alwayslink NOT found in pack_lh"
+      
           echo "=== MICROKERNEL_DEPS ==="
           grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
 
