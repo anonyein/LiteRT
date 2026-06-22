@@ -136,16 +136,19 @@ jobs:
       - name: Create BUILD files for @KleidiAI
         run: |
           REPO=/tmp/kleidiai_repo
-          # 根 BUILD.bazel
           cat > $REPO/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
+
+          config_setting(
+              name = "kleidiai_enabled",
+              define_values = {"xnn_enable_kleidiai": "true"},
+          )
 
           cc_library(
               name = "common",
               hdrs = glob(["src/kai/**/*.h", "kai/ukernels/**/*.h"]),
-              # 仅在 ARM64 架构时包含汇编源文件，其他架构为空，避免编译错误
               srcs = select({
-                  "@platforms//cpu:aarch64": [
+                  ":kleidiai_enabled": [
                       "src/kai/kai_common_sme_asm.S",
                       "src/kai/kai_common_sve_asm.S",
                   ],
@@ -153,9 +156,8 @@ jobs:
               }),
               includes = ["src", "."],
               alwayslink = 1,
-              # 仅 ARM64 架构使用 ARM 专用编译选项
               copts = select({
-                  "@platforms//cpu:aarch64": [
+                  ":kleidiai_enabled": [
                       "-Xclang", "-target-feature", "-Xclang", "+fp16",
                       "-Xclang", "-target-feature", "-Xclang", "+dotprod",
                       "-Xclang", "-target-feature", "-Xclang", "+i8mm",
@@ -172,17 +174,17 @@ jobs:
           cc_library(
               name = "matmul",
               srcs = select({
-                  "@platforms//cpu:aarch64": ["@KleidiAI//kai/ukernels/matmul:matmul_srcs"],
+                  ":kleidiai_enabled": ["@KleidiAI//kai/ukernels/matmul:matmul_srcs"],
                   "//conditions:default": [],
               }),
               hdrs = select({
-                  "@platforms//cpu:aarch64": ["@KleidiAI//kai/ukernels/matmul:matmul_hdrs"],
+                  ":kleidiai_enabled": ["@KleidiAI//kai/ukernels/matmul:matmul_hdrs"],
                   "//conditions:default": [],
               }),
               includes = ["src"],
               alwayslink = 1,
               copts = select({
-                  "@platforms//cpu:aarch64": [
+                  ":kleidiai_enabled": [
                       "-Xclang", "-target-feature", "-Xclang", "+fp16",
                       "-Xclang", "-target-feature", "-Xclang", "+dotprod",
                       "-Xclang", "-target-feature", "-Xclang", "+i8mm",
@@ -199,7 +201,6 @@ jobs:
           )
           EOF
 
-          # 子包 BUILD：新增 matmul_hdrs filegroup
           cat > $REPO/kai/ukernels/matmul/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
 
@@ -216,7 +217,6 @@ jobs:
               srcs = glob(["**/*.h"]),
           )
 
-          # 保留别名，以支持 XNNPACK 的原有依赖路径
           alias(
               name = "matmul",
               actual = "//:matmul",
