@@ -138,7 +138,7 @@ jobs:
           REPO=/tmp/kleidiai_repo
           cat > $REPO/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
-
+      
           cc_library(
               name = "common",
               hdrs = glob(["src/kai/**/*.h", "kai/ukernels/**/*.h"]),
@@ -165,7 +165,7 @@ jobs:
                   "//conditions:default": [],
               }),
           )
-
+      
           cc_library(
               name = "matmul",
               srcs = select({
@@ -176,7 +176,7 @@ jobs:
                   "@platforms//cpu:aarch64": ["@KleidiAI//kai/ukernels/matmul:matmul_hdrs"],
                   "//conditions:default": [],
               }),
-              includes = ["src"],
+              includes = ["src", "."],   # 原来只有 ["src"]，改为 ["src", "."]
               alwayslink = 1,
               copts = select({
                   "@platforms//cpu:aarch64": [
@@ -195,14 +195,14 @@ jobs:
               deps = [":common"],
           )
           EOF
-
+      
           cat > $REPO/kai/ukernels/matmul/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
           filegroup(name = "matmul_srcs", srcs = glob(["**/*.c", "**/*.S"], exclude = ["BUILD.bazel"]))
           filegroup(name = "matmul_hdrs", srcs = glob(["**/*.h"]))
           alias(name = "matmul", actual = "//:matmul")
           EOF
-
+      
           echo "=== @KleidiAI root BUILD ==="
           cat $REPO/BUILD.bazel
           echo "=== @KleidiAI matmul BUILD ==="
@@ -214,52 +214,125 @@ jobs:
           cd /tmp/xnnpack
           python3 << 'PYEOF'
           import re
-
-          with open("BUILD.bazel", "r") as f:
-              content = f.read()
-
+          from pathlib import Path
+      
+          p = Path('BUILD.bazel')
+          s = p.read_text()
+      
+          # 辅助函数：向指定名称的 cc_library 目标注入 deps（若不存在则添加）
+          def inject_deps_to_target(content, target_name, deps_list):
+              # 找到 cc_library 规则中 name = "target_name" 的部分
+              # 注意：匹配可能跨多行，且规则可能包含其他属性
+              pattern = r'(cc_library\s*\([^)]*?name\s*=\s*"' + re.escape(target_name) + r'"\s*[,)][^)]*?\))'
+              # 使用更健壮的方式：先找到目标名所在位置，再向前/向后匹配
+              # 简单起见，用正则查找整个块（假设规则中 name 附近有合适的括号）
+              # 但为了避免嵌套问题，我们查找以 "cc_library(" 开头，直到匹配的 ")"（可嵌套）
+              # 这里采用更简单的方法：寻找 name = "X" 并用正则提取整个块（假设括号平衡）
+              # 由于 XNNPACK 的 BUILD 文件结构清晰，我们可以用以下方法：
+              # 分割出每个 cc_library 块，然后处理包含目标名的块
+              blocks = re.split(r'(cc_library\s*\()', content)
+              # 但更简单的是直接替换 deps 列表，我们可以在原文本中修改
+              # 本脚本采用 Copilot 提供的策略：先定位目标开始的索引，再修改 deps
+              start = content.find(f'name = "{target_name}"')
+              if start == -1:
+                  return content, False
+              # 向前找到最近的 "cc_library("
+              lib_start = content.rfind('cc_library(', 0, start)
+              if lib_start == -1:
+                  return content, False
+              # 找到匹配的右括号（简易方法，假设括号平衡）
+              # 从 lib_start 开始数括号
+              depth = 0
+              end = lib_start
+              while end < len(content):
+                  if content[end] == '(':
+                      depth += 1
+                  elif content[end] == ')':
+                      depth -= 1
+                      if depth == 0:
+                          break
+                  end += 1
+              if depth != 0:
+                  return content, False
+              rule_block = content[lib_start:end+1]
+              # 检查是否已有需要的 deps
+              if all(dep in rule_block for dep in deps_list):
+                  return content, False
+              # 尝试在现有 deps 块中添加，或创建新的 deps 块
+              deps_re = re.search(r'(deps\s*=\s*\[)(.*?)(\])', rule_block, re.DOTALL)
+              new_rule = rule_block
+              if deps_re:
+                  inner = deps_re.group(2).rstrip()
+                  if inner and not inner.endswith(','):
+                      inner += ','
+                  for dep in deps_list:
+                      if dep not in inner:
+                          inner += f'\n        {dep},'
+                  new_inner = inner
+                  new_rule = rule_block[:deps_re.start(2)] + new_inner + rule_block[deps_re.end(2):]
+              else:
+                  # 插入新的 deps 块，放在属性列表末尾，闭合括号前
+                  # 找最后一个 ')' 前的位置
+                  last_paren = new_rule.rfind(')')
+                  if last_paren == -1:
+                      return content, False
+                  deps_str = '\n    deps = [\n        ' + ',\n        '.join(deps_list) + ',\n    ],'
+                  new_rule = new_rule[:last_paren] + deps_str + new_rule[last_paren:]
+              # 替换原块
+              content = content[:lib_start] + new_rule + content[end+1:]
+              return content, True
+      
+          # 需要添加的依赖
+          deps_needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
+      
           # 1. 更新 MICROKERNEL_DEPS
           deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
-          m = re.search(deps_pattern, content, flags=re.DOTALL)
+          m = re.search(deps_pattern, s, flags=re.DOTALL)
           if m:
               inner = m.group(2).rstrip()
               if not inner.endswith(','):
                   inner += ','
-              if '"@KleidiAI//:common"' not in inner:
-                  inner += '\n    "@KleidiAI//:common",\n    "@KleidiAI//:matmul",'
-              content = content[:m.start(2)] + inner + content[m.end(2):]
+              for dep in deps_needed:
+                  if dep not in inner:
+                      inner += f'\n    {dep},'
+              s = s[:m.start(2)] + inner + s[m.end(2):]
               print("✅ Updated MICROKERNEL_DEPS")
-
-          # 2. 在 packing 和 pack_lh 的 xnnpack_if_kleidiai_enabled 块中添加 @KleidiAI//:common
-          targets = ["packing", "pack_lh"]
-          for t in targets:
-              # 找到 xnnpack_if_kleidiai_enabled 调用的括号列表，并插入新依赖
-              # 匹配模式：xnnpack_if_kleidiai_enabled([ ... ])
-              pattern = r'(xnnpack_if_kleidiai_enabled\s*\(\s*\[)([^]]*?)(\])'
-              def add_common(m):
-                  inner_list = m.group(2)
-                  if '"@KleidiAI//:common"' in inner_list:
-                      return m.group(0)  # 已存在
-                  # 确保逗号
-                  if inner_list.strip() and not inner_list.rstrip().endswith(','):
-                      inner_list = inner_list.rstrip() + ',\n        '
-                  elif not inner_list.strip():
-                      inner_list = inner_list
-                  inner_list += '"@KleidiAI//:common"'
-                  return m.group(1) + inner_list + m.group(3)
-              # 只替换在 packing 或 pack_lh 定义附近的那个块（简单起见替换所有匹配，但依赖名唯一，不会误伤）
-              # 更精确：先找到目标定义的区域，但全局替换也足够安全
-              content = re.sub(pattern, add_common, content, flags=re.DOTALL)
-
-          with open("BUILD.bazel", "w") as f:
-              f.write(content)
-          print("✅ Injected @KleidiAI//:common into packing and pack_lh deps")
+      
+          # 2. 在 xnnpack_if_kleidiai_enabled 块中添加依赖（先前的做法，保留）
+          pattern2 = r'(xnnpack_if_kleidiai_enabled\s*\(\s*\[)([^\]]*?)(\])'
+          def add_deps(m):
+              inner_list = m.group(2)
+              for dep in deps_needed:
+                  if dep not in inner_list:
+                      if inner_list.strip() and not inner_list.rstrip().endswith(','):
+                          inner_list = inner_list.rstrip() + ',\n        '
+                      elif not inner_list.strip():
+                          inner_list = inner_list
+                      inner_list += dep
+              return m.group(1) + inner_list + m.group(3)
+          s = re.sub(pattern2, add_deps, s, flags=re.DOTALL)
+      
+          # 3. 显式向 packing、pack_lh 和 XNNPACK 目标注入 deps
+          changed = False
+          for target in ['packing', 'pack_lh', 'XNNPACK']:
+              s, did = inject_deps_to_target(s, target, deps_needed)
+              if did:
+                  changed = True
+                  print(f"✅ Injected deps into target {target}")
+      
+          if changed:
+              p.write_text(s)
+              print("✅ Finished patching XNNPACK BUILD.bazel")
+          else:
+              print("⚠️ No changes made (targets already have deps or not found)")
           PYEOF
-
+      
           echo "=== Verify packing deps ==="
           grep -A 30 'name = "packing"' BUILD.bazel | head -35
           echo "=== Verify pack_lh deps ==="
           grep -A 30 'name = "pack_lh"' BUILD.bazel | head -35
+          echo "=== Verify XNNPACK main deps ==="
+          grep -A 30 'name = "XNNPACK"' BUILD.bazel | head -35
           echo "=== MICROKERNEL_DEPS ==="
           grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
 
