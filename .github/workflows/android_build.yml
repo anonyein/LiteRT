@@ -139,16 +139,11 @@ jobs:
           cat > $REPO/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
 
-          config_setting(
-              name = "kleidiai_enabled",
-              define_values = {"xnn_enable_kleidiai": "true"},
-          )
-
           cc_library(
               name = "common",
               hdrs = glob(["src/kai/**/*.h", "kai/ukernels/**/*.h"]),
               srcs = select({
-                  ":kleidiai_enabled": [
+                  "@platforms//cpu:aarch64": [
                       "src/kai/kai_common_sme_asm.S",
                       "src/kai/kai_common_sve_asm.S",
                   ],
@@ -157,7 +152,7 @@ jobs:
               includes = ["src", "."],
               alwayslink = 1,
               copts = select({
-                  ":kleidiai_enabled": [
+                  "@platforms//cpu:aarch64": [
                       "-Xclang", "-target-feature", "-Xclang", "+fp16",
                       "-Xclang", "-target-feature", "-Xclang", "+dotprod",
                       "-Xclang", "-target-feature", "-Xclang", "+i8mm",
@@ -174,17 +169,17 @@ jobs:
           cc_library(
               name = "matmul",
               srcs = select({
-                  ":kleidiai_enabled": ["@KleidiAI//kai/ukernels/matmul:matmul_srcs"],
+                  "@platforms//cpu:aarch64": ["@KleidiAI//kai/ukernels/matmul:matmul_srcs"],
                   "//conditions:default": [],
               }),
               hdrs = select({
-                  ":kleidiai_enabled": ["@KleidiAI//kai/ukernels/matmul:matmul_hdrs"],
+                  "@platforms//cpu:aarch64": ["@KleidiAI//kai/ukernels/matmul:matmul_hdrs"],
                   "//conditions:default": [],
               }),
               includes = ["src"],
               alwayslink = 1,
               copts = select({
-                  ":kleidiai_enabled": [
+                  "@platforms//cpu:aarch64": [
                       "-Xclang", "-target-feature", "-Xclang", "+fp16",
                       "-Xclang", "-target-feature", "-Xclang", "+dotprod",
                       "-Xclang", "-target-feature", "-Xclang", "+i8mm",
@@ -203,31 +198,16 @@ jobs:
 
           cat > $REPO/kai/ukernels/matmul/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
-
-          filegroup(
-              name = "matmul_srcs",
-              srcs = glob(
-                  ["**/*.c", "**/*.S"],
-                  exclude = ["BUILD.bazel"],
-              ),
-          )
-
-          filegroup(
-              name = "matmul_hdrs",
-              srcs = glob(["**/*.h"]),
-          )
-
-          alias(
-              name = "matmul",
-              actual = "//:matmul",
-          )
+          filegroup(name = "matmul_srcs", srcs = glob(["**/*.c", "**/*.S"], exclude = ["BUILD.bazel"]))
+          filegroup(name = "matmul_hdrs", srcs = glob(["**/*.h"]))
+          alias(name = "matmul", actual = "//:matmul")
           EOF
 
           echo "=== @KleidiAI root BUILD ==="
           cat $REPO/BUILD.bazel
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
-
+          
       # ---------- 修补 XNNPACK BUILD（给 packing/pack_lh 加 common 依赖） ----------
       - name: Patch XNNPACK BUILD – add KleidiAI deps to MICROKERNEL_DEPS and packing targets
         run: |
@@ -622,84 +602,32 @@ jobs:
           
       - name: Run build_android_package.sh
         run: |
-          OUTPUT_BASE=$(bazel info output_base)
-          cd "${OUTPUT_BASE}/external/XNNPACK"
-          
-          # 1. 用修补后的 BUILD 覆盖缓存（来自 /tmp/xnnpack）
-          cp -f /tmp/xnnpack/BUILD.bazel BUILD.bazel 2>/dev/null || true
-          echo "✅ Overwrote cached XNNPACK BUILD"
-          
-          # 2. 强力注入 common/matmul 到所有 _prod_microkernels 和 packing/pack_lh
-          python3 << 'PYEOF'
+          # 确保 /tmp/xnnpack/BUILD.bazel 中的 MICROKERNEL_DEPS 已包含 KleidiAI 依赖
+          if ! grep -q '@KleidiAI//:matmul' /tmp/xnnpack/BUILD.bazel; then
+            echo "⚠️ MICROKERNEL_DEPS missing KleidiAI deps, applying patch..."
+            python3 << 'PYEOF'
           import re
-          
-          with open("BUILD.bazel", "r") as f:
+          with open("/tmp/xnnpack/BUILD.bazel", "r") as f:
               content = f.read()
-          
-          # 更新 MICROKERNEL_DEPS
           deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
           m = re.search(deps_pattern, content, flags=re.DOTALL)
           if m:
               inner = m.group(2).rstrip()
               if not inner.endswith(','):
                   inner += ','
-              for dep in ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']:
-                  if dep not in inner:
-                      inner += f'\n    {dep},'
+              if '"@KleidiAI//:common"' not in inner:
+                  inner += '\n    "@KleidiAI//:common",\n    "@KleidiAI//:matmul",'
               content = content[:m.start(2)] + inner + content[m.end(2):]
-          
-          # 给所有 _prod_microkernels 目标注入 common 和 matmul
-          def inject_into_microkernel(match):
-              rule = match.group(0)
-              needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
-              if all(d in rule for d in needed):
-                  return rule
-              deps_match = re.search(r'(deps\s*=\s*\[)(.*?)(\])', rule, flags=re.DOTALL)
-              if deps_match:
-                  inner = deps_match.group(2).rstrip()
-                  if inner and not inner.endswith(','):
-                      inner += ','
-                  for d in needed:
-                      if d not in inner:
-                          inner += f'\n        {d},'
-                  rule = rule[:deps_match.start(2)] + inner + rule[deps_match.end(2):]
-              else:
-                  deps_str = '\n    deps = [' + ', '.join(needed) + '],'
-                  rule = rule.rstrip().rstrip(')') + deps_str + '\n)'
-              return rule
-          
-          pattern = r'(cc_library\s*\(.*?name\s*=\s*"[^"]*_prod_microkernels".*?\)\n\})'
-          content = re.sub(pattern, inject_into_microkernel, content, flags=re.DOTALL)
-          
-          # 修补 packing/pack_lh 的 xnnpack_if_kleidiai_enabled 列表
-          def add_matmul_to_kleidiai(m):
-              inner = m.group(2)
-              needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
-              for d in needed:
-                  if d not in inner:
-                      if inner.rstrip() and not inner.rstrip().endswith(','):
-                          inner = inner.rstrip() + ','
-                      inner += d
-              return m.group(1) + inner + m.group(3)
-          
-          pattern2 = r'(xnnpack_if_kleidiai_enabled\s*\(\s*\[)([^\]]*?)(\])'
-          content = re.sub(pattern2, add_matmul_to_kleidiai, content, flags=re.DOTALL)
-          
-          with open("BUILD.bazel", "w") as f:
+          with open("/tmp/xnnpack/BUILD.bazel", "w") as f:
               f.write(content)
-          print("✅ Injected common/matmul into all relevant targets")
+          print("✅ Patched MICROKERNEL_DEPS")
           PYEOF
-          
-          # 3. 快速验证
-          if grep -q '@KleidiAI//:matmul' BUILD.bazel; then
-            echo "✅ matmul dependency present in cached BUILD"
-          else
-            echo "❌ Failed to inject matmul dependency"
-            exit 1
           fi
-          
-          # 4. 返回工作目录并执行打包
-          cd "$GITHUB_WORKSPACE"
+
+          # 强制 Bazel 丢弃可能缓存的分析结果，重新加载 BUILD 文件
+          bazel clean --expunge 2>/dev/null || true
+          echo "✅ Expunged old analysis cache"
+
           chmod +x ./ci/build_android_package.sh
           echo "=== Final build commands (first 5) ==="
           grep -n 'bazel build' ci/build_android_package.sh | head -5
