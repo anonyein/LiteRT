@@ -214,141 +214,152 @@ jobs:
           cd /tmp/xnnpack
           python3 << 'PYEOF'
           import re
-          from pathlib import Path
-      
-          p = Path('BUILD.bazel')
-          s = p.read_text()
-      
+
+          with open('BUILD.bazel', 'r') as f:
+              content = f.read()
+
           deps_needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
-      
-          def inject_deps_and_alwayslink_fixed(content, target_name, deps_list, force_alwayslink):
-              start = content.find(f'name = "{target_name}"')
-              if start == -1:
-                  return content, False, None
-              lib_start = content.rfind('cc_library(', 0, start)
-              if lib_start == -1:
-                  return content, False, None
-              depth = 0
-              end = lib_start
-              while end < len(content):
-                  if content[end] == '(':
-                      depth += 1
-                  elif content[end] == ')':
-                      depth -= 1
-                      if depth == 0:
-                          break
-                  end += 1
-              if depth != 0:
-                  return content, False, None
-              rule = content[lib_start:end+1]
-              modified = False
-              new_rule = rule
-      
-              # 处理 deps
-              deps_match = re.search(r'(deps\s*=\s*\[)([^\]]*)(\])', rule, re.DOTALL)
-              if deps_match:
-                  inner = deps_match.group(2)
-                  if inner.strip():
-                      if not inner.rstrip().endswith(','):
-                          inner += ','
-                  for dep in deps_list:
-                      if dep not in inner:
-                          inner += f'\n        {dep},'
-                  new_deps = deps_match.group(1) + inner + deps_match.group(3)
-                  new_rule = rule[:deps_match.start(1)] + new_deps + rule[deps_match.end(3):]
-                  modified = True
-              else:
-                  last_paren = rule.rfind(')')
-                  if last_paren == -1:
-                      return content, False, None
-                  deps_str = '\n    deps = [\n        ' + ',\n        '.join(deps_list) + ',\n    ],'
-                  new_rule = rule[:last_paren] + deps_str + rule[last_paren:]
-                  modified = True
-      
-              # 处理 alwayslink
-              if force_alwayslink and 'alwayslink' not in new_rule:
-                  if 'deps' in new_rule:
-                      deps_end = new_rule.rfind('],')
-                      if deps_end == -1:
-                          deps_end = new_rule.rfind(']')
-                      if deps_end != -1:
-                          insert_pos = deps_end + 1
-                          if insert_pos < len(new_rule) and new_rule[insert_pos] == ',':
-                              new_rule = new_rule[:insert_pos] + '\n    alwayslink = 1,' + new_rule[insert_pos+1:]
-                          else:
-                              new_rule = new_rule[:insert_pos] + ',\n    alwayslink = 1,' + new_rule[insert_pos:]
-                          modified = True
-                  else:
-                      last_paren = new_rule.rfind(')')
-                      if last_paren != -1:
-                          before = new_rule[:last_paren].rstrip()
-                          if before.endswith(','):
-                              insert_str = '\n    alwayslink = 1,'
-                          else:
-                              insert_str = ',\n    alwayslink = 1'
-                          new_rule = new_rule[:last_paren] + insert_str + new_rule[last_paren:]
-                          modified = True
-      
-              if modified:
-                  content = content[:lib_start] + new_rule + content[end+1:]
-              return content, modified, new_rule
-      
+          targets_with_alwayslink = ['XNNPACK', 'packing', 'pack_lh']
+
           # 1. 更新 MICROKERNEL_DEPS
-          deps_pattern = r'(MICROKERNEL_DEPS\s*=\s*\[)(.*?)(\])'
-          m = re.search(deps_pattern, s, flags=re.DOTALL)
-          if m:
-              inner = m.group(2).rstrip()
-              if not inner.endswith(','):
-                  inner += ','
+          def update_microkernel_deps(m):
+              inner = m.group(1)
               for dep in deps_needed:
                   if dep not in inner:
-                      inner += f'\n    {dep},'
-              s = s[:m.start(2)] + inner + s[m.end(2):]
-              print("✅ Updated MICROKERNEL_DEPS")
-      
-          # 2. 修补 xnnpack_if_kleidiai_enabled 块
-          pattern2 = r'(xnnpack_if_kleidiai_enabled\s*\(\s*\[)([^\]]*?)(\])'
-          def add_deps(m):
-              inner_list = m.group(2)
+                      if inner.rstrip() and not inner.rstrip().endswith(','):
+                          inner = inner.rstrip() + ',\n    '
+                      elif inner.rstrip():
+                          inner = inner.rstrip() + '\n    '
+                      inner += dep
+              return 'MICROKERNEL_DEPS = [' + inner + ']'
+
+          content = re.sub(
+              r'MICROKERNEL_DEPS\s*=\s*\[(.*?)\]',
+              update_microkernel_deps,
+              content,
+              flags=re.DOTALL,
+          )
+
+          # 2. 更新所有 xnnpack_if_kleidiai_enabled 列表
+          def update_kleidiai_list(m):
+              inner = m.group(1)
               for dep in deps_needed:
-                  if dep not in inner_list:
-                      if inner_list.strip() and not inner_list.rstrip().endswith(','):
-                          inner_list = inner_list.rstrip() + ',\n        '
-                      elif not inner_list.strip():
-                          inner_list = inner_list
-                      inner_list += dep
-              return m.group(1) + inner_list + m.group(3)
-          s = re.sub(pattern2, add_deps, s, flags=re.DOTALL)
-      
-          # 3. 对所有相关目标注入 deps 和 alwayslink
-          alwayslink_targets = ['packing', 'pack_lh', 'XNNPACK']
-          pattern_names = r'name\s*=\s*"([^"]*_prod_microkernels[^"]*)"'
-          found_names = set(re.findall(pattern_names, s))
-          all_targets = set(alwayslink_targets) | found_names
-      
-          changed = False
-          modified_blocks = {}
-          for target in all_targets:
-              force = target in alwayslink_targets
-              s, did, new_rule = inject_deps_and_alwayslink_fixed(s, target, deps_needed, force)
-              if did:
-                  changed = True
-                  modified_blocks[target] = new_rule
-                  print(f"✅ Patched target {target} (alwayslink={force})")
-      
-          if changed:
-              p.write_text(s)
-              print("✅ Finished patching XNNPACK BUILD.bazel")
-              # 打印修改过的目标规则块
-              for target, rule in modified_blocks.items():
-                  print(f"\n=== Modified rule for {target} ===")
-                  print(rule)
-          else:
-              print("⚠️ No changes made (targets already have deps or not found)")
+                  if dep not in inner:
+                      if inner.rstrip() and not inner.rstrip().endswith(','):
+                          inner = inner.rstrip() + ',\n        '
+                      elif inner.rstrip():
+                          inner = inner.rstrip() + '\n        '
+                      inner += dep
+              return 'xnnpack_if_kleidiai_enabled([' + inner + '])'
+
+          content = re.sub(
+              r'xnnpack_if_kleidiai_enabled\s*\(\s*\[([^\]]*?)\]\s*\)',
+              update_kleidiai_list,
+              content,
+              flags=re.DOTALL,
+          )
+
+          # 3. 为特定目标添加 alwayslink = 1
+          macro_prefixes = ['xnnpack_cc_library(', 'xnnpack_cxx_library(']
+
+          def add_alwayslink_for_target(content, target_name):
+              name_pattern = rf'name\s*=\s*"{target_name}"'
+              match = re.search(name_pattern, content)
+              if not match:
+                  return content
+
+              start = match.start()
+              lib_start = -1
+              for prefix in macro_prefixes:
+                  pos = content.rfind(prefix, 0, start)
+                  if pos > lib_start:
+                      lib_start = pos
+              if lib_start == -1:
+                  return content
+
+              depth = 0
+              i = lib_start
+              while i < len(content):
+                  if content[i] == '(':
+                      depth += 1
+                  elif content[i] == ')':
+                      depth -= 1
+                      if depth == 0:
+                          end = i
+                          break
+                  i += 1
+              else:
+                  return content
+
+              macro_call = content[lib_start:end+1]
+              if 'alwayslink' in macro_call:
+                  return content
+
+              before_paren = macro_call[:-1]
+              stripped = before_paren.rstrip()
+              if not stripped.endswith(','):
+                  insert = ',\n    alwayslink = 1'
+              else:
+                  insert = '\n    alwayslink = 1'
+              new_macro_call = before_paren + insert + ')'
+
+              content = content[:lib_start] + new_macro_call + content[end+1:]
+              return content
+
+          for target in targets_with_alwayslink:
+              content = add_alwayslink_for_target(content, target)
+
+          with open('BUILD.bazel', 'w') as f:
+              f.write(content)
+
+          print("✅ Updated MICROKERNEL_DEPS and xnnpack_if_kleidiai_enabled lists")
+          print("✅ Added alwayslink = 1 to:", targets_with_alwayslink)
           PYEOF
-      
+
           echo "=== MICROKERNEL_DEPS ==="
           grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
+
+          echo "=== Modified rules for XNNPACK, packing, pack_lh ==="
+          python3 << 'PYEOF'
+          import re
+
+          with open('BUILD.bazel', 'r') as f:
+              content = f.read()
+
+          for name in ['XNNPACK', 'packing', 'pack_lh']:
+              # 查找 name = "xxx"
+              match = re.search(rf'name\s*=\s*"{name}"', content)
+              if not match:
+                  print(f"⚠️ Target {name} not found")
+                  continue
+              start = match.start()
+              # 向前找宏调用开始
+              prefixes = ['xnnpack_cc_library(', 'xnnpack_cxx_library(']
+              lib_start = -1
+              for p in prefixes:
+                  pos = content.rfind(p, 0, start)
+                  if pos > lib_start:
+                      lib_start = pos
+              if lib_start == -1:
+                  continue
+              # 配对括号
+              depth = 0
+              i = lib_start
+              while i < len(content):
+                  if content[i] == '(':
+                      depth += 1
+                  elif content[i] == ')':
+                      depth -= 1
+                      if depth == 0:
+                          end = i
+                          break
+                  i += 1
+              else:
+                  continue
+              block = content[lib_start:end+1]
+              print(f"\n=== {name} ===")
+              print(block)
+          PYEOF
 
       # ---------- Inject overrides into build script ----------
       - name: Inject overrides into build script
