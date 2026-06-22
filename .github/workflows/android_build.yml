@@ -705,46 +705,6 @@ jobs:
             echo "❌ fixedpoint not found in rule"
             exit 1
           fi
-
-      # ===================== 新增步骤：在最终 JNI 库中直接添加 KleidiAI 依赖 =====================
-      - name: Add KleidiAI deps to JNI library
-        run: |
-          OUTPUT_BASE=$(bazel info output_base)
-          JNI_BUILD="${OUTPUT_BASE}/external/org_tensorflow/tflite/java/BUILD"
-          cp "$JNI_BUILD" "$JNI_BUILD.bak"
-
-          export JNI_BUILD
-          python3 << 'PYEOF'
-          import os, re
-
-          build_file = os.environ['JNI_BUILD']
-          with open(build_file, 'r') as f:
-              content = f.read()
-
-          # 查找 libtensorflowlite_jni.so 目标
-          pattern = r'(name\s*=\s*"libtensorflowlite_jni\.so".*?deps\s*=\s*\[)([^\]]*?)(\])'
-          def add_deps(m):
-              deps_inner = m.group(2).strip()
-              needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
-              if all(dep in deps_inner for dep in needed):
-                  return m.group(0)
-              if deps_inner:
-                  if not deps_inner.endswith(','):
-                      deps_inner += ','
-              deps_inner += '\n        "@KleidiAI//:common",\n        "@KleidiAI//:matmul",'
-              return m.group(1) + deps_inner + m.group(3)
-
-          new_content, count = re.subn(pattern, add_deps, content, flags=re.DOTALL)
-          if count == 0:
-              print("⚠️ Could not find libtensorflowlite_jni.so target, skipping")
-          else:
-              with open(build_file, 'w') as f:
-                  f.write(new_content)
-              print("✅ Added KleidiAI deps to libtensorflowlite_jni.so")
-          PYEOF
-
-          echo "=== Verify JNI BUILD modification ==="
-          grep -A 25 'name = "libtensorflowlite_jni.so"' "$JNI_BUILD" | head -30
       # ========================================================================================
 
       - name: Run build_android_package.sh
