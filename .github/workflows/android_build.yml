@@ -638,19 +638,28 @@ jobs:
             -c opt \
             --config=android_arm64 \
             @KleidiAI//:matmul
-          MATMUL_LIB=$(find bazel-out/ -name "libmatmul.a" -path "*/arm64-v8a*" | head -1)
+          # 优先找 .so，其次 .a
+          MATMUL_LIB=$(find bazel-out/ -name "libmatmul.so" -path "*/arm64-v8a*" | head -1)
           if [ -z "$MATMUL_LIB" ]; then
-            echo "❌ Could not find libmatmul.a"
+            MATMUL_LIB=$(find bazel-out/ -name "libmatmul.a" -path "*/arm64-v8a*" | head -1)
+          fi
+          if [ -z "$MATMUL_LIB" ]; then
+            echo "❌ Could not find libmatmul.so or libmatmul.a"
             exit 1
           fi
           echo "Checking symbols in $MATMUL_LIB"
-          # 检查几个代表性的 RHS pack 符号，若缺失则报错退出
-          if ! nm "$MATMUL_LIB" | grep -q 'kai_run_rhs_pack_nxk_qsi4cxps1s0_qsu4cxs1s0_neon'; then
-            echo "❌ FATAL: Required rhs_pack symbols missing in libmatmul.a"
-            echo "Ensure that -march flag enables all needed features (dotprod,i8mm,fp16,bf16,sme2,sve2)."
-            exit 1
+          if [ "${MATMUL_LIB##*.}" = "so" ]; then
+            nm -D "$MATMUL_LIB" | grep -q 'kai_run_rhs_pack_nxk_qsi4cxps1s0_qsu4cxs1s0_neon' || {
+              echo "❌ Required symbol not found in shared library"
+              exit 1
+            }
+          else
+            nm "$MATMUL_LIB" | grep -q 'kai_run_rhs_pack_nxk_qsi4cxps1s0_qsu4cxs1s0_neon' || {
+              echo "❌ Required symbol not found in static library"
+              exit 1
+            }
           fi
-          echo "✅ Required rhs_pack symbols found in libmatmul.a"
+          echo "✅ Required rhs_pack symbols found"
 
           # 其余架构预热
           for arch in android_arm android_x86 android_x86_64; do
