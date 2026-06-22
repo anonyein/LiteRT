@@ -781,35 +781,49 @@ jobs:
           grep -A 30 'name = "libtensorflowlite_jni.so"' "$JNI_BUILD" | head -35
       # ========================================================================================
 
-      - name: Diagnostic - Check if KleidiAI is actually linked
-        continue-on-error: true
-        run: |
-          set +e
-          echo "=== Building libtensorflowlite_jni.so to inspect link command ==="
-          bazel build --config=android_arm64 \
-            --override_repository=XNNPACK=/tmp/xnnpack \
-            --override_repository=KleidiAI=/tmp/kleidiai_repo \
-            -c opt \
-            --cxxopt=--std=c++17 \
-            --subcommands=pretty_print \
-            --verbose_failures \
-            //tflite/java:libtensorflowlite_jni.so 2>&1 | tee /tmp/link.log
+      # - name: Diagnostic - Check if KleidiAI is actually linked
+      #   continue-on-error: true
+      #   run: |
+      #     set +e
+      #     echo "=== Building libtensorflowlite_jni.so to inspect link command ==="
+      #     bazel build --config=android_arm64 \
+      #       --override_repository=XNNPACK=/tmp/xnnpack \
+      #       --override_repository=KleidiAI=/tmp/kleidiai_repo \
+      #       -c opt \
+      #       --cxxopt=--std=c++17 \
+      #       --subcommands=pretty_print \
+      #       --verbose_failures \
+      #       //tflite/java:libtensorflowlite_jni.so 2>&1 | tee /tmp/link.log
 
-          echo ""
-          echo "=== Checking link log for KleidiAI libraries ==="
-          if grep -qi 'kleidiai\|libmatmul\|libcommon' /tmp/link.log; then
-            echo "✅ KleidiAI reference found in link command!"
-            grep -i 'kleidiai\|libmatmul\|libcommon' /tmp/link.log
-          else
-            echo "❌ No KleidiAI reference found in link command."
-          fi
+      #     echo ""
+      #     echo "=== Checking link log for KleidiAI libraries ==="
+      #     if grep -qi 'kleidiai\|libmatmul\|libcommon' /tmp/link.log; then
+      #       echo "✅ KleidiAI reference found in link command!"
+      #       grep -i 'kleidiai\|libmatmul\|libcommon' /tmp/link.log
+      #     else
+      #       echo "❌ No KleidiAI reference found in link command."
+      #     fi
 
-          echo ""
-          echo "=== Checking for parameter files ==="
-          find bazel-out/ -name 'libtensorflowlite_jni.so-2.params' -exec sh -c 'echo "--- {} ---"; cat "{}"' \;
+      #     echo ""
+      #     echo "=== Checking for parameter files ==="
+      #     find bazel-out/ -name 'libtensorflowlite_jni.so-2.params' -exec sh -c 'echo "--- {} ---"; cat "{}"' \;
 
       - name: Run build_android_package.sh
         run: |
+          echo "=== Verifying BUILD file patch ==="
+          if grep -q '@KleidiAI' tflite/java/BUILD; then
+            echo "✅ BUILD file contains KleidiAI"
+          else
+            echo "❌ BUILD file MISSING KleidiAI"
+            exit 1
+          fi
+
+          echo "=== Context around libtensorflowlite_jni.so target ==="
+          grep -n -B5 -A20 'name = "libtensorflowlite_jni.so"' tflite/java/BUILD
+
+          echo "=== Cleaning Bazel analysis cache to pick up BUILD changes ==="
+          bazel clean --expunge_async
+
           cd "$GITHUB_WORKSPACE"
           chmod +x ./ci/build_android_package.sh
           echo "=== Final build commands (first 5) ==="
