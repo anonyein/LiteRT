@@ -263,34 +263,23 @@ jobs:
                   deps_str = '\n    deps = [\n        ' + ',\n        '.join(deps_list) + ',\n    ],'
                   new_rule = rule_block[:last_paren] + deps_str + rule_block[last_paren:]
                   modified = True
-      
-              # 2. 如果需要强制 alwayslink，检查并添加
+
               if force_alwayslink and 'alwayslink' not in new_rule:
-                  # 在最后一个 ')' 前插入 alwayslink = 1,
-                  last_paren = new_rule.rfind(')')
-                  if last_paren != -1:
-                      # 插入到最后一个括号前，但可能在属性列表中，我们需要找到合适的位置
-                      # 简单地在最后一个属性后插入，即寻找最后一个逗号或开始括号之后
-                      # 更健壮：在最后一个 ')' 前插入 "alwayslink = 1," 
-                      # 但需要确保有逗号分隔
-                      # 我们可以放在 deps 后面
-                      if 'deps' in new_rule:
-                          # 在 deps 块后面插入
-                          deps_end = new_rule.rfind('],')
-                          if deps_end == -1:
-                              deps_end = new_rule.rfind(']')
-                          if deps_end != -1:
-                              insert_pos = deps_end + 1
-                              new_rule = new_rule[:insert_pos] + '\n    alwayslink = 1,' + new_rule[insert_pos:]
-                              modified = True
-                      else:
-                          # 没有 deps 块，直接插在最后属性前
-                          last_attr_end = new_rule.rfind(',')
-                          if last_attr_end == -1:
-                              last_attr_end = new_rule.rfind('(') + 1
-                          new_rule = new_rule[:last_attr_end] + '\n    alwayslink = 1,' + new_rule[last_attr_end:]
+                  if 'deps' in new_rule:
+                      deps_end = new_rule.rfind('],')
+                      if deps_end == -1:
+                          deps_end = new_rule.rfind(']')
+                      if deps_end != -1:
+                          insert_pos = deps_end + 1
+                          new_rule = new_rule[:insert_pos] + '\n    alwayslink = 1,' + new_rule[insert_pos:]
                           modified = True
-      
+                  else:
+                      last_attr_end = new_rule.rfind(',')
+                      if last_attr_end == -1:
+                          last_attr_end = new_rule.rfind('(') + 1
+                      new_rule = new_rule[:last_attr_end] + '\n    alwayslink = 1,' + new_rule[last_attr_end:]
+                      modified = True
+
               if modified:
                   content = content[:lib_start] + new_rule + content[end+1:]
               return content, modified
@@ -344,15 +333,13 @@ jobs:
           else:
               print("⚠️ No changes made (targets already have deps or not found)")
           PYEOF
-      
-          echo "=== Verify packing target ==="
-          grep -A 30 'name = "packing"' BUILD.bazel | head -35
-          echo "=== Verify pack_lh target ==="
-          grep -A 30 'name = "pack_lh"' BUILD.bazel | head -35
-          echo "=== Verify XNNPACK main target ==="
-          grep -A 30 'name = "XNNPACK"' BUILD.bazel | head -35
-          echo "=== Verify a prod_microkernels target (e.g., neonsme2) ==="
-          grep -A 30 'name = "neonsme2_prod_microkernels"' BUILD.bazel | head -35
+
+          echo "=== Verify packing target (full rule) ==="
+          sed -n '/^cc_library(/,/^)/p' BUILD.bazel | grep -A 50 'name = "packing"' | head -60
+          echo "=== Check alwayslink in packing ==="
+          grep -A 50 'name = "packing"' BUILD.bazel | grep alwayslink || echo "⚠️ alwayslink NOT found in packing"
+          echo "=== Check alwayslink in pack_lh ==="
+          grep -A 50 'name = "pack_lh"' BUILD.bazel | grep alwayslink || echo "⚠️ alwayslink NOT found in pack_lh"
           echo "=== MICROKERNEL_DEPS ==="
           grep -A 20 'MICROKERNEL_DEPS' BUILD.bazel | head -25
 
@@ -700,7 +687,48 @@ jobs:
             echo "❌ fixedpoint not found in rule"
             exit 1
           fi
-          
+
+      # ===================== 新增步骤：在最终 JNI 库中直接添加 KleidiAI 依赖 =====================
+      - name: Add KleidiAI deps to JNI library
+        run: |
+          OUTPUT_BASE=$(bazel info output_base)
+          JNI_BUILD="${OUTPUT_BASE}/external/org_tensorflow/tflite/java/BUILD"
+          cp "$JNI_BUILD" "$JNI_BUILD.bak"
+
+          export JNI_BUILD
+          python3 << 'PYEOF'
+          import os, re
+
+          build_file = os.environ['JNI_BUILD']
+          with open(build_file, 'r') as f:
+              content = f.read()
+
+          # 查找 libtensorflowlite_jni.so 目标
+          pattern = r'(name\s*=\s*"libtensorflowlite_jni\.so".*?deps\s*=\s*\[)([^\]]*?)(\])'
+          def add_deps(m):
+              deps_inner = m.group(2).strip()
+              needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
+              if all(dep in deps_inner for dep in needed):
+                  return m.group(0)
+              if deps_inner:
+                  if not deps_inner.endswith(','):
+                      deps_inner += ','
+              deps_inner += '\n        "@KleidiAI//:common",\n        "@KleidiAI//:matmul",'
+              return m.group(1) + deps_inner + m.group(3)
+
+          new_content, count = re.subn(pattern, add_deps, content, flags=re.DOTALL)
+          if count == 0:
+              print("⚠️ Could not find libtensorflowlite_jni.so target, skipping")
+          else:
+              with open(build_file, 'w') as f:
+                  f.write(new_content)
+              print("✅ Added KleidiAI deps to libtensorflowlite_jni.so")
+          PYEOF
+
+          echo "=== Verify JNI BUILD modification ==="
+          grep -A 25 'name = "libtensorflowlite_jni.so"' "$JNI_BUILD" | head -30
+      # ========================================================================================
+
       - name: Run build_android_package.sh
         run: |
           # 进入 Bazel 实际使用的 XNNPACK 源目录（/tmp/xnnpack）
