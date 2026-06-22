@@ -33,6 +33,43 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      # ===================== 修改点：将 KleidiAI 依赖加入 tflite_deps =====================
+      - name: Add KleidiAI deps to libtensorflowlite_jni.so (tflite_deps)
+        run: |
+          JNI_BUILD="tflite/java/BUILD"
+          if [ ! -f "$JNI_BUILD" ]; then
+            echo "❌ $JNI_BUILD not found"
+            exit 1
+          fi
+          cp "$JNI_BUILD" "$JNI_BUILD.bak"
+          python3 << 'PYEOF'
+          import re
+          file = "tflite/java/BUILD"
+          with open(file, "r") as f:
+              content = f.read()
+          # 匹配 tflite_deps 而非 deps
+          pattern = r'(name\s*=\s*"libtensorflowlite_jni\.so".*?\btflite_deps\s*=\s*\[)([^\]]*?)(\])'
+          def add_deps(m):
+              inner = m.group(2).strip()
+              needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
+              if all(d in inner for d in needed):
+                  return m.group(0)
+              if inner and not inner.endswith(','):
+                  inner += ','
+              inner += '\n        "@KleidiAI//:common",\n        "@KleidiAI//:matmul",'
+              return m.group(1) + inner + m.group(3)
+          new_content, count = re.subn(pattern, add_deps, content, flags=re.DOTALL)
+          if count == 0:
+              print("⚠️ Could not find libtensorflowlite_jni.so target")
+              exit(1)
+          with open(file, "w") as f:
+              f.write(new_content)
+          print("✅ Added KleidiAI deps to libtensorflowlite_jni.so (tflite_deps)")
+          PYEOF
+          echo "=== Verify ==="
+          grep -A 30 'name = "libtensorflowlite_jni.so"' "$JNI_BUILD" | head -35
+      # ========================================================================================
+
       # ---------- 克隆 XNNPACK ----------
       - name: Clone latest XNNPACK
         run: |
@@ -743,43 +780,6 @@ jobs:
             exit 1
           fi
       # ========================================================================================
-      
-      # ===================== 修改点：将 KleidiAI 依赖加入 tflite_deps =====================
-      - name: Add KleidiAI deps to libtensorflowlite_jni.so (tflite_deps)
-        run: |
-          JNI_BUILD="tflite/java/BUILD"
-          if [ ! -f "$JNI_BUILD" ]; then
-            echo "❌ $JNI_BUILD not found"
-            exit 1
-          fi
-          cp "$JNI_BUILD" "$JNI_BUILD.bak"
-          python3 << 'PYEOF'
-          import re
-          file = "tflite/java/BUILD"
-          with open(file, "r") as f:
-              content = f.read()
-          # 匹配 tflite_deps 而非 deps
-          pattern = r'(name\s*=\s*"libtensorflowlite_jni\.so".*?\btflite_deps\s*=\s*\[)([^\]]*?)(\])'
-          def add_deps(m):
-              inner = m.group(2).strip()
-              needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
-              if all(d in inner for d in needed):
-                  return m.group(0)
-              if inner and not inner.endswith(','):
-                  inner += ','
-              inner += '\n        "@KleidiAI//:common",\n        "@KleidiAI//:matmul",'
-              return m.group(1) + inner + m.group(3)
-          new_content, count = re.subn(pattern, add_deps, content, flags=re.DOTALL)
-          if count == 0:
-              print("⚠️ Could not find libtensorflowlite_jni.so target")
-              exit(1)
-          with open(file, "w") as f:
-              f.write(new_content)
-          print("✅ Added KleidiAI deps to libtensorflowlite_jni.so (tflite_deps)")
-          PYEOF
-          echo "=== Verify ==="
-          grep -A 30 'name = "libtensorflowlite_jni.so"' "$JNI_BUILD" | head -35
-      # ========================================================================================
 
       # - name: Diagnostic - Check if KleidiAI is actually linked
       #   continue-on-error: true
@@ -820,9 +820,6 @@ jobs:
 
           echo "=== Context around libtensorflowlite_jni.so target ==="
           grep -n -B5 -A20 'name = "libtensorflowlite_jni.so"' tflite/java/BUILD
-
-          echo "=== Cleaning Bazel analysis cache to pick up BUILD changes ==="
-          bazel clean --expunge_async
 
           cd "$GITHUB_WORKSPACE"
           chmod +x ./ci/build_android_package.sh
