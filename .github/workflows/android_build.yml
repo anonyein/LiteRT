@@ -742,7 +742,8 @@ jobs:
           fi
       # ========================================================================================
       
-      - name: Add KleidiAI deps to libtensorflowlite_jni.so
+      # ===================== 修改点：将 KleidiAI 依赖加入 tflite_deps =====================
+      - name: Add KleidiAI deps to libtensorflowlite_jni.so (tflite_deps)
         run: |
           JNI_BUILD="tflite/java/BUILD"
           if [ ! -f "$JNI_BUILD" ]; then
@@ -755,8 +756,8 @@ jobs:
           file = "tflite/java/BUILD"
           with open(file, "r") as f:
               content = f.read()
-          # 用 \b 确保只匹配 deps 而不匹配 tflite_deps
-          pattern = r'(name\s*=\s*"libtensorflowlite_jni\.so".*?\bdeps\s*=\s*\[)([^\]]*?)(\])'
+          # 匹配 tflite_deps 而非 deps
+          pattern = r'(name\s*=\s*"libtensorflowlite_jni\.so".*?\btflite_deps\s*=\s*\[)([^\]]*?)(\])'
           def add_deps(m):
               inner = m.group(2).strip()
               needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
@@ -772,10 +773,11 @@ jobs:
               exit(1)
           with open(file, "w") as f:
               f.write(new_content)
-          print("✅ Added KleidiAI deps to libtensorflowlite_jni.so")
+          print("✅ Added KleidiAI deps to libtensorflowlite_jni.so (tflite_deps)")
           PYEOF
           echo "=== Verify ==="
           grep -A 30 'name = "libtensorflowlite_jni.so"' "$JNI_BUILD" | head -35
+      # ========================================================================================
 
       - name: Run build_android_package.sh
         run: |
