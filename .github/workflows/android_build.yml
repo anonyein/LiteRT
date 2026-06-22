@@ -151,6 +151,7 @@ jobs:
               }),
               includes = ["src", "."],
               alwayslink = 1,
+              linkstatic = True,   # 强制生成静态库
               copts = select({
                   "@platforms//cpu:aarch64": [
                       "-march=armv8.2-a+dotprod+i8mm+fp16+bf16+sme2+sve2",
@@ -171,6 +172,7 @@ jobs:
               }),
               includes = ["src", "."],   # 原来只有 ["src"]，改为 ["src", "."]
               alwayslink = 1,
+              linkstatic = True,   # 强制生成静态库
               copts = select({
                   "@platforms//cpu:aarch64": [
                       "-march=armv8.2-a+dotprod+i8mm+fp16+bf16+sme2+sve2",
