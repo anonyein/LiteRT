@@ -153,14 +153,7 @@ jobs:
               alwayslink = 1,
               copts = select({
                   "@platforms//cpu:aarch64": [
-                      "-Xclang", "-target-feature", "-Xclang", "+fp16",
-                      "-Xclang", "-target-feature", "-Xclang", "+dotprod",
-                      "-Xclang", "-target-feature", "-Xclang", "+i8mm",
-                      "-Xclang", "-target-feature", "-Xclang", "+sme2",
-                      "-Xclang", "-target-feature", "-Xclang", "+sve2",
-                      "-Xclang", "-target-feature", "-Xclang", "+sme",
-                      "-Xclang", "-target-feature", "-Xclang", "+bf16",
-                      "-Wa,-march=armv8-a+sme2+fp16+dotprod",
+                      "-march=armv8.2-a+dotprod+i8mm+fp16+bf16+sme2+sve2",
                   ],
                   "//conditions:default": [],
               }),
@@ -180,15 +173,8 @@ jobs:
               alwayslink = 1,
               copts = select({
                   "@platforms//cpu:aarch64": [
-                      "-Xclang", "-target-feature", "-Xclang", "+fp16",
-                      "-Xclang", "-target-feature", "-Xclang", "+dotprod",
-                      "-Xclang", "-target-feature", "-Xclang", "+i8mm",
-                      "-Xclang", "-target-feature", "-Xclang", "+sme2",
-                      "-Xclang", "-target-feature", "-Xclang", "+sve2",
-                      "-Xclang", "-target-feature", "-Xclang", "+sme",
-                      "-Xclang", "-target-feature", "-Xclang", "+bf16",
+                      "-march=armv8.2-a+dotprod+i8mm+fp16+bf16+sme2+sve2",
                       "-fno-tree-vectorize",
-                      "-Wa,-march=armv8-a+sme2+fp16+dotprod",
                   ],
                   "//conditions:default": [],
               }),
@@ -644,8 +630,29 @@ jobs:
             || { echo "❌ XNNPACK build failed"; exit 1; }
       
           echo "✅ XNNPACK (arm64) compiled successfully with KleidiAI enabled."
-      
-          # 其余架构预热同样使用相同模式
+
+          echo "=== Building KleidiAI matmul to verify symbols ==="
+          bazel build \
+            --override_repository=XNNPACK=/tmp/xnnpack \
+            --override_repository=KleidiAI=/tmp/kleidiai_repo \
+            -c opt \
+            --config=android_arm64 \
+            @KleidiAI//:matmul
+          MATMUL_LIB=$(find bazel-out/ -name "libmatmul.a" -path "*/arm64-v8a*" | head -1)
+          if [ -z "$MATMUL_LIB" ]; then
+            echo "❌ Could not find libmatmul.a"
+            exit 1
+          fi
+          echo "Checking symbols in $MATMUL_LIB"
+          # 检查几个代表性的 RHS pack 符号，若缺失则报错退出
+          if ! nm "$MATMUL_LIB" | grep -q 'kai_run_rhs_pack_nxk_qsi4cxps1s0_qsu4cxs1s0_neon'; then
+            echo "❌ FATAL: Required rhs_pack symbols missing in libmatmul.a"
+            echo "Ensure that -march flag enables all needed features (dotprod,i8mm,fp16,bf16,sme2,sve2)."
+            exit 1
+          fi
+          echo "✅ Required rhs_pack symbols found in libmatmul.a"
+
+          # 其余架构预热
           for arch in android_arm android_x86 android_x86_64; do
             echo "Building @XNNPACK//:XNNPACK for $arch (warmup only)"
             bazel build \
