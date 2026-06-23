@@ -165,6 +165,91 @@ jobs:
           echo "✅ topology-x86.c removal completed."
       # ========================================================================================
 
+      - name: Fetch hwloc and apply fixes
+        run: |
+          # ---------- 动态解析 TensorFlow 中 hwloc 的版本信息 ----------
+          WORKSPACE_BZL="/tmp/tensorflow/third_party/xla/third_party/hwloc/workspace.bzl"
+          if [ ! -f "$WORKSPACE_BZL" ]; then
+            echo "❌ workspace.bzl not found"
+            exit 1
+          fi
+
+          # 提取原始 URL（忽略 tf_mirror_urls 的包装，直接取括号内的字符串）
+          HW_URL=$(grep -oP 'urls\s*=\s*tf_mirror_urls\s*\(\s*"\K[^"]+' "$WORKSPACE_BZL" | head -1)
+          if [ -z "$HW_URL" ]; then
+            echo "❌ Could not parse hwloc URL from workspace.bzl"
+            exit 1
+          fi
+
+          # 提取 sha256
+          HW_SHA256=$(grep -oP 'sha256\s*=\s*"\K[^"]+' "$WORKSPACE_BZL")
+          if [ -z "$HW_SHA256" ]; then
+            echo "❌ Could not parse hwloc sha256 from workspace.bzl"
+            exit 1
+          fi
+
+          # 提取 strip_prefix（若不指定则使用压缩包默认根目录）
+          HW_STRIP=$(grep -oP 'strip_prefix\s*=\s*"\K[^"]+' "$WORKSPACE_BZL" || true)
+
+          echo "✅ Extracted hwloc URL: $HW_URL"
+          echo "✅ Extracted sha256: $HW_SHA256"
+          echo "✅ Extracted strip_prefix: ${HW_STRIP:-default}"
+
+          # ---------- 下载并解压 ----------
+          wget -q "$HW_URL" -O /tmp/hwloc.tar.gz
+          # 验证 sha256（可选，非必须）
+          echo "$HW_SHA256  /tmp/hwloc.tar.gz" | sha256sum --check --status || {
+            echo "❌ sha256 mismatch, aborting"
+            exit 1
+          }
+
+          tar -xzf /tmp/hwloc.tar.gz -C /tmp/
+          # 如果指定了 strip_prefix，则重命名；否则取解压后的第一个目录
+          if [ -n "$HW_STRIP" ]; then
+            mv "/tmp/$HW_STRIP" /tmp/hwloc
+          else
+            # 默认取解压后唯一的顶层目录
+            HW_DIR=$(tar -tzf /tmp/hwloc.tar.gz | head -1 | cut -f1 -d"/")
+            mv "/tmp/$HW_DIR" /tmp/hwloc
+          fi
+
+          # ---------- 使用 TensorFlow 提供的 BUILD 模板 ----------
+          cp /tmp/tensorflow/third_party/xla/third_party/hwloc/hwloc.BUILD /tmp/hwloc/BUILD.bazel
+
+          # ---------- 以下内容与原始步骤完全一致（修补 BUILD 和 topology-linux.c）----------
+          HWLOC_DIR="/tmp/hwloc"
+          if [ -d "$HWLOC_DIR" ]; then
+            echo "Found hwloc at $HWLOC_DIR"
+            BUILD_FILE="$HWLOC_DIR/BUILD.bazel"
+            if [ -f "$BUILD_FILE" ]; then
+              cp "$BUILD_FILE" "$BUILD_FILE.bak"
+              echo "Before patching BUILD file (x86 sources):"
+              grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  No x86 source found"
+              # 删除包含 topology-x86.c 和 topology-x86_64.c 的行
+              grep -v 'topology-x86.*\.c' "$BUILD_FILE" > "$BUILD_FILE.tmp"
+              mv "$BUILD_FILE.tmp" "$BUILD_FILE"
+              # 清理可能遗留的逗号
+              sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' "$BUILD_FILE"
+              echo "After patching BUILD file:"
+              grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  Success: no x86 source remaining"
+            else
+              echo "BUILD.bazel not found, skipping"
+            fi
+
+            # 修改 topology-linux.c 强制禁用 pthread affinity 函数
+            LINUX_SRC="$HWLOC_DIR/hwloc/topology-linux.c"
+            if [ -f "$LINUX_SRC" ]; then
+              cp "$LINUX_SRC" "$LINUX_SRC.bak"
+              echo "Patching $LINUX_SRC to disable pthread affinity..."
+              sed -i '/#include "private\/autogen\/config.h"/a #undef HAVE_DECL_PTHREAD_SETAFFINITY_NP\n#define HAVE_DECL_PTHREAD_SETAFFINITY_NP 0\n#undef HAVE_DECL_PTHREAD_GETAFFINITY_NP\n#define HAVE_DECL_PTHREAD_GETAFFINITY_NP 0' "$LINUX_SRC"
+              echo "Patched topology-linux.c"
+            else
+              echo "topology-linux.c not found, skipping"
+            fi
+          else
+            echo "hwloc directory not found, skipping"
+          fi
+
       # ===================== 使用源码路径添加 fixedpoint 依赖 =====================
       - name: Add fixedpoint dep to existing deps list
         run: |
@@ -614,6 +699,7 @@ jobs:
           echo "build --override_repository=XNNPACK=/tmp/xnnpack" >> .bazelrc
           echo "build --override_repository=KleidiAI=/tmp/kleidiai_repo" >> .bazelrc
           echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
+          echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
 
       - name: Disable layering_check globally and for monolithic config
