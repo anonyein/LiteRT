@@ -831,9 +831,6 @@ jobs:
               exit 1
             fi
           fi
-          # 再次清空缓存，确保模板修改生效
-          echo "=== Purging Bazel analysis cache again after patching hwloc template ==="
-          bazel clean --expunge_async
 
       # 修复 hwloc
       - name: Fetch hwloc and apply fixes (with detailed output)
