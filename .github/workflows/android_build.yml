@@ -552,26 +552,30 @@ jobs:
             exit 1
           fi
 
-      # 修复 xla 中的 tsl.bzl：删除 if_linux_x86_64(["-msse3"]) 行
-      - name: Fetch xla and remove -msse3 flag from tsl.bzl
+      # 修复 xla 中的全部 -msse3 标志
+      - name: Fetch xla and remove all -msse3 flags from BUILD/bzl files
         run: |
           bazel fetch @xla//... || true
           OUTPUT_BASE=$(bazel info output_base)
-          TSL_BZL_PATH="${OUTPUT_BASE}/external/xla/xla/tsl/tsl.bzl"
-          if [ -f "$TSL_BZL_PATH" ]; then
-            echo "Found tsl.bzl at $TSL_BZL_PATH"
-            cp "$TSL_BZL_PATH" "$TSL_BZL_PATH.bak"
-            sed -i '/if_linux_x86_64.*-msse3/d' "$TSL_BZL_PATH"
-            echo "Patched tsl.bzl: removed -msse3 flag"
-            if grep -q -- '-msse3' "$TSL_BZL_PATH"; then
-              echo "ERROR: -msse3 flag still present in tsl.bzl!"
-              grep -n -- '-msse3' "$TSL_BZL_PATH"
+          XLA_PATH="${OUTPUT_BASE}/external/xla"
+          if [ -d "$XLA_PATH" ]; then
+            echo "Found xla at $XLA_PATH"
+            echo "=== Files containing -msse3 ==="
+            find "$XLA_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -l -- '-msse3' {} \;
+            echo "=== Context of -msse3 lines (before) ==="
+            find "$XLA_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -n -H -C3 -- '-msse3' {} \;
+            echo "=== Removing all -msse3 lines ==="
+            find "$XLA_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i '/-msse3/d' {} \;
+            echo "=== Checking for remaining -msse3 (after) ==="
+            if find "$XLA_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -q -- '-msse3' {} \; ; then
+              echo "ERROR: -msse3 flags still present!"
+              find "$XLA_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -n -H -C3 -- '-msse3' {} \;
               exit 1
             else
-              echo "-msse3 flag successfully removed from tsl.bzl."
+              echo "✅ All -msse3 flags removed successfully."
             fi
           else
-            echo "Warning: tsl.bzl not found at $TSL_BZL_PATH, xla may not be fully fetched."
+            echo "Warning: xla not found at $XLA_PATH"
           fi
 
       # 彻底删除 org_tensorflow 中所有文件里的 -msse3 标志，并打印被删除的行
