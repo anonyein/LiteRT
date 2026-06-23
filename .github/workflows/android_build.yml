@@ -525,19 +525,23 @@ jobs:
           grep -n -- '--copt' ci/build_android_package.sh || echo "No --copt flags left"
 
       # 修复 libwebp：删除其 BUILD 文件中的 -msse4.1 选项
-      - name: Fetch libwebp and remove -msse4.1 flag from its BUILD
+      - name: Fetch libwebp and remove all msse4 flags from its BUILD
         run: |
           bazel fetch @libwebp//...
           OUTPUT_BASE=$(bazel info output_base)
           WEBP_PATH="${OUTPUT_BASE}/external/libwebp"
           if [ -d "$WEBP_PATH" ]; then
             echo "Found libwebp at $WEBP_PATH"
+            echo "=== Lines containing msse4 BEFORE removal ==="
+            grep -ni 'msse4' "$WEBP_PATH/BUILD.bazel" || echo "(none found)"
             cp "$WEBP_PATH/BUILD.bazel" "$WEBP_PATH/BUILD.bazel.bak"
-            sed -i '/"-msse4\.1"/d' "$WEBP_PATH/BUILD.bazel"
-            echo "Patched libwebp BUILD: removed -msse4.1"
-            if grep -q -- '-msse4' "$WEBP_PATH/BUILD.bazel"; then
+            # 彻底删除所有包含 msse4 的行（不区分大小写）
+            sed -i '/msse4/Id' "$WEBP_PATH/BUILD.bazel"
+            echo "Patched libwebp BUILD: removed all msse4 flags"
+            echo "=== Checking for remaining msse4 ==="
+            if grep -qi msse4 "$WEBP_PATH/BUILD.bazel"; then
               echo "ERROR: SSE flags still present!"
-              grep -n -- '-msse4' "$WEBP_PATH/BUILD.bazel"
+              grep -ni msse4 "$WEBP_PATH/BUILD.bazel"
               exit 1
             else
               echo "SSE flags successfully removed."
