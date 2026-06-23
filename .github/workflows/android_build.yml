@@ -533,17 +533,23 @@ jobs:
           if [ -d "$WEBP_PATH" ]; then
             echo "Found libwebp at $WEBP_PATH"
             echo "=== Files containing msse4 or WEBP_HAVE_SSE41 before ==="
-            find "$WEBP_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -l -E 'msse4|WEBP_HAVE_SSE41' {} \;
-            echo "=== Context of matching lines before ==="
-            find "$WEBP_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -n -H -C3 -E 'msse4|WEBP_HAVE_SSE41' {} \;
-            find "$WEBP_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i '/msse4\|WEBP_HAVE_SSE41/Id' {} \;
-            echo "=== Verifying removal ==="
-            if find "$WEBP_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -qiE 'msse4|WEBP_HAVE_SSE41' {} \; ; then
-              echo "ERROR: msse4/WEBP_HAVE_SSE41 still present!"
-              find "$WEBP_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -n -H -C3 -E 'msse4|WEBP_HAVE_SSE41' {} \;
-              exit 1
+            find "$WEBP_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -l -E 'msse4|WEBP_HAVE_SSE41' {} \; | tee /tmp/libwebp_sse_files.txt
+            if [ -s /tmp/libwebp_sse_files.txt ]; then
+              echo "=== Context of matching lines before ==="
+              xargs -a /tmp/libwebp_sse_files.txt grep -n -H -C3 -E 'msse4|WEBP_HAVE_SSE41'
+              echo "=== Removing matching lines ==="
+              xargs -a /tmp/libwebp_sse_files.txt sed -i '/msse4\|WEBP_HAVE_SSE41/Id'
+              echo "=== Verifying removal ==="
+              remaining=$(xargs -a /tmp/libwebp_sse_files.txt grep -l -E 'msse4|WEBP_HAVE_SSE41' || true)
+              if [ -n "$remaining" ]; then
+                echo "ERROR: msse4/WEBP_HAVE_SSE41 still present in:"
+                echo "$remaining"
+                exit 1
+              else
+                echo "✅ All msse4/WEBP_HAVE_SSE41 removed from libwebp."
+              fi
             else
-              echo "✅ All msse4/WEBP_HAVE_SSE41 removed from libwebp."
+              echo "✅ No msse4/WEBP_HAVE_SSE41 found in libwebp."
             fi
           else
             echo "libwebp not found at $WEBP_PATH"
