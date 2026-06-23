@@ -33,6 +33,141 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      # ==================== 新增：克隆 TensorFlow 源码 ====================
+      - name: Clone TensorFlow source
+        run: |
+          git clone --depth 1 https://github.com/tensorflow/tensorflow.git /tmp/tensorflow
+          echo "✅ TensorFlow cloned to /tmp/tensorflow"
+      # ====================================================================
+
+
+      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 / -msse4.1 / -msse4.2 / -DWEBP_HAVE_SSE41，并精确对比修改前后相同行（含上下文）
+      - name: Remove all SSE options from org_tensorflow with before/after context
+        run: |
+          TF_DIR="/tmp/tensorflow"
+          if [ -d "$TF_DIR" ]; then
+            echo "Scanning $TF_DIR for files containing -msse3, -msse4.1, -msse4.2, -DWEBP_HAVE_SSE41..."
+            # 1. 修改前：显示匹配行及上下文（前后各3行）
+            echo "=== BEFORE: Lines containing SSE options (with context) ==="
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.bak" \
+              -exec grep -n -H -C3 -E '\-msse3|\-msse4\.1|\-msse4\.2|\-DWEBP_HAVE_SSE41' {} \; || echo "(none found)"
+
+            # 2. 记录所有匹配文件的匹配行号（用于修改后打印）
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.bak" \
+              -exec grep -n -H -E '\-msse3|\-msse4\.1|\-msse4\.2|\-DWEBP_HAVE_SSE41' {} \; > /tmp/sse_lines_before.txt
+
+            if [ -s /tmp/sse_lines_before.txt ]; then
+              # 3. 执行修改：.tpl 文件只移除字符串，其他文件整行删除
+              grep '\.tpl:' /tmp/sse_lines_before.txt | cut -d: -f1 | sort -u | while read file; do
+                [ -f "$file" ] && sed -i -e 's/-msse3//g' -e 's/-msse4\.1//g' -e 's/-msse4\.2//g' -e 's/-DWEBP_HAVE_SSE41//g' "$file"
+              done
+              grep -v '\.tpl:' /tmp/sse_lines_before.txt | cut -d: -f1 | sort -u | while read file; do
+                [ -f "$file" ] && sed -i '/-msse3\|-msse4\.1\|-msse4\.2\|-DWEBP_HAVE_SSE41/d' "$file"
+              done
+
+              # 4. 修改后：对于之前匹配的每一行，打印当前内容（带上下文标记）
+              echo "=== AFTER: The same lines after modification ==="
+              while IFS=: read file line rest; do
+                if [ -f "$file" ]; then
+                  new_line=$(sed -n "${line}p" "$file" 2>/dev/null)
+                  if [ -z "$new_line" ]; then
+                    echo "$file:$line: [LINE DELETED]"
+                  else
+                    echo "$file:$line: $new_line"
+                    if [[ "$file" == *.tpl ]]; then
+                      echo "   (context after removal)"
+                      sed -n "$((line-3)),$((line+3))p" "$file" | sed 's/^/   /'
+                    fi
+                  fi
+                else
+                  echo "$file:$line: [FILE MISSING]"
+                fi
+              done < /tmp/sse_lines_before.txt
+              echo "✅ All SSE options (-msse3, -msse4.1, -msse4.2, -DWEBP_HAVE_SSE41) removed successfully."
+            else
+              echo "✅ No SSE options found in org_tensorflow."
+            fi
+          else
+            echo "TensorFlow directory not found, skipping"
+          fi
+
+      # 处理 ZenDNN 和 MKL 相关文件：删除有问题的源文件，并替换 mkl_util.h 为空文件
+      - name: Handle MKL and ZenDNN files
+        run: |
+          TF_DIR="/tmp/tensorflow"
+          # 删除 ZenDNN 相关文件
+          rm -vf "$TF_DIR/tensorflow/core/common_runtime/eager/zen_eager_op_rewrite.cc"
+          rm -vf "$TF_DIR/tensorflow/core/graph/zen_graph_util.h"
+          # 删除 MKL 源文件
+          rm -vf "$TF_DIR/tensorflow/core/common_runtime/eager/mkl_eager_op_rewrite.cc"
+          # 删除原 mkl_util.h 并创建空文件（使用 printf 避免 EOF 缩进问题）
+          MKL_UTIL_H="$TF_DIR/tensorflow/core/util/mkl_util.h"
+          rm -vf "$MKL_UTIL_H"
+          mkdir -p "$(dirname "$MKL_UTIL_H")"
+          printf '%s\n' "#ifndef TENSORFLOW_CORE_UTIL_MKL_UTIL_H_" \
+                       "#define TENSORFLOW_CORE_UTIL_MKL_UTIL_H_" \
+                       "// Empty file for Android build to satisfy dependencies." \
+                       "#endif" > "$MKL_UTIL_H"
+          echo "Created empty $MKL_UTIL_H"
+
+      # 修复 hash BUILD 因 copts 行被删可能缺 copts 属性
+      - name: Fix hash BUILD copts if missing
+        run: |
+          HASH_BUILD="/tmp/tensorflow/third_party/xla/xla/tsl/lib/hash/BUILD"
+          if [ -f "$HASH_BUILD" ]; then
+            if ! grep -q 'copts\s*=' "$HASH_BUILD"; then
+              sed -i '/hdrs\s*=\s*\[/a\    copts = tsl_copts(),' "$HASH_BUILD"
+              echo "Patched hash BUILD to add missing copts"
+            fi
+          fi
+
+      # ===================== 使用源码路径添加 fixedpoint 依赖 =====================
+      - name: Add fixedpoint dep to existing deps list
+        run: |
+          BUILD_FILE="/tmp/tensorflow/tensorflow/core/BUILD"
+          cp "$BUILD_FILE" "$BUILD_FILE.bak"
+
+          export BUILD_FILE
+          python3 << 'PYEOF'
+          import os, re
+
+          build_file = os.environ['BUILD_FILE']
+          with open(build_file, 'r') as f:
+              content = f.read()
+
+          # 在 portable_tensorflow_lib_lite 规则的 deps = [ 之后立即插入依赖项
+          pattern = r'(name\s*=\s*"portable_tensorflow_lib_lite".*?deps\s*=\s*\[)'
+          replacement = r'\1\n        "@xla//xla/tsl/framework/fixedpoint",'
+          new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
+
+          if count == 0:
+              raise Exception("Could not find deps list for portable_tensorflow_lib_lite")
+
+          with open(build_file, 'w') as f:
+              f.write(new_content)
+          print("✅ Added fixedpoint dep to existing deps")
+          PYEOF
+
+          echo "=== Full patched BUILD file ==="
+          cat "$BUILD_FILE"
+
+          echo "=== Verification ==="
+          # 检查规则范围内只出现一次 deps 定义
+          RULE_BLOCK=$(grep -A 40 'name = "portable_tensorflow_lib_lite"' "$BUILD_FILE")
+          DEPS_COUNT=$(echo "$RULE_BLOCK" | grep -c '^\s*deps\s*=' || true)
+          if [ "$DEPS_COUNT" -ne 1 ]; then
+            echo "❌ Found $DEPS_COUNT deps definitions (expected 1)"
+            exit 1
+          fi
+
+          if echo "$RULE_BLOCK" | grep -q 'fixedpoint'; then
+            echo "✅ Dependency inserted and verified"
+          else
+            echo "❌ fixedpoint not found in rule"
+            exit 1
+          fi
+      # ========================================================================================
+
       # ===================== 修改点：将 KleidiAI 依赖加入 tflite_deps =====================
       - name: Add KleidiAI deps to libtensorflowlite_jni.so (tflite_deps)
         run: |
@@ -434,6 +569,7 @@ jobs:
           # 将覆盖仓库写入 .bazelrc，确保所有构建自动应用
           echo "build --override_repository=XNNPACK=/tmp/xnnpack" >> .bazelrc
           echo "build --override_repository=KleidiAI=/tmp/kleidiai_repo" >> .bazelrc
+          echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
 
       - name: Disable layering_check globally and for monolithic config
@@ -549,77 +685,6 @@ jobs:
           bazel clean --expunge_async
           echo "✅ Cache purged. All subsequent bazel commands will re-analyze everything."
 
-
-      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 / -msse4.1 / -msse4.2 / -DWEBP_HAVE_SSE41，并精确对比修改前后相同行（含上下文）
-      - name: Remove all SSE options from org_tensorflow with before/after context
-        run: |
-          OUTPUT_BASE=$(bazel info output_base)
-          TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
-          if [ -d "$TF_DIR" ]; then
-            echo "Scanning $TF_DIR for files containing -msse3, -msse4.1, -msse4.2, -DWEBP_HAVE_SSE41..."
-            # 1. 修改前：显示匹配行及上下文（前后各3行）
-            echo "=== BEFORE: Lines containing SSE options (with context) ==="
-            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.bak" \
-              -exec grep -n -H -C3 -E '\-msse3|\-msse4\.1|\-msse4\.2|\-DWEBP_HAVE_SSE41' {} \; || echo "(none found)"
-
-            # 2. 记录所有匹配文件的匹配行号（用于修改后打印）
-            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.bak" \
-              -exec grep -n -H -E '\-msse3|\-msse4\.1|\-msse4\.2|\-DWEBP_HAVE_SSE41' {} \; > /tmp/sse_lines_before.txt
-
-            if [ -s /tmp/sse_lines_before.txt ]; then
-              # 3. 执行修改：.tpl 文件只移除字符串，其他文件整行删除
-              grep '\.tpl:' /tmp/sse_lines_before.txt | cut -d: -f1 | sort -u | while read file; do
-                [ -f "$file" ] && sed -i -e 's/-msse3//g' -e 's/-msse4\.1//g' -e 's/-msse4\.2//g' -e 's/-DWEBP_HAVE_SSE41//g' "$file"
-              done
-              grep -v '\.tpl:' /tmp/sse_lines_before.txt | cut -d: -f1 | sort -u | while read file; do
-                [ -f "$file" ] && sed -i '/-msse3\|-msse4\.1\|-msse4\.2\|-DWEBP_HAVE_SSE41/d' "$file"
-              done
-
-              # 4. 修改后：对于之前匹配的每一行，打印当前内容（带上下文标记）
-              echo "=== AFTER: The same lines after modification ==="
-              while IFS=: read file line rest; do
-                if [ -f "$file" ]; then
-                  new_line=$(sed -n "${line}p" "$file" 2>/dev/null)
-                  if [ -z "$new_line" ]; then
-                    echo "$file:$line: [LINE DELETED]"
-                  else
-                    echo "$file:$line: $new_line"
-                    if [[ "$file" == *.tpl ]]; then
-                      echo "   (context after removal)"
-                      sed -n "$((line-3)),$((line+3))p" "$file" | sed 's/^/   /'
-                    fi
-                  fi
-                else
-                  echo "$file:$line: [FILE MISSING]"
-                fi
-              done < /tmp/sse_lines_before.txt
-              echo "✅ All SSE options (-msse3, -msse4.1, -msse4.2, -DWEBP_HAVE_SSE41) removed successfully."
-            else
-              echo "✅ No SSE options found in org_tensorflow."
-            fi
-          else
-            echo "TensorFlow directory not found, skipping"
-          fi
-
-      # 处理 ZenDNN 和 MKL 相关文件：删除有问题的源文件，并替换 mkl_util.h 为空文件
-      - name: Handle MKL and ZenDNN files
-        run: |
-          OUTPUT_BASE=$(bazel info output_base)
-          TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
-          # 删除 ZenDNN 相关文件
-          rm -vf "$TF_DIR/tensorflow/core/common_runtime/eager/zen_eager_op_rewrite.cc"
-          rm -vf "$TF_DIR/tensorflow/core/graph/zen_graph_util.h"
-          # 删除 MKL 源文件
-          rm -vf "$TF_DIR/tensorflow/core/common_runtime/eager/mkl_eager_op_rewrite.cc"
-          # 删除原 mkl_util.h 并创建空文件（使用 printf 避免 EOF 缩进问题）
-          MKL_UTIL_H="$TF_DIR/tensorflow/core/util/mkl_util.h"
-          rm -vf "$MKL_UTIL_H"
-          mkdir -p "$(dirname "$MKL_UTIL_H")"
-          printf '%s\n' "#ifndef TENSORFLOW_CORE_UTIL_MKL_UTIL_H_" \
-                       "#define TENSORFLOW_CORE_UTIL_MKL_UTIL_H_" \
-                       "// Empty file for Android build to satisfy dependencies." \
-                       "#endif" > "$MKL_UTIL_H"
-          echo "Created empty $MKL_UTIL_H"
 
       # ======================= 以下步骤涉及 bazel fetch / info / build，保持原顺序 =======================
       # 修复 libwebp：删除其 BUILD 文件中的 -msse4.1 选项
@@ -764,17 +829,6 @@ jobs:
             echo "External directory not found, skipping"
           fi
 
-      # 修复 hash BUILD 因 copts 行被删可能缺 copts 属性
-      - name: Fix hash BUILD copts if missing
-        run: |
-          OUTPUT_BASE=$(bazel info output_base)
-          HASH_BUILD="${OUTPUT_BASE}/external/org_tensorflow/third_party/xla/xla/tsl/lib/hash/BUILD"
-          if [ -f "$HASH_BUILD" ]; then
-            if ! grep -q 'copts\s*=' "$HASH_BUILD"; then
-              sed -i '/hdrs\s*=\s*\[/a\    copts = tsl_copts(),' "$HASH_BUILD"
-              echo "Patched hash BUILD to add missing copts"
-            fi
-          fi
 
       # ===================== 新增：提前修补 hwloc BUILD 模板（带前后对比） =====================
       - name: Patch hwloc BUILD template in xla (with before/after context)
@@ -875,53 +929,6 @@ jobs:
             echo "hwloc directory not found, skipping"
           fi
 
-      # ===================== 移动至此：确保 fixedpoint 修改在预热之前 =====================
-      - name: Add fixedpoint dep to existing deps list and print BUILD
-        run: |
-          OUTPUT_BASE=$(bazel info output_base)
-          BUILD_FILE="${OUTPUT_BASE}/external/org_tensorflow/tensorflow/core/BUILD"
-          cp "$BUILD_FILE" "$BUILD_FILE.bak"
-
-          export BUILD_FILE
-          python3 << 'PYEOF'
-          import os, re
-
-          build_file = os.environ['BUILD_FILE']
-          with open(build_file, 'r') as f:
-              content = f.read()
-
-          # 在 portable_tensorflow_lib_lite 规则的 deps = [ 之后立即插入依赖项
-          pattern = r'(name\s*=\s*"portable_tensorflow_lib_lite".*?deps\s*=\s*\[)'
-          replacement = r'\1\n        "@xla//xla/tsl/framework/fixedpoint",'
-          new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
-
-          if count == 0:
-              raise Exception("Could not find deps list for portable_tensorflow_lib_lite")
-
-          with open(build_file, 'w') as f:
-              f.write(new_content)
-          print("✅ Added fixedpoint dep to existing deps")
-          PYEOF
-
-          echo "=== Full patched BUILD file ==="
-          cat "$BUILD_FILE"
-
-          echo "=== Verification ==="
-          # 检查规则范围内只出现一次 deps 定义
-          RULE_BLOCK=$(grep -A 40 'name = "portable_tensorflow_lib_lite"' "$BUILD_FILE")
-          DEPS_COUNT=$(echo "$RULE_BLOCK" | grep -c '^\s*deps\s*=' || true)
-          if [ "$DEPS_COUNT" -ne 1 ]; then
-            echo "❌ Found $DEPS_COUNT deps definitions (expected 1)"
-            exit 1
-          fi
-
-          if echo "$RULE_BLOCK" | grep -q 'fixedpoint'; then
-            echo "✅ Dependency inserted and verified"
-          else
-            echo "❌ fixedpoint not found in rule"
-            exit 1
-          fi
-      # ========================================================================================
 
       # ======================= 预热 XNNPACK（完全匹配最终打包参数） =======================
       - name: Pre-build XNNPACK for arm64 (compile check)
