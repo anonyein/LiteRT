@@ -215,7 +215,8 @@ jobs:
 
           # ---------- 使用 TensorFlow 提供的 BUILD 模板 ----------
           cp /tmp/tensorflow/third_party/xla/third_party/hwloc/hwloc.BUILD /tmp/hwloc/BUILD.bazel
-
+          touch /tmp/hwloc/WORKSPACE          # <-- 新增这一行
+          
           # ---------- 以下内容与原始步骤完全一致（修补 BUILD 和 topology-linux.c）----------
           HWLOC_DIR="/tmp/hwloc"
           if [ -d "$HWLOC_DIR" ]; then
