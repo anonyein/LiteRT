@@ -197,7 +197,6 @@ jobs:
               }),
               includes = ["src", "."],
               alwayslink = 1,
-              linkstatic = True,
               copts = select({
                   ":is_android_arm64": [
                       "-march=armv8.2-a+dotprod+i8mm+fp16+bf16+sme2+sve2",
@@ -218,7 +217,6 @@ jobs:
               }),
               includes = ["src", "."],
               alwayslink = 1,
-              linkstatic = True,
               copts = select({
                   ":is_android_arm64": [
                       "-march=armv8.2-a+dotprod+i8mm+fp16+bf16+sme2+sve2",
