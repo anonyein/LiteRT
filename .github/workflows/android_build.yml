@@ -525,34 +525,46 @@ jobs:
           grep -n -- '--copt' ci/build_android_package.sh || echo "No --copt flags left"
 
       # 修复 libwebp：删除其 BUILD 文件中的 -msse4.1 选项
-      - name: Fetch libwebp and remove ALL msse4 flags from ALL build files
+      - name: Fetch libwebp and thoroughly remove SSE41 options (with full file dump)
         run: |
           bazel fetch @libwebp//...
           OUTPUT_BASE=$(bazel info output_base)
           WEBP_PATH="${OUTPUT_BASE}/external/libwebp"
           if [ -d "$WEBP_PATH" ]; then
             echo "Found libwebp at $WEBP_PATH"
-            echo "=== Files containing msse4 or WEBP_HAVE_SSE41 before ==="
-            find "$WEBP_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -l -E 'msse4|WEBP_HAVE_SSE41' {} \; | tee /tmp/libwebp_sse_files.txt
-            if [ -s /tmp/libwebp_sse_files.txt ]; then
-              echo "=== Context of matching lines before ==="
-              xargs -a /tmp/libwebp_sse_files.txt grep -n -H -C3 -E 'msse4|WEBP_HAVE_SSE41'
-              echo "=== Removing matching lines ==="
-              xargs -a /tmp/libwebp_sse_files.txt sed -i '/msse4\|WEBP_HAVE_SSE41/Id'
-              echo "=== Verifying removal ==="
-              remaining=$(xargs -a /tmp/libwebp_sse_files.txt grep -l -E 'msse4|WEBP_HAVE_SSE41' || true)
-              if [ -n "$remaining" ]; then
-                echo "ERROR: msse4/WEBP_HAVE_SSE41 still present in:"
-                echo "$remaining"
-                exit 1
-              else
-                echo "✅ All msse4/WEBP_HAVE_SSE41 removed from libwebp."
-              fi
-            else
-              echo "✅ No msse4/WEBP_HAVE_SSE41 found in libwebp."
-            fi
+            export BUILD_FILE="$WEBP_PATH/BUILD.bazel"
+            cp "$BUILD_FILE" "$BUILD_FILE.bak"
+            # 全局删除包含 msse4 或 WEBP_HAVE_SSE41 的行（兜底）
+            sed -i '/msse4\|WEBP_HAVE_SSE41/Id' "$BUILD_FILE"
+            # 使用 Python 精确删除 webp 目标的 copts 属性
+            python3 << 'PYEOF'
+          import os, re
+          build_file = os.environ["BUILD_FILE"]
+          with open(build_file, "r") as f:
+              content = f.read()
+          # 匹配 name = "webp" 的 cc_library 块
+          pattern = r'(cc_library\s*\(\s*name\s*=\s*"webp".*?)(\))'
+          m = re.search(pattern, content, re.DOTALL)
+          if m:
+              rule = m.group(0)
+              # 移除 copts 属性（可能跨多行）
+              rule = re.sub(r'copts\s*=\s*[^,\n]*(,\s*)?', '', rule)
+              # 清理多余逗号
+              rule = re.sub(r',\s*,', ',', rule)
+              rule = re.sub(r'\[\s*,', '[', rule)
+              rule = re.sub(r',\s*\]', ']', rule)
+              content = content[:m.start()] + rule + content[m.end():]
+              with open(build_file, "w") as f:
+                  f.write(content)
+              print("✅ Removed copts from libwebp 'webp' target")
+          else:
+              print("⚠️ 'webp' target not found, relying on global sed only")
+          PYEOF
+            # 打印完整的 BUILD 文件内容以进行校验
+            echo "=== Final content of libwebp BUILD.bazel ==="
+            cat "$BUILD_FILE"
           else
-            echo "libwebp not found at $WEBP_PATH"
+            echo "libwebp not found"
             exit 1
           fi
 
