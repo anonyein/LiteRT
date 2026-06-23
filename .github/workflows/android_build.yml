@@ -552,24 +552,31 @@ jobs:
             exit 1
           fi
 
-      # 修复 xla 中的全部 -msse3 标志
-      - name: Fetch xla and remove all -msse3 flags from BUILD/bzl files
+      # 修复 xla 中所有文件里的 -msse3 标志（全面清理，并打印上下文）
+      - name: Fetch xla and remove all -msse3 flags from all files
         run: |
+          # fetch 可能因缺少 rc_number 等仓库而失败，但 xla 目录通常已存在
           bazel fetch @xla//... || true
           OUTPUT_BASE=$(bazel info output_base)
           XLA_PATH="${OUTPUT_BASE}/external/xla"
           if [ -d "$XLA_PATH" ]; then
             echo "Found xla at $XLA_PATH"
-            echo "=== Files containing -msse3 ==="
-            find "$XLA_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -l -- '-msse3' {} \;
+            echo "=== Files containing -msse3 (before) ==="
+            # 查找所有文件（排除二进制），列出包含 -msse3 的文件名
+            find "$XLA_PATH" -type f \( -name "*.o" -o -name "*.a" -o -name "*.so" -o -name "*.pyc" \) -prune -o -type f -exec grep -l -- '-msse3' {} \;
             echo "=== Context of -msse3 lines (before) ==="
-            find "$XLA_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -n -H -C3 -- '-msse3' {} \;
+            # 打印匹配行及其上下文（前后各3行）
+            find "$XLA_PATH" -type f \( -name "*.o" -o -name "*.a" -o -name "*.so" -o -name "*.pyc" \) -prune -o -type f -exec grep -n -H -C3 -- '-msse3' {} \;
             echo "=== Removing all -msse3 lines ==="
-            find "$XLA_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i '/-msse3/d' {} \;
+            # 删除所有包含 -msse3 的行
+            find "$XLA_PATH" -type f \( -name "*.o" -o -name "*.a" -o -name "*.so" -o -name "*.pyc" \) -prune -o -type f -exec sed -i '/-msse3/d' {} \;
             echo "=== Checking for remaining -msse3 (after) ==="
-            if find "$XLA_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -q -- '-msse3' {} \; ; then
-              echo "ERROR: -msse3 flags still present!"
-              find "$XLA_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -n -H -C3 -- '-msse3' {} \;
+            # 收集残留文件列表（避免 grep -q 在 if 中误报）
+            remaining=$(find "$XLA_PATH" -type f \( -name "*.o" -o -name "*.a" -o -name "*.so" -o -name "*.pyc" \) -prune -o -type f -exec grep -l -- '-msse3' {} \;)
+            if [ -n "$remaining" ]; then
+              echo "ERROR: -msse3 still present in:"
+              echo "$remaining"
+              find "$XLA_PATH" -type f \( -name "*.o" -o -name "*.a" -o -name "*.so" -o -name "*.pyc" \) -prune -o -type f -exec grep -n -H -C3 -- '-msse3' {} \;
               exit 1
             else
               echo "✅ All -msse3 flags removed successfully."
