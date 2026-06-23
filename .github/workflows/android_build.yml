@@ -120,6 +120,50 @@ jobs:
               echo "Patched hash BUILD to add missing copts"
             fi
           fi
+      
+      # ===================== 单独处理：删除 hwloc.BUILD 中的 topology-x86.c =====================
+      - name: Remove topology-x86.c from hwloc BUILD template (with before/after comparison)
+        run: |
+          HWBUILD="/tmp/tensorflow/third_party/xla/third_party/hwloc/hwloc.BUILD"
+          if [ ! -f "$HWBUILD" ]; then
+            echo "❌ $HWBUILD not found, skipping"
+            exit 0
+          fi
+
+          echo "=== BEFORE: lines containing topology-x86.c / topology-x86_64.c ==="
+          grep -n -H 'topology-x86\(_64\)\{0,1\}\.c' "$HWBUILD" | tee /tmp/hwloc_x86_lines_before.txt
+          if [ ! -s /tmp/hwloc_x86_lines_before.txt ]; then
+            echo "✅ No topology-x86 lines found, nothing to do."
+            exit 0
+          fi
+
+          # 备份
+          cp "$HWBUILD" "$HWBUILD.bak"
+
+          # 删除所有包含 topology-x86.c 或 topology-x86_64.c 的行
+          sed -i '/topology-x86\(_64\)\{0,1\}\.c/d' "$HWBUILD"
+
+          # 清理可能出现的语法问题（空列表、多余逗号等）
+          sed -i 's/\[\s*\]/[]/g' "$HWBUILD"
+          sed -i 's/,\s*,/,/g' "$HWBUILD"
+          sed -i 's/\[\s*,/[/g' "$HWBUILD"
+          sed -i 's/,\s*\]/]/g' "$HWBUILD"
+
+          echo "=== AFTER: the same lines (original line numbers) ==="
+          while IFS=: read file line rest; do
+            if [ -f "$file" ]; then
+              new_line=$(sed -n "${line}p" "$file" 2>/dev/null)
+              if [ -z "$new_line" ]; then
+                echo "$file:$line: [LINE DELETED]"
+              else
+                echo "$file:$line: $new_line"
+              fi
+            else
+              echo "$file:$line: [FILE MISSING]"
+            fi
+          done < /tmp/hwloc_x86_lines_before.txt
+          echo "✅ topology-x86.c removal completed."
+      # ========================================================================================
 
       # ===================== 使用源码路径添加 fixedpoint 依赖 =====================
       - name: Add fixedpoint dep to existing deps list
