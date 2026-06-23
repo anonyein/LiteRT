@@ -542,6 +542,13 @@ jobs:
         with:
           bazel-version: 7.0.0
 
+      # ===================== 新增：提前清空分析缓存，确保后续所有操作使用干净缓存 =====================
+      - name: Purge Bazel analysis cache before any fetch/build
+        run: |
+          echo "=== Purging Bazel analysis cache to ensure all BUILD/bzl/tpl changes are picked up ==="
+          bazel clean --expunge_async
+          echo "✅ Cache purged. All subsequent bazel commands will re-analyze everything."
+
       # ======================= 以下步骤涉及 bazel fetch / info / build，保持原顺序 =======================
       # 修复 libwebp：删除其 BUILD 文件中的 -msse4.1 选项
       - name: Fetch libwebp and thoroughly remove SSE41 options (with full file dump)
@@ -639,24 +646,30 @@ jobs:
             echo "Warning: xla not found at $XLA_PATH"
           fi
 
-      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 标志，并打印被删除的行
-      - name: Remove all -msse3 flags from TensorFlow source tree
+      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 标志，并打印删除前后的上下文
+      - name: Remove all -msse3 flags from TensorFlow source tree (with context)
         run: |
           OUTPUT_BASE=$(bazel info output_base)
           TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
           if [ -d "$TF_DIR" ]; then
             echo "Scanning $TF_DIR for files containing -msse3..."
-            # 先列出所有包含 -msse3 的行
-            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" -exec grep -Hn -- '-msse3' {} \; | while IFS=: read file line_num line_content; do
-              echo "Found in $file:$line_num: $line_content"
+            # 打印所有包含 -msse3 的行及其上下文（前后各 3 行）
+            echo "=== Context of -msse3 lines BEFORE removal ==="
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" -exec grep -n -H -C3 -- '-msse3' {} \; || echo "(none found)"
+            # 对 .tpl 文件：只删除 -msse3 字符串，保留行其余内容
+            find "$TF_DIR" -type f -name "*.tpl" -exec grep -l -- '-msse3' {} \; | while read file; do
+              echo "Patching (tpl) $file"
+              cp "$file" "$file.bak"
+              sed -i 's/-msse3//g' "$file"
             done
-            # 然后执行删除操作
-            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" -exec grep -l -- '-msse3' {} \; | while read file; do
+            # 对其他文件：删除包含 -msse3 的整行
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.tpl" -exec grep -l -- '-msse3' {} \; | while read file; do
               echo "Patching $file"
               cp "$file" "$file.bak"
               sed -i '/-msse3/d' "$file"
             done
-            echo "Patching completed."
+            echo "=== Context of -msse3 lines AFTER removal ==="
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" -exec grep -n -H -C3 -- '-msse3' {} \; || echo "✅ All -msse3 flags removed successfully."
           else
             echo "TensorFlow directory not found, skipping"
           fi
