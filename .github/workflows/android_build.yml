@@ -687,13 +687,13 @@ jobs:
             -c opt \
             --config=android_arm64 \
             @KleidiAI//:matmul
-          # 查找库文件：优先 .a，其次 .lo，最后 .so
+          # 查找库文件：优先 .a，其次 .so，最后 .lo
           MATMUL_LIB=$(find bazel-out/ -name "libmatmul.a" -path "*/arm64-v8a*" | head -1)
           if [ -z "$MATMUL_LIB" ]; then
-            MATMUL_LIB=$(find bazel-out/ -name "libmatmul.lo" -path "*/arm64-v8a*" | head -1)
+            MATMUL_LIB=$(find bazel-out/ -name "libmatmul.so" -path "*/arm64-v8a*" | head -1)
           fi
           if [ -z "$MATMUL_LIB" ]; then
-            MATMUL_LIB=$(find bazel-out/ -name "libmatmul.so" -path "*/arm64-v8a*" | head -1)
+            MATMUL_LIB=$(find bazel-out/ -name "libmatmul.lo" -path "*/arm64-v8a*" | head -1)
           fi
           if [ -z "$MATMUL_LIB" ]; then
             echo "⚠️  Could not find libmatmul (a/lo/so), skipping symbol check"
