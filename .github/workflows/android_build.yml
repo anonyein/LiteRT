@@ -525,27 +525,27 @@ jobs:
           grep -n -- '--copt' ci/build_android_package.sh || echo "No --copt flags left"
 
       # 修复 libwebp：删除其 BUILD 文件中的 -msse4.1 选项
-      - name: Fetch libwebp and remove all msse4 flags from its BUILD
+      - name: Fetch libwebp and remove all SSE41 options and macros from its BUILD
         run: |
           bazel fetch @libwebp//...
           OUTPUT_BASE=$(bazel info output_base)
           WEBP_PATH="${OUTPUT_BASE}/external/libwebp"
           if [ -d "$WEBP_PATH" ]; then
             echo "Found libwebp at $WEBP_PATH"
-            echo "=== Lines with msse4 and context BEFORE removal ==="
-            grep -ni -C3 'msse4' "$WEBP_PATH/BUILD.bazel" || echo "(none found)"
+            echo "=== Lines with msse4 or WEBP_HAVE_SSE41 BEFORE removal ==="
+            grep -ni -E 'msse4|WEBP_HAVE_SSE41' "$WEBP_PATH/BUILD.bazel" || echo "(none found)"
             cp "$WEBP_PATH/BUILD.bazel" "$WEBP_PATH/BUILD.bazel.bak"
-            # 删除所有包含 msse4 的行（不区分大小写）
-            sed -i '/msse4/Id' "$WEBP_PATH/BUILD.bazel"
-            echo "Patched libwebp BUILD: removed all msse4 flags"
-            echo "=== Lines with msse4 and context AFTER removal ==="
-            grep -ni -C3 'msse4' "$WEBP_PATH/BUILD.bazel" || echo "✅ No msse4 lines remain"
-            if grep -qi msse4 "$WEBP_PATH/BUILD.bazel"; then
-              echo "ERROR: SSE flags still present!"
-              grep -ni -C3 'msse4' "$WEBP_PATH/BUILD.bazel"
+            # 删除所有包含 msse4 或 WEBP_HAVE_SSE41 的行（不区分大小写）
+            sed -i '/msse4\|WEBP_HAVE_SSE41/Id' "$WEBP_PATH/BUILD.bazel"
+            echo "Patched libwebp BUILD: removed all SSE41 flags and macros"
+            echo "=== Lines with msse4 or WEBP_HAVE_SSE41 AFTER removal ==="
+            grep -ni -E 'msse4|WEBP_HAVE_SSE41' "$WEBP_PATH/BUILD.bazel" || echo "✅ All SSE41 options/macros removed"
+            if grep -qi -E 'msse4|WEBP_HAVE_SSE41' "$WEBP_PATH/BUILD.bazel"; then
+              echo "ERROR: SSE41 flags still present!"
+              grep -ni -E 'msse4|WEBP_HAVE_SSE41' "$WEBP_PATH/BUILD.bazel"
               exit 1
             else
-              echo "SSE flags successfully removed."
+              echo "SSE41 flags and macros successfully removed."
             fi
           else
             echo "Error: libwebp not found at $WEBP_PATH"
