@@ -627,6 +627,38 @@ jobs:
                        "#endif" > "$MKL_UTIL_H"
           echo "Created empty $MKL_UTIL_H"
 
+      # ===================== 新增最终清理步骤 =====================
+      - name: Final cleanup of SSE options in all external repos (except XNNPACK/KleidiAI)
+        run: |
+          OUTPUT_BASE=$(bazel info output_base)
+          EXT_DIR="${OUTPUT_BASE}/external"
+          if [ -d "$EXT_DIR" ]; then
+            echo "Scanning all external repos for SSE options (msse, WEBP_HAVE_SSE41)..."
+            # 排除 XNNPACK 和 KleidiAI 仓库
+            find "$EXT_DIR" -type d \( -name "XNNPACK" -o -name "KleidiAI" -o -name "kleidiai_repo" \) -prune -o \
+              -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) \
+              -exec grep -l -E 'msse|WEBP_HAVE_SSE41' {} \; | tee /tmp/sse_files.txt
+            if [ -s /tmp/sse_files.txt ]; then
+              echo "=== Context of matching lines BEFORE removal ==="
+              xargs -a /tmp/sse_files.txt grep -n -H -C3 -E 'msse|WEBP_HAVE_SSE41'
+              echo "=== Removing matching lines ==="
+              xargs -a /tmp/sse_files.txt sed -i '/msse\|WEBP_HAVE_SSE41/Id'
+              echo "=== Verifying removal ==="
+              remaining=$(xargs -a /tmp/sse_files.txt grep -l -E 'msse|WEBP_HAVE_SSE41' || true)
+              if [ -n "$remaining" ]; then
+                echo "ERROR: SSE options still present in:"
+                echo "$remaining"
+                exit 1
+              else
+                echo "✅ All SSE options removed from listed files."
+              fi
+            else
+              echo "✅ No SSE options found in external repos (except XNNPACK/KleidiAI)."
+            fi
+          else
+            echo "External directory not found, skipping"
+          fi
+
       # 修复 hwloc
       - name: Fetch hwloc and apply fixes
         run: |
