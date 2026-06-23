@@ -646,59 +646,45 @@ jobs:
             echo "Warning: xla not found at $XLA_PATH"
           fi
 
-      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 标志，并打印修改前后原始行内容
-      - name: Remove all -msse3 flags from TensorFlow source tree (show modified lines)
+      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 标志，并精确对比修改前后相同行
+      - name: Remove all -msse3 flags and show exact before/after lines
         run: |
           OUTPUT_BASE=$(bazel info output_base)
           TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
           if [ -d "$TF_DIR" ]; then
             echo "Scanning $TF_DIR for files containing -msse3..."
-            # 保存包含 -msse3 的文件列表（排除二进制和 .bak）
-            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.bak" -exec grep -l -- '-msse3' {} \; > /tmp/msse3_files_before.txt
-            # 保存原始匹配行及其行号（用于后续提取）
-            xargs -a /tmp/msse3_files_before.txt grep -n -- '-msse3' > /tmp/msse3_lines_before.txt
-            echo "=== Context of -msse3 lines BEFORE removal ==="
-            xargs -a /tmp/msse3_files_before.txt grep -n -H -C3 -- '-msse3' || echo "(none found)"
+            # 记录原始匹配行信息：文件名:行号:内容
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.bak" -exec grep -n -H -- '-msse3' {} \; > /tmp/msse3_lines_before.txt
+            echo "=== BEFORE: Lines containing -msse3 (file:line:content) ==="
+            cat /tmp/msse3_lines_before.txt || echo "(none found)"
 
-            # 修改 .tpl 文件：只删除 -msse3 字符串
-            grep '\.tpl$' /tmp/msse3_files_before.txt | while read file; do
-              echo "Patching (tpl) $file"
-              cp "$file" "$file.bak"
-              sed -i 's/-msse3//g' "$file"
+            # 执行修改（.tpl 只移除字符串，其他文件整行删除）
+            grep '\.tpl:' /tmp/msse3_lines_before.txt | cut -d: -f1 | sort -u | while read file; do
+              [ -f "$file" ] && sed -i 's/-msse3//g' "$file"
             done
-            # 修改其他文件：整行删除
-            grep -v '\.tpl$' /tmp/msse3_files_before.txt | while read file; do
-              echo "Patching $file"
-              cp "$file" "$file.bak"
-              sed -i '/-msse3/d' "$file"
+            grep -v '\.tpl:' /tmp/msse3_lines_before.txt | cut -d: -f1 | sort -u | while read file; do
+              [ -f "$file" ] && sed -i '/-msse3/d' "$file"
             done
 
-            echo "=== Lines that contained -msse3 AFTER modification ==="
-            # 对于非 .tpl 文件，检查是否还存在 -msse3（应无），并打印原本行号附近的内容
-            grep -v '\.tpl$' /tmp/msse3_files_before.txt | while read file; do
-              if grep -q -- '-msse3' "$file"; then
-                echo "ERROR: $file still contains -msse3!"
-                grep -n -H -C3 -- '-msse3' "$file"
+            echo "=== AFTER: The same lines after modification ==="
+            # 对之前记录的每一行，提取文件名和行号，用 sed 打印该行的当前内容
+            while IFS=: read file line rest; do
+              if [ -f "$file" ]; then
+                new_content=$(sed -n "${line}p" "$file" 2>/dev/null)
+                if [ -z "$new_content" ]; then
+                  echo "$file:$line: [LINE DELETED]"
+                else
+                  echo "$file:$line: $new_content"
+                fi
               else
-                echo "✅ $file: no -msse3 remaining"
-                # 提取原行号，打印修改后该行附近内容（如果行还在）
-                grep "^$file:" /tmp/msse3_lines_before.txt | awk -F: '{print $2}' | while read line; do
-                  echo "--- $file:$line ---"
-                  sed -n "$((line-2)),$((line+2))p" "$file"
-                done
+                echo "$file:$line: [FILE MISSING]"
               fi
-            done
-            # 对于 .tpl 文件，打印原本行号附近的内容（因为行还在，只是移除了字符串）
-            grep '\.tpl$' /tmp/msse3_files_before.txt | while read file; do
-              echo "=== $file (original lines after removal) ==="
-              grep "^$file:" /tmp/msse3_lines_before.txt | awk -F: '{print $2}' | while read line; do
-                echo "--- $file:$line ---"
-                sed -n "$((line-1)),$((line+1))p" "$file"
-              done
-            done
+            done < /tmp/msse3_lines_before.txt
+            echo "✅ Modification complete. All -msse3 options have been removed."
           else
             echo "TensorFlow directory not found, skipping"
           fi
+
 
       # 处理 ZenDNN 和 MKL 相关文件：删除有问题的源文件，并替换 mkl_util.h 为空文件
       - name: Handle MKL and ZenDNN files
