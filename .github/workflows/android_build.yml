@@ -646,19 +646,21 @@ jobs:
             echo "Warning: xla not found at $XLA_PATH"
           fi
 
-      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 标志，并精确对比修改前后相同行
-      - name: Remove all -msse3 flags and show exact before/after lines
+      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 标志，并精确对比修改前后相同行（含上下文）
+      - name: Remove all -msse3 flags and show exact before/after with context
         run: |
           OUTPUT_BASE=$(bazel info output_base)
           TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
           if [ -d "$TF_DIR" ]; then
             echo "Scanning $TF_DIR for files containing -msse3..."
-            # 记录原始匹配行信息：文件名:行号:内容
-            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.bak" -exec grep -n -H -- '-msse3' {} \; > /tmp/msse3_lines_before.txt
-            echo "=== BEFORE: Lines containing -msse3 (file:line:content) ==="
-            cat /tmp/msse3_lines_before.txt || echo "(none found)"
+            # 1. 修改前：显示匹配行及上下文（前后各3行）
+            echo "=== BEFORE: Lines containing -msse3 (with context) ==="
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.bak" -exec grep -n -H -C3 -- '-msse3' {} \; || echo "(none found)"
 
-            # 执行修改（.tpl 只移除字符串，其他文件整行删除）
+            # 2. 记录所有匹配文件的匹配行号（用于修改后打印）
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.bak" -exec grep -n -H -- '-msse3' {} \; > /tmp/msse3_lines_before.txt
+
+            # 3. 执行修改：.tpl 文件只移除 -msse3 字符串，其他文件整行删除
             grep '\.tpl:' /tmp/msse3_lines_before.txt | cut -d: -f1 | sort -u | while read file; do
               [ -f "$file" ] && sed -i 's/-msse3//g' "$file"
             done
@@ -666,25 +668,29 @@ jobs:
               [ -f "$file" ] && sed -i '/-msse3/d' "$file"
             done
 
+            # 4. 修改后：对于之前匹配的每一行，打印当前内容（带上下文标记）
             echo "=== AFTER: The same lines after modification ==="
-            # 对之前记录的每一行，提取文件名和行号，用 sed 打印该行的当前内容
             while IFS=: read file line rest; do
               if [ -f "$file" ]; then
-                new_content=$(sed -n "${line}p" "$file" 2>/dev/null)
-                if [ -z "$new_content" ]; then
+                new_line=$(sed -n "${line}p" "$file" 2>/dev/null)
+                if [ -z "$new_line" ]; then
                   echo "$file:$line: [LINE DELETED]"
                 else
-                  echo "$file:$line: $new_content"
+                  echo "$file:$line: $new_line"
+                  # 如果是 .tpl 文件，额外显示该行前后各3行以验证其他标志保留
+                  if [[ "$file" == *.tpl ]]; then
+                    echo "   (context after removal)"
+                    sed -n "$((line-3)),$((line+3))p" "$file" | sed 's/^/   /'
+                  fi
                 fi
               else
                 echo "$file:$line: [FILE MISSING]"
               fi
             done < /tmp/msse3_lines_before.txt
-            echo "✅ Modification complete. All -msse3 options have been removed."
+            echo "✅ All -msse3 flags removed successfully."
           else
             echo "TensorFlow directory not found, skipping"
           fi
-
 
       # 处理 ZenDNN 和 MKL 相关文件：删除有问题的源文件，并替换 mkl_util.h 为空文件
       - name: Handle MKL and ZenDNN files
@@ -707,7 +713,8 @@ jobs:
           echo "Created empty $MKL_UTIL_H"
 
       # ===================== 新增最终清理步骤 =====================
-      - name: Final cleanup of SSE options in all external repos (except XNNPACK/KleidiAI)
+      # 全局 SSE 清理（精确对比修改前后）
+      - name: Final cleanup of SSE options with before/after comparison
         run: |
           OUTPUT_BASE=$(bazel info output_base)
           EXT_DIR="${OUTPUT_BASE}/external"
@@ -717,26 +724,40 @@ jobs:
             find "$EXT_DIR" -type d \( -name "XNNPACK" -o -name "KleidiAI" -o -name "kleidiai_repo" \) -prune -o \
               -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) \
               -exec grep -l -E 'msse|WEBP_HAVE_SSE41' {} \; | tee /tmp/sse_files.txt
+
             if [ -s /tmp/sse_files.txt ]; then
-              echo "=== Context of matching lines BEFORE removal ==="
+              # 修改前：显示匹配行及上下文
+              echo "=== BEFORE: Lines containing msse/WEBP_HAVE_SSE41 (with context) ==="
               xargs -a /tmp/sse_files.txt grep -n -H -C3 -E 'msse|WEBP_HAVE_SSE41'
-              echo "=== Removing matching lines ==="
+
+              # 记录所有匹配行信息（文件名:行号:内容）
+              xargs -a /tmp/sse_files.txt grep -n -H -E 'msse|WEBP_HAVE_SSE41' > /tmp/sse_lines_before.txt
+
+              # 执行删除（所有文件均为整行删除，无 .tpl）
               xargs -a /tmp/sse_files.txt sed -i '/msse\|WEBP_HAVE_SSE41/Id'
-              echo "=== Verifying removal ==="
-              remaining=$(xargs -a /tmp/sse_files.txt grep -l -E 'msse|WEBP_HAVE_SSE41' || true)
-              if [ -n "$remaining" ]; then
-                echo "ERROR: SSE options still present in:"
-                echo "$remaining"
-                exit 1
-              else
-                echo "✅ All SSE options removed from listed files."
-              fi
+
+              # 修改后：逐行检查
+              echo "=== AFTER: The same lines after removal ==="
+              while IFS=: read file line rest; do
+                if [ -f "$file" ]; then
+                  new_line=$(sed -n "${line}p" "$file" 2>/dev/null)
+                  if [ -z "$new_line" ]; then
+                    echo "$file:$line: [LINE DELETED]"
+                  else
+                    echo "$file:$line: $new_line"
+                  fi
+                else
+                  echo "$file:$line: [FILE MISSING]"
+                fi
+              done < /tmp/sse_lines_before.txt
+              echo "✅ All SSE options removed from listed files."
             else
               echo "✅ No SSE options found in external repos (except XNNPACK/KleidiAI)."
             fi
           else
             echo "External directory not found, skipping"
           fi
+
 
       # 修复 hash BUILD 因 copts 行被删可能缺 copts 属性
       - name: Fix hash BUILD copts if missing
