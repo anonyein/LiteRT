@@ -865,6 +865,13 @@ jobs:
             exit 1
           fi
       # ========================================================================================
+      
+      # ===================== 新增：提前清空分析缓存，确保后续所有操作使用干净缓存 =====================
+      - name: Purge Bazel analysis cache before any fetch/build
+        run: |
+          echo "=== Purging Bazel analysis cache to ensure all BUILD/bzl/tpl changes are picked up ==="
+          bazel clean --expunge_async
+          echo "✅ Cache purged. All subsequent bazel commands will re-analyze everything."
 
       # ======================= 预热 XNNPACK（完全匹配最终打包参数） =======================
       - name: Pre-build XNNPACK for arm64 (compile check)
