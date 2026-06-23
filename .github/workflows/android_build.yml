@@ -646,48 +646,53 @@ jobs:
             echo "Warning: xla not found at $XLA_PATH"
           fi
 
-      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 标志，并精确对比修改前后相同行（含上下文）
-      - name: Remove all -msse3 flags and show exact before/after with context
+      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 / -msse4.1 / -msse4.2 / -DWEBP_HAVE_SSE41，并精确对比修改前后相同行（含上下文）
+      - name: Remove all SSE options from org_tensorflow with before/after context
         run: |
           OUTPUT_BASE=$(bazel info output_base)
           TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
           if [ -d "$TF_DIR" ]; then
-            echo "Scanning $TF_DIR for files containing -msse3..."
+            echo "Scanning $TF_DIR for files containing -msse3, -msse4.1, -msse4.2, -DWEBP_HAVE_SSE41..."
             # 1. 修改前：显示匹配行及上下文（前后各3行）
-            echo "=== BEFORE: Lines containing -msse3 (with context) ==="
-            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.bak" -exec grep -n -H -C3 -- '-msse3' {} \; || echo "(none found)"
+            echo "=== BEFORE: Lines containing SSE options (with context) ==="
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.bak" \
+              -exec grep -n -H -C3 -E '\-msse3|\-msse4\.1|\-msse4\.2|\-DWEBP_HAVE_SSE41' {} \; || echo "(none found)"
 
             # 2. 记录所有匹配文件的匹配行号（用于修改后打印）
-            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.bak" -exec grep -n -H -- '-msse3' {} \; > /tmp/msse3_lines_before.txt
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.bak" \
+              -exec grep -n -H -E '\-msse3|\-msse4\.1|\-msse4\.2|\-DWEBP_HAVE_SSE41' {} \; > /tmp/sse_lines_before.txt
 
-            # 3. 执行修改：.tpl 文件只移除 -msse3 字符串，其他文件整行删除
-            grep '\.tpl:' /tmp/msse3_lines_before.txt | cut -d: -f1 | sort -u | while read file; do
-              [ -f "$file" ] && sed -i 's/-msse3//g' "$file"
-            done
-            grep -v '\.tpl:' /tmp/msse3_lines_before.txt | cut -d: -f1 | sort -u | while read file; do
-              [ -f "$file" ] && sed -i '/-msse3/d' "$file"
-            done
+            if [ -s /tmp/sse_lines_before.txt ]; then
+              # 3. 执行修改：.tpl 文件只移除字符串，其他文件整行删除
+              grep '\.tpl:' /tmp/sse_lines_before.txt | cut -d: -f1 | sort -u | while read file; do
+                [ -f "$file" ] && sed -i -e 's/-msse3//g' -e 's/-msse4\.1//g' -e 's/-msse4\.2//g' -e 's/-DWEBP_HAVE_SSE41//g' "$file"
+              done
+              grep -v '\.tpl:' /tmp/sse_lines_before.txt | cut -d: -f1 | sort -u | while read file; do
+                [ -f "$file" ] && sed -i '/-msse3\|-msse4\.1\|-msse4\.2\|-DWEBP_HAVE_SSE41/d' "$file"
+              done
 
-            # 4. 修改后：对于之前匹配的每一行，打印当前内容（带上下文标记）
-            echo "=== AFTER: The same lines after modification ==="
-            while IFS=: read file line rest; do
-              if [ -f "$file" ]; then
-                new_line=$(sed -n "${line}p" "$file" 2>/dev/null)
-                if [ -z "$new_line" ]; then
-                  echo "$file:$line: [LINE DELETED]"
-                else
-                  echo "$file:$line: $new_line"
-                  # 如果是 .tpl 文件，额外显示该行前后各3行以验证其他标志保留
-                  if [[ "$file" == *.tpl ]]; then
-                    echo "   (context after removal)"
-                    sed -n "$((line-3)),$((line+3))p" "$file" | sed 's/^/   /'
+              # 4. 修改后：对于之前匹配的每一行，打印当前内容（带上下文标记）
+              echo "=== AFTER: The same lines after modification ==="
+              while IFS=: read file line rest; do
+                if [ -f "$file" ]; then
+                  new_line=$(sed -n "${line}p" "$file" 2>/dev/null)
+                  if [ -z "$new_line" ]; then
+                    echo "$file:$line: [LINE DELETED]"
+                  else
+                    echo "$file:$line: $new_line"
+                    if [[ "$file" == *.tpl ]]; then
+                      echo "   (context after removal)"
+                      sed -n "$((line-3)),$((line+3))p" "$file" | sed 's/^/   /'
+                    fi
                   fi
+                else
+                  echo "$file:$line: [FILE MISSING]"
                 fi
-              else
-                echo "$file:$line: [FILE MISSING]"
-              fi
-            done < /tmp/msse3_lines_before.txt
-            echo "✅ All -msse3 flags removed successfully."
+              done < /tmp/sse_lines_before.txt
+              echo "✅ All SSE options (-msse3, -msse4.1, -msse4.2, -DWEBP_HAVE_SSE41) removed successfully."
+            else
+              echo "✅ No SSE options found in org_tensorflow."
+            fi
           else
             echo "TensorFlow directory not found, skipping"
           fi
