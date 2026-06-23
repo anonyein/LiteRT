@@ -400,12 +400,7 @@ jobs:
           echo "✅ Injected XNNPACK, KleidiAI overrides and static link flags"
           grep -n 'bazel build' ci/build_android_package.sh | head -5
 
-      # ---------- 环境配置与构建 ----------
-      - name: Setup Bazel
-        uses: bazel-contrib/setup-bazel@0.9.0
-        with:
-          bazel-version: 7.0.0
-
+      # ---------- 环境配置与构建（不涉及 bazel 命令的部分提前） ----------
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -431,6 +426,7 @@ jobs:
           echo "ANDROID_SDK_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
 
+      # 以下修改 .bazelrc、配置等均不涉及 bazel 命令，提前至此
       - name: Configure .bazelrc for NDK and overrides   # <-- 修改：在此统一配置 NDK 和仓库覆盖
         run: |
           echo "build --repo_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
@@ -524,6 +520,29 @@ jobs:
           echo "Patched script after removing SSE flags:"
           grep -n -- '--copt' ci/build_android_package.sh || echo "No --copt flags left"
 
+      # 以下两个 sed 修改（强制禁用 layering_check 和启用 XLA）不涉及 bazel，提前至此
+      # select-tf-ops 禁用 layering_check
+      - name: Force disable layering_check for select-tf-ops build
+        run: |
+          sed -i '/\/\/tflite\/java:tensorflow-lite-select-tf-ops/ s/$/ --features=-layering_check/' ci/build_android_package.sh
+          echo "✅ Appended --features=-layering_check to select-tf-ops build line"
+
+      # ======================= 强制启用 XLA 支持 =======================
+      - name: Enable XLA support for Android
+        run: |
+          echo "=== Enabling XLA for Android builds ==="
+          sed -i 's/--define=with_xla_support=false/--define=with_xla_support=true/' .bazelrc
+          echo "=== Modified .bazelrc (android config line) ==="
+          grep -n 'with_xla_support' .bazelrc || echo "No with_xla_support lines found"
+      # ================================================================
+
+      # ---------- 至此，所有不涉及 bazel 命令的修改文件步骤已完成，接下来安装 bazel ----------
+      - name: Setup Bazel
+        uses: bazel-contrib/setup-bazel@0.9.0
+        with:
+          bazel-version: 7.0.0
+
+      # ======================= 以下步骤涉及 bazel fetch / info / build，保持原顺序 =======================
       # 修复 libwebp：删除其 BUILD 文件中的 -msse4.1 选项
       - name: Fetch libwebp and thoroughly remove SSE41 options (with full file dump)
         run: |
@@ -568,8 +587,8 @@ jobs:
             exit 1
           fi
 
-      # 修复 xla 中所有文件里的 -msse3 标志（全面清理，并打印上下文）
-      - name: Fetch xla and remove all -msse3 flags from all files
+      # 修复 xla 中所有文件里的 -msse3 标志，并直接修补 stats_calculator_portable 目标
+      - name: Fetch xla and remove -msse3 (patch stats_calculator_portable directly)
         run: |
           # fetch 可能因缺少 rc_number 等仓库而失败，但 xla 目录通常已存在
           bazel fetch @xla//... || true
@@ -577,25 +596,44 @@ jobs:
           XLA_PATH="${OUTPUT_BASE}/external/xla"
           if [ -d "$XLA_PATH" ]; then
             echo "Found xla at $XLA_PATH"
-            echo "=== Files containing -msse3 (before) ==="
-            # 查找所有文件（排除二进制），列出包含 -msse3 的文件名
-            find "$XLA_PATH" -type f \( -name "*.o" -o -name "*.a" -o -name "*.so" -o -name "*.pyc" \) -prune -o -type f -exec grep -l -- '-msse3' {} \;
-            echo "=== Context of -msse3 lines (before) ==="
-            # 打印匹配行及其上下文（前后各3行）
-            find "$XLA_PATH" -type f \( -name "*.o" -o -name "*.a" -o -name "*.so" -o -name "*.pyc" \) -prune -o -type f -exec grep -n -H -C3 -- '-msse3' {} \;
-            echo "=== Removing all -msse3 lines ==="
-            # 删除所有包含 -msse3 的行
-            find "$XLA_PATH" -type f \( -name "*.o" -o -name "*.a" -o -name "*.so" -o -name "*.pyc" \) -prune -o -type f -exec sed -i '/-msse3/d' {} \;
-            echo "=== Checking for remaining -msse3 (after) ==="
-            # 收集残留文件列表（避免 grep -q 在 if 中误报）
-            remaining=$(find "$XLA_PATH" -type f \( -name "*.o" -o -name "*.a" -o -name "*.so" -o -name "*.pyc" \) -prune -o -type f -exec grep -l -- '-msse3' {} \;)
-            if [ -n "$remaining" ]; then
-              echo "ERROR: -msse3 still present in:"
-              echo "$remaining"
-              find "$XLA_PATH" -type f \( -name "*.o" -o -name "*.a" -o -name "*.so" -o -name "*.pyc" \) -prune -o -type f -exec grep -n -H -C3 -- '-msse3' {} \;
-              exit 1
+
+            # 1. 修补 tsl.bzl（保留原有修补）
+            TSL_BZL_PATH="$XLA_PATH/xla/tsl/tsl.bzl"
+            if [ -f "$TSL_BZL_PATH" ]; then
+              cp "$TSL_BZL_PATH" "$TSL_BZL_PATH.bak"
+              sed -i '/if_linux_x86_64.*-msse3/d' "$TSL_BZL_PATH"
+              if grep -q -- '-msse3' "$TSL_BZL_PATH"; then
+                echo "ERROR: -msse3 still in tsl.bzl"
+                exit 1
+              fi
+              echo "✅ tsl.bzl patched"
+            fi
+
+            # 2. 直接修补 stats_calculator_portable 所在的 BUILD 文件
+            STATS_BUILD="$XLA_PATH/xla/tsl/util/BUILD"
+            if [ -f "$STATS_BUILD" ]; then
+              echo "=== BEFORE: stats_calculator_portable target ==="
+              grep -n -B5 -A25 'name = "stats_calculator_portable"' "$STATS_BUILD"
+              cp "$STATS_BUILD" "$STATS_BUILD.bak"
+              # 删除所有包含 -msse3 的行
+              sed -i '/-msse3/d' "$STATS_BUILD"
+              # 如果 copts 变成空列表，删除该行
+              sed -i '/copts\s*=\s*\[\s*\]/d' "$STATS_BUILD"
+              echo "=== AFTER: stats_calculator_portable target ==="
+              grep -n -B5 -A25 'name = "stats_calculator_portable"' "$STATS_BUILD"
+              echo "✅ stats_calculator_portable patched"
             else
-              echo "✅ All -msse3 flags removed successfully."
+              echo "stats_calculator_portable BUILD not found at $STATS_BUILD"
+            fi
+
+            # 3. 全局清理所有剩余 -msse3（兜底）
+            echo "=== Global cleanup of remaining -msse3 ==="
+            find "$XLA_PATH" -type f \( -name "*.o" -o -name "*.a" -o -name "*.so" -o -name "*.pyc" \) -prune -o -type f -exec grep -l -- '-msse3' {} \; | tee /tmp/xla_sse3_files.txt
+            if [ -s /tmp/xla_sse3_files.txt ]; then
+              xargs -a /tmp/xla_sse3_files.txt sed -i '/-msse3/d'
+              echo "✅ Cleaned extra files"
+            else
+              echo "✅ No remaining -msse3"
             fi
           else
             echo "Warning: xla not found at $XLA_PATH"
@@ -729,20 +767,53 @@ jobs:
             echo "hwloc directory not found, skipping"
           fi
 
-      # select-tf-ops 禁用 layering_check
-      - name: Force disable layering_check for select-tf-ops build
+      # ===================== 移动至此：确保 fixedpoint 修改在预热之前 =====================
+      - name: Add fixedpoint dep to existing deps list and print BUILD
         run: |
-          sed -i '/\/\/tflite\/java:tensorflow-lite-select-tf-ops/ s/$/ --features=-layering_check/' ci/build_android_package.sh
-          echo "✅ Appended --features=-layering_check to select-tf-ops build line"
+          OUTPUT_BASE=$(bazel info output_base)
+          BUILD_FILE="${OUTPUT_BASE}/external/org_tensorflow/tensorflow/core/BUILD"
+          cp "$BUILD_FILE" "$BUILD_FILE.bak"
 
-      # ======================= 强制启用 XLA 支持 =======================
-      - name: Enable XLA support for Android
-        run: |
-          echo "=== Enabling XLA for Android builds ==="
-          sed -i 's/--define=with_xla_support=false/--define=with_xla_support=true/' .bazelrc
-          echo "=== Modified .bazelrc (android config line) ==="
-          grep -n 'with_xla_support' .bazelrc || echo "No with_xla_support lines found"
-      # ================================================================
+          export BUILD_FILE
+          python3 << 'PYEOF'
+          import os, re
+
+          build_file = os.environ['BUILD_FILE']
+          with open(build_file, 'r') as f:
+              content = f.read()
+
+          # 在 portable_tensorflow_lib_lite 规则的 deps = [ 之后立即插入依赖项
+          pattern = r'(name\s*=\s*"portable_tensorflow_lib_lite".*?deps\s*=\s*\[)'
+          replacement = r'\1\n        "@xla//xla/tsl/framework/fixedpoint",'
+          new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
+
+          if count == 0:
+              raise Exception("Could not find deps list for portable_tensorflow_lib_lite")
+
+          with open(build_file, 'w') as f:
+              f.write(new_content)
+          print("✅ Added fixedpoint dep to existing deps")
+          PYEOF
+
+          echo "=== Full patched BUILD file ==="
+          cat "$BUILD_FILE"
+
+          echo "=== Verification ==="
+          # 检查规则范围内只出现一次 deps 定义
+          RULE_BLOCK=$(grep -A 40 'name = "portable_tensorflow_lib_lite"' "$BUILD_FILE")
+          DEPS_COUNT=$(echo "$RULE_BLOCK" | grep -c '^\s*deps\s*=' || true)
+          if [ "$DEPS_COUNT" -ne 1 ]; then
+            echo "❌ Found $DEPS_COUNT deps definitions (expected 1)"
+            exit 1
+          fi
+
+          if echo "$RULE_BLOCK" | grep -q 'fixedpoint'; then
+            echo "✅ Dependency inserted and verified"
+          else
+            echo "❌ fixedpoint not found in rule"
+            exit 1
+          fi
+      # ========================================================================================
 
       # ======================= 预热 XNNPACK（完全匹配最终打包参数） =======================
       - name: Pre-build XNNPACK for arm64 (compile check)
@@ -827,53 +898,6 @@ jobs:
               @XNNPACK//:XNNPACK \
               || echo "Prebuild for $arch completed with warnings (cache partial)"
           done
-      # ========================================================================================
-
-      - name: Add fixedpoint dep to existing deps list and print BUILD
-        run: |
-          OUTPUT_BASE=$(bazel info output_base)
-          BUILD_FILE="${OUTPUT_BASE}/external/org_tensorflow/tensorflow/core/BUILD"
-          cp "$BUILD_FILE" "$BUILD_FILE.bak"
-
-          export BUILD_FILE
-          python3 << 'PYEOF'
-          import os, re
-
-          build_file = os.environ['BUILD_FILE']
-          with open(build_file, 'r') as f:
-              content = f.read()
-
-          # 在 portable_tensorflow_lib_lite 规则的 deps = [ 之后立即插入依赖项
-          pattern = r'(name\s*=\s*"portable_tensorflow_lib_lite".*?deps\s*=\s*\[)'
-          replacement = r'\1\n        "@xla//xla/tsl/framework/fixedpoint",'
-          new_content, count = re.subn(pattern, replacement, content, flags=re.DOTALL)
-
-          if count == 0:
-              raise Exception("Could not find deps list for portable_tensorflow_lib_lite")
-
-          with open(build_file, 'w') as f:
-              f.write(new_content)
-          print("✅ Added fixedpoint dep to existing deps")
-          PYEOF
-
-          echo "=== Full patched BUILD file ==="
-          cat "$BUILD_FILE"
-
-          echo "=== Verification ==="
-          # 检查规则范围内只出现一次 deps 定义
-          RULE_BLOCK=$(grep -A 40 'name = "portable_tensorflow_lib_lite"' "$BUILD_FILE")
-          DEPS_COUNT=$(echo "$RULE_BLOCK" | grep -c '^\s*deps\s*=' || true)
-          if [ "$DEPS_COUNT" -ne 1 ]; then
-            echo "❌ Found $DEPS_COUNT deps definitions (expected 1)"
-            exit 1
-          fi
-
-          if echo "$RULE_BLOCK" | grep -q 'fixedpoint'; then
-            echo "✅ Dependency inserted and verified"
-          else
-            echo "❌ fixedpoint not found in rule"
-            exit 1
-          fi
       # ========================================================================================
 
       # - name: Diagnostic - Check if KleidiAI is actually linked
