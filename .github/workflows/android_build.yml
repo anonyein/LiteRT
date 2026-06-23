@@ -646,33 +646,42 @@ jobs:
             echo "Warning: xla not found at $XLA_PATH"
           fi
 
-      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 标志，并打印删除前后的上下文
-      - name: Remove all -msse3 flags from TensorFlow source tree (with context)
+      # 彻底删除 org_tensorflow 中所有文件里的 -msse3 标志，并打印删除前后的上下文（忽略 .bak 文件）
+      - name: Remove all -msse3 flags from TensorFlow source tree (show modified lines)
         run: |
           OUTPUT_BASE=$(bazel info output_base)
           TF_DIR="${OUTPUT_BASE}/external/org_tensorflow"
           if [ -d "$TF_DIR" ]; then
             echo "Scanning $TF_DIR for files containing -msse3..."
-            # 打印所有包含 -msse3 的行及其上下文（前后各 3 行）
+            # 保存包含 -msse3 的原始文件列表（排除二进制和 .bak）
+            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.bak" -exec grep -l -- '-msse3' {} \; > /tmp/msse3_files_before.txt
             echo "=== Context of -msse3 lines BEFORE removal ==="
-            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" -exec grep -n -H -C3 -- '-msse3' {} \; || echo "(none found)"
-            # 对 .tpl 文件：只删除 -msse3 字符串，保留行其余内容
-            find "$TF_DIR" -type f -name "*.tpl" -exec grep -l -- '-msse3' {} \; | while read file; do
+            xargs -a /tmp/msse3_files_before.txt grep -n -H -C3 -- '-msse3' || echo "(none found)"
+
+            # 修改 .tpl 文件：只删除 -msse3 字符串
+            grep '\.tpl$' /tmp/msse3_files_before.txt | while read file; do
               echo "Patching (tpl) $file"
               cp "$file" "$file.bak"
               sed -i 's/-msse3//g' "$file"
             done
-            # 对其他文件：删除包含 -msse3 的整行
-            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" ! -name "*.tpl" -exec grep -l -- '-msse3' {} \; | while read file; do
+            # 修改其他文件：整行删除
+            grep -v '\.tpl$' /tmp/msse3_files_before.txt | while read file; do
               echo "Patching $file"
               cp "$file" "$file.bak"
               sed -i '/-msse3/d' "$file"
             done
-            echo "=== Context of -msse3 lines AFTER removal ==="
-            find "$TF_DIR" -type f ! -name "*.o" ! -name "*.a" ! -name "*.so" ! -name "*.pyc" -exec grep -n -H -C3 -- '-msse3' {} \; || echo "✅ All -msse3 flags removed successfully."
+
+            echo "=== Lines that contained -msse3 AFTER modification (showing current content) ==="
+            # 对非 .tpl 文件检查残留（应无输出），对 .tpl 文件显示修改后行
+            grep -v '\.tpl$' /tmp/msse3_files_before.txt | xargs grep -n -H -- '-msse3' 2>/dev/null && echo "WARNING: Some files still contain -msse3" || echo "✅ No -msse3 lines remain in non-tpl files."
+            grep '\.tpl$' /tmp/msse3_files_before.txt | while read file; do
+              echo "=== $file (relevant lines after removal) ==="
+              grep -n -C3 'msse3' "$file" || true  # 显示包含 msse3 的行（此时应无 -msse3，但行还在）
+            done
           else
             echo "TensorFlow directory not found, skipping"
           fi
+
 
       # 处理 ZenDNN 和 MKL 相关文件：删除有问题的源文件，并替换 mkl_util.h 为空文件
       - name: Handle MKL and ZenDNN files
