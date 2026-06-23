@@ -197,27 +197,28 @@ jobs:
 
           # ---------- 下载并解压 ----------
           wget -q "$HW_URL" -O /tmp/hwloc.tar.gz
-          # 验证 sha256（可选，非必须）
           echo "$HW_SHA256  /tmp/hwloc.tar.gz" | sha256sum --check --status || {
             echo "❌ sha256 mismatch, aborting"
             exit 1
           }
 
           tar -xzf /tmp/hwloc.tar.gz -C /tmp/
-          # 如果指定了 strip_prefix，则重命名；否则取解压后的第一个目录
           if [ -n "$HW_STRIP" ]; then
             mv "/tmp/$HW_STRIP" /tmp/hwloc
           else
-            # 默认取解压后唯一的顶层目录
             HW_DIR=$(tar -tzf /tmp/hwloc.tar.gz | head -1 | cut -f1 -d"/")
             mv "/tmp/$HW_DIR" /tmp/hwloc
           fi
 
-          # ---------- 使用 TensorFlow 提供的 BUILD 模板 ----------
-          cp /tmp/tensorflow/third_party/xla/third_party/hwloc/hwloc.BUILD /tmp/hwloc/BUILD.bazel
-          touch /tmp/hwloc/WORKSPACE          # <-- 新增这一行
-          
-          # ---------- 以下内容与原始步骤完全一致（修补 BUILD 和 topology-linux.c）----------
+          # ---------- 合并 TensorFlow 的 hwloc 构建配置 ----------
+          # 将整个 third_party/hwloc/ 目录复制到源码目录（包含 hwloc.BUILD、static-components.h、BUILD.system 等）
+          cp -r /tmp/tensorflow/third_party/xla/third_party/hwloc/* /tmp/hwloc/
+          # 明确使用 hwloc.BUILD 作为 Bazel 的构建入口
+          cp /tmp/hwloc/hwloc.BUILD /tmp/hwloc/BUILD.bazel
+          # 确保仓库根目录有 WORKSPACE 文件
+          touch /tmp/hwloc/WORKSPACE
+
+          # ---------- 修补 BUILD 和 topology-linux.c ----------
           HWLOC_DIR="/tmp/hwloc"
           if [ -d "$HWLOC_DIR" ]; then
             echo "Found hwloc at $HWLOC_DIR"
@@ -226,10 +227,8 @@ jobs:
               cp "$BUILD_FILE" "$BUILD_FILE.bak"
               echo "Before patching BUILD file (x86 sources):"
               grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  No x86 source found"
-              # 删除包含 topology-x86.c 和 topology-x86_64.c 的行
               grep -v 'topology-x86.*\.c' "$BUILD_FILE" > "$BUILD_FILE.tmp"
               mv "$BUILD_FILE.tmp" "$BUILD_FILE"
-              # 清理可能遗留的逗号
               sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' "$BUILD_FILE"
               echo "After patching BUILD file:"
               grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  Success: no x86 source remaining"
@@ -237,7 +236,6 @@ jobs:
               echo "BUILD.bazel not found, skipping"
             fi
 
-            # 修改 topology-linux.c 强制禁用 pthread affinity 函数
             LINUX_SRC="$HWLOC_DIR/hwloc/topology-linux.c"
             if [ -f "$LINUX_SRC" ]; then
               cp "$LINUX_SRC" "$LINUX_SRC.bak"
