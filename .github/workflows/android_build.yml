@@ -525,30 +525,28 @@ jobs:
           grep -n -- '--copt' ci/build_android_package.sh || echo "No --copt flags left"
 
       # 修复 libwebp：删除其 BUILD 文件中的 -msse4.1 选项
-      - name: Fetch libwebp and remove all SSE41 options and macros from its BUILD
+      - name: Fetch libwebp and remove ALL msse4 flags from ALL build files
         run: |
           bazel fetch @libwebp//...
           OUTPUT_BASE=$(bazel info output_base)
           WEBP_PATH="${OUTPUT_BASE}/external/libwebp"
           if [ -d "$WEBP_PATH" ]; then
             echo "Found libwebp at $WEBP_PATH"
-            echo "=== Lines with msse4 or WEBP_HAVE_SSE41 BEFORE removal ==="
-            grep -ni -E 'msse4|WEBP_HAVE_SSE41' "$WEBP_PATH/BUILD.bazel" || echo "(none found)"
-            cp "$WEBP_PATH/BUILD.bazel" "$WEBP_PATH/BUILD.bazel.bak"
-            # 删除所有包含 msse4 或 WEBP_HAVE_SSE41 的行（不区分大小写）
-            sed -i '/msse4\|WEBP_HAVE_SSE41/Id' "$WEBP_PATH/BUILD.bazel"
-            echo "Patched libwebp BUILD: removed all SSE41 flags and macros"
-            echo "=== Lines with msse4 or WEBP_HAVE_SSE41 AFTER removal ==="
-            grep -ni -E 'msse4|WEBP_HAVE_SSE41' "$WEBP_PATH/BUILD.bazel" || echo "✅ All SSE41 options/macros removed"
-            if grep -qi -E 'msse4|WEBP_HAVE_SSE41' "$WEBP_PATH/BUILD.bazel"; then
-              echo "ERROR: SSE41 flags still present!"
-              grep -ni -E 'msse4|WEBP_HAVE_SSE41' "$WEBP_PATH/BUILD.bazel"
+            echo "=== Files containing msse4 or WEBP_HAVE_SSE41 before ==="
+            find "$WEBP_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -l -E 'msse4|WEBP_HAVE_SSE41' {} \;
+            echo "=== Context of matching lines before ==="
+            find "$WEBP_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -n -H -C3 -E 'msse4|WEBP_HAVE_SSE41' {} \;
+            find "$WEBP_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec sed -i '/msse4\|WEBP_HAVE_SSE41/Id' {} \;
+            echo "=== Verifying removal ==="
+            if find "$WEBP_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -qiE 'msse4|WEBP_HAVE_SSE41' {} \; ; then
+              echo "ERROR: msse4/WEBP_HAVE_SSE41 still present!"
+              find "$WEBP_PATH" -type f \( -name "BUILD" -o -name "BUILD.bazel" -o -name "*.bzl" \) -exec grep -n -H -C3 -E 'msse4|WEBP_HAVE_SSE41' {} \;
               exit 1
             else
-              echo "SSE41 flags and macros successfully removed."
+              echo "✅ All msse4/WEBP_HAVE_SSE41 removed from libwebp."
             fi
           else
-            echo "Error: libwebp not found at $WEBP_PATH"
+            echo "libwebp not found at $WEBP_PATH"
             exit 1
           fi
 
@@ -659,6 +657,18 @@ jobs:
             echo "External directory not found, skipping"
           fi
 
+      # 修复 hash BUILD 因 copts 行被删可能缺 copts 属性
+      - name: Fix hash BUILD copts if missing
+        run: |
+          OUTPUT_BASE=$(bazel info output_base)
+          HASH_BUILD="${OUTPUT_BASE}/external/org_tensorflow/third_party/xla/xla/tsl/lib/hash/BUILD"
+          if [ -f "$HASH_BUILD" ]; then
+            if ! grep -q 'copts\s*=' "$HASH_BUILD"; then
+              sed -i '/hdrs\s*=\s*\[/a\    copts = tsl_copts(),' "$HASH_BUILD"
+              echo "Patched hash BUILD to add missing copts"
+            fi
+          fi
+	  
       # 修复 hwloc
       - name: Fetch hwloc and apply fixes
         run: |
