@@ -447,14 +447,19 @@ jobs:
 
       # ======================= XNNPACK 专用配置 ======================= #
       # 仍写入 .bazelrc，但也存入环境变量以备后用
-      - name: Enable KleidiAI for arm64 (and disable for x86)
+      - name: Enable KleidiAI for arm64 (and disable for x86) + fix hwloc x86
         run: |
           echo "build:android_arm64 --define=xnn_enable_kleidiai=true"   >> .bazelrc
           echo "build:android_arm   --define=xnn_enable_kleidiai=false"  >> .bazelrc
           echo "build:android_x86   --define=xnn_enable_kleidiai=false"  >> .bazelrc
           echo "build:android_x86_64 --define=xnn_enable_kleidiai=false" >> .bazelrc
+          # 修复 hwloc 的 pthread affinity 编译错误（仅 x86）
+          echo "build:android_x86   --copt=-DHAVE_DECL_PTHREAD_SETAFFINITY_NP=0" >> .bazelrc
+          echo "build:android_x86   --copt=-DHAVE_DECL_PTHREAD_GETAFFINITY_NP=0" >> .bazelrc
+          echo "build:android_x86_64 --copt=-DHAVE_DECL_PTHREAD_SETAFFINITY_NP=0" >> .bazelrc
+          echo "build:android_x86_64 --copt=-DHAVE_DECL_PTHREAD_GETAFFINITY_NP=0" >> .bazelrc
           echo "build:kleidiai_query --define=xnn_enable_kleidiai=true"  >> .bazelrc
-          echo "✅ KleidiAI: arm64=true, x86/x86_64=false"
+          echo "✅ KleidiAI: arm64=true, x86/x86_64=false, pthread affinity fixed for x86"
 
       # 【修改 1】关闭 cc_shared_library 实验特性，让 alwayslink 回归传统 .a 静态链接
       - name: Force static linking for KleidiAI symbols
