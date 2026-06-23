@@ -763,7 +763,6 @@ jobs:
             echo "External directory not found, skipping"
           fi
 
-
       # 修复 hash BUILD 因 copts 行被删可能缺 copts 属性
       - name: Fix hash BUILD copts if missing
         run: |
@@ -775,6 +774,66 @@ jobs:
               echo "Patched hash BUILD to add missing copts"
             fi
           fi
+
+      # ===================== 新增：提前修补 hwloc BUILD 模板（带前后对比） =====================
+      - name: Patch hwloc BUILD template in xla (with before/after context)
+        run: |
+          bazel fetch @xla//... || true
+          OUTPUT_BASE=$(bazel info output_base)
+          HWLOC_TEMPLATE="${OUTPUT_BASE}/external/xla/third_party/hwloc/hwloc.BUILD"
+          if [ -f "$HWLOC_TEMPLATE" ]; then
+            echo "Found hwloc BUILD template: $HWLOC_TEMPLATE"
+            echo "=== BEFORE: lines related to topology-x86 or -msse (with context) ==="
+            grep -n -H -C3 -E 'topology-x86|-msse' "$HWLOC_TEMPLATE" || echo "(none found)"
+            grep -n -H -E 'topology-x86|-msse' "$HWLOC_TEMPLATE" > /tmp/hwloc_lines_before.txt
+            cp "$HWLOC_TEMPLATE" "$HWLOC_TEMPLATE.bak"
+            sed -i '/topology-x86.*\.c/d' "$HWLOC_TEMPLATE"
+            sed -i -e 's/-msse3//g' -e 's/-msse4\.1//g' -e 's/-msse4\.2//g' "$HWLOC_TEMPLATE"
+            echo "=== AFTER: The same lines after modification ==="
+            while IFS=: read file line rest; do
+              if [ -f "$file" ]; then
+                new_line=$(sed -n "${line}p" "$file" 2>/dev/null)
+                if [ -z "$new_line" ]; then
+                  echo "$file:$line: [LINE DELETED]"
+                else
+                  echo "$file:$line: $new_line"
+                fi
+              else
+                echo "$file:$line: [FILE MISSING]"
+              fi
+            done < /tmp/hwloc_lines_before.txt
+            echo "✅ hwloc BUILD template patched."
+          else
+            echo "hwloc BUILD template not found at $HWLOC_TEMPLATE, searching..."
+            HWLOC_TEMPLATE=$(find "${OUTPUT_BASE}/external/xla" -name "hwloc.BUILD" | head -1)
+            if [ -n "$HWLOC_TEMPLATE" ]; then
+              echo "Found alternate: $HWLOC_TEMPLATE"
+              grep -n -H -C3 -E 'topology-x86|-msse' "$HWLOC_TEMPLATE" || echo "(none found)"
+              grep -n -H -E 'topology-x86|-msse' "$HWLOC_TEMPLATE" > /tmp/hwloc_lines_before.txt
+              cp "$HWLOC_TEMPLATE" "$HWLOC_TEMPLATE.bak"
+              sed -i '/topology-x86.*\.c/d' "$HWLOC_TEMPLATE"
+              sed -i -e 's/-msse3//g' -e 's/-msse4\.1//g' -e 's/-msse4\.2//g' "$HWLOC_TEMPLATE"
+              while IFS=: read file line rest; do
+                if [ -f "$file" ]; then
+                  new_line=$(sed -n "${line}p" "$file" 2>/dev/null)
+                  if [ -z "$new_line" ]; then
+                    echo "$file:$line: [LINE DELETED]"
+                  else
+                    echo "$file:$line: $new_line"
+                  fi
+                else
+                  echo "$file:$line: [FILE MISSING]"
+                fi
+              done < /tmp/hwloc_lines_before.txt
+              echo "✅ hwloc BUILD template patched (alternate)."
+            else
+              echo "❌ Critical: hwloc BUILD template not found anywhere. Build may fail."
+              exit 1
+            fi
+          fi
+          # 再次清空缓存，确保模板修改生效
+          echo "=== Purging Bazel analysis cache again after patching hwloc template ==="
+          bazel clean --expunge_async
 
       # 修复 hwloc
       - name: Fetch hwloc and apply fixes (with detailed output)
@@ -865,13 +924,6 @@ jobs:
             exit 1
           fi
       # ========================================================================================
-      
-      # ===================== 新增：提前清空分析缓存，确保后续所有操作使用干净缓存 =====================
-      - name: Purge Bazel analysis cache before any fetch/build
-        run: |
-          echo "=== Purging Bazel analysis cache to ensure all BUILD/bzl/tpl changes are picked up ==="
-          bazel clean --expunge_async
-          echo "✅ Cache purged. All subsequent bazel commands will re-analyze everything."
 
       # ======================= 预热 XNNPACK（完全匹配最终打包参数） =======================
       - name: Pre-build XNNPACK for arm64 (compile check)
