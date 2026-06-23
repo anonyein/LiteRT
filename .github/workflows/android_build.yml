@@ -676,7 +676,7 @@ jobs:
           fi
 
       # 修复 hwloc
-      - name: Fetch hwloc and apply fixes
+      - name: Fetch hwloc and apply fixes (with detailed output)
         run: |
           bazel fetch @hwloc//... || true
           OUTPUT_BASE=$(bazel info output_base)
@@ -686,15 +686,19 @@ jobs:
             BUILD_FILE="$HWLOC_DIR/BUILD.bazel"
             if [ -f "$BUILD_FILE" ]; then
               cp "$BUILD_FILE" "$BUILD_FILE.bak"
-              echo "Before patching BUILD file (x86 sources):"
-              grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  No x86 source found"
-              # 删除包含 topology-x86.c 和 topology-x86_64.c 的行
+              echo "=== BEFORE: lines related to topology-x86 (with context) ==="
+              grep -n -C3 'topology-x86' "$BUILD_FILE" || echo "(no topology-x86 lines found)"
+              echo "=== Removing lines containing topology-x86.c or topology-x86_64.c ==="
               grep -v 'topology-x86.*\.c' "$BUILD_FILE" > "$BUILD_FILE.tmp"
               mv "$BUILD_FILE.tmp" "$BUILD_FILE"
-              # 清理可能遗留的逗号
+              echo "=== AFTER (first pass): remaining topology-x86 references ==="
+              grep -n -C3 'topology-x86' "$BUILD_FILE" || echo "(none)"
+              echo "=== Extra cleanup: directly deleting quoted file names ==="
+              sed -i 's/"topology-x86\.c"//g; s/"topology-x86_64\.c"//g' "$BUILD_FILE"
+              echo "=== Cleaning up empty entries and stray commas ==="
               sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' "$BUILD_FILE"
-              echo "After patching BUILD file:"
-              grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  Success: no x86 source remaining"
+              echo "=== FINAL: lines mentioning topology-x86 (should be empty or clean) ==="
+              grep -n -C3 'topology-x86' "$BUILD_FILE" || echo "(none)"
             else
               echo "BUILD.bazel not found, skipping"
             fi
@@ -703,7 +707,7 @@ jobs:
             LINUX_SRC="$HWLOC_DIR/hwloc/topology-linux.c"
             if [ -f "$LINUX_SRC" ]; then
               cp "$LINUX_SRC" "$LINUX_SRC.bak"
-              echo "Patching $LINUX_SRC to disable pthread affinity..."
+              echo "=== Patching $LINUX_SRC to disable pthread affinity ==="
               sed -i '/#include "private\/autogen\/config.h"/a #undef HAVE_DECL_PTHREAD_SETAFFINITY_NP\n#define HAVE_DECL_PTHREAD_SETAFFINITY_NP 0\n#undef HAVE_DECL_PTHREAD_GETAFFINITY_NP\n#define HAVE_DECL_PTHREAD_GETAFFINITY_NP 0' "$LINUX_SRC"
               echo "Patched topology-linux.c"
             else
