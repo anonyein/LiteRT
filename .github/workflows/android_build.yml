@@ -169,18 +169,27 @@ jobs:
             cat /tmp/qsi4cxp_files.txt
           fi
 
-      # ---------- 创建 BUILD 文件（includes 添加 "."） ----------
+      # 【修改 2】KleidiAI BUILD：用自定义 config_setting 匹配 Android arm64，取代 @platforms//cpu:aarch64
       - name: Create BUILD files for @KleidiAI
         run: |
           REPO=/tmp/kleidiai_repo
           cat > $REPO/BUILD.bazel << 'EOF'
           package(default_visibility = ["//visibility:public"])
-      
+
+          # 匹配 Android ARM64 的自定义条件
+          config_setting(
+              name = "is_android_arm64",
+              values = {
+                  "cpu": "arm64-v8a",
+                  "define": "xnn_enable_kleidiai=true",
+              },
+          )
+
           cc_library(
               name = "common",
               hdrs = glob(["src/kai/**/*.h", "kai/ukernels/**/*.h"]),
               srcs = select({
-                  "@platforms//cpu:aarch64": [
+                  ":is_android_arm64": [
                       "src/kai/kai_common_sme_asm.S",
                       "src/kai/kai_common_sve_asm.S",
                   ],
@@ -188,30 +197,30 @@ jobs:
               }),
               includes = ["src", "."],
               alwayslink = 1,
-              linkstatic = True,   # 强制生成静态库
+              linkstatic = True,
               copts = select({
-                  "@platforms//cpu:aarch64": [
+                  ":is_android_arm64": [
                       "-march=armv8.2-a+dotprod+i8mm+fp16+bf16+sme2+sve2",
                   ],
                   "//conditions:default": [],
               }),
           )
-      
+
           cc_library(
               name = "matmul",
               srcs = select({
-                  "@platforms//cpu:aarch64": ["@KleidiAI//kai/ukernels/matmul:matmul_srcs"],
+                  ":is_android_arm64": ["@KleidiAI//kai/ukernels/matmul:matmul_srcs"],
                   "//conditions:default": [],
               }),
               hdrs = select({
-                  "@platforms//cpu:aarch64": ["@KleidiAI//kai/ukernels/matmul:matmul_hdrs"],
+                  ":is_android_arm64": ["@KleidiAI//kai/ukernels/matmul:matmul_hdrs"],
                   "//conditions:default": [],
               }),
-              includes = ["src", "."],   # 原来只有 ["src"]，改为 ["src", "."]
+              includes = ["src", "."],
               alwayslink = 1,
-              linkstatic = True,   # 强制生成静态库
+              linkstatic = True,
               copts = select({
-                  "@platforms//cpu:aarch64": [
+                  ":is_android_arm64": [
                       "-march=armv8.2-a+dotprod+i8mm+fp16+bf16+sme2+sve2",
                       "-fno-tree-vectorize",
                   ],
@@ -386,11 +395,11 @@ jobs:
               print(block)
           PYEOF
 
-      # ---------- Inject overrides into build script ----------
+      # ---------- Inject overrides into build script ----------  ← 【修改 3】同时注入 --noexperimental_cc_shared_library
       - name: Inject overrides into build script
         run: |
-          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack --override_repository=KleidiAI=\/tmp\/kleidiai_repo /g' ci/build_android_package.sh
-          echo "✅ Injected XNNPACK and KleidiAI overrides"
+          sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack --override_repository=KleidiAI=\/tmp\/kleidiai_repo --noexperimental_cc_shared_library --noincompatible_remove_legacy_whole_archive /g' ci/build_android_package.sh
+          echo "✅ Injected XNNPACK, KleidiAI overrides and static link flags"
           grep -n 'bazel build' ci/build_android_package.sh | head -5
 
       # ---------- 环境配置与构建 ----------
@@ -449,15 +458,12 @@ jobs:
           echo "build:kleidiai_query --define=xnn_enable_kleidiai=true"  >> .bazelrc
           echo "✅ KleidiAI: arm64=true, x86/x86_64=false"
 
-      # ====== 关键修改：添加 --whole-archive 强制包含所有静态库符号 ======
-      - name: Add linker flags to force include all static symbols
+      # 【修改 1】关闭 cc_shared_library 实验特性，让 alwayslink 回归传统 .a 静态链接
+      - name: Force static linking for KleidiAI symbols
         run: |
-          echo "build:android_arm64 --linkopt=-Wl,--whole-archive" >> .bazelrc
-          echo "build:android_arm64 --linkopt=-Wl,--no-whole-archive" >> .bazelrc
-          echo "build:android_arm64 --linkopt=-Wl,--start-group" >> .bazelrc
-          echo "build:android_arm64 --linkopt=-Wl,--end-group"    >> .bazelrc
-          echo "✅ Added --whole-archive, --start-group/--end-group for android_arm64"
-      # =============================================================== #
+          echo "build:android_arm64 --noexperimental_cc_shared_library" >> .bazelrc
+          echo "build:android_arm64 --noincompatible_remove_legacy_whole_archive" >> .bazelrc
+          echo "✅ Disabled cc_shared_library for android_arm64 to force .a linking"
 
       - name: Verify Android paths
         run: |
@@ -663,6 +669,8 @@ jobs:
           bazel build \
             --override_repository=XNNPACK=/tmp/xnnpack \
             --override_repository=KleidiAI=/tmp/kleidiai_repo \
+            --noexperimental_cc_shared_library \
+            --noincompatible_remove_legacy_whole_archive \
             -c opt \
             --cxxopt=--std=c++17 \
             --config=android_arm64 \
@@ -676,19 +684,21 @@ jobs:
           bazel build \
             --override_repository=XNNPACK=/tmp/xnnpack \
             --override_repository=KleidiAI=/tmp/kleidiai_repo \
+            --noexperimental_cc_shared_library \
+            --noincompatible_remove_legacy_whole_archive \
             -c opt \
             --config=android_arm64 \
             @KleidiAI//:matmul
-          # 查找库文件：优先 .so，其次 .a，最后 .lo
-          MATMUL_LIB=$(find bazel-out/ -name "libmatmul.so" -path "*/arm64-v8a*" | head -1)
-          if [ -z "$MATMUL_LIB" ]; then
-            MATMUL_LIB=$(find bazel-out/ -name "libmatmul.a" -path "*/arm64-v8a*" | head -1)
-          fi
+          # 查找库文件：优先 .a，其次 .lo，最后 .so
+          MATMUL_LIB=$(find bazel-out/ -name "libmatmul.a" -path "*/arm64-v8a*" | head -1)
           if [ -z "$MATMUL_LIB" ]; then
             MATMUL_LIB=$(find bazel-out/ -name "libmatmul.lo" -path "*/arm64-v8a*" | head -1)
           fi
           if [ -z "$MATMUL_LIB" ]; then
-            echo "⚠️  Could not find libmatmul (so/a/lo), skipping symbol check"
+            MATMUL_LIB=$(find bazel-out/ -name "libmatmul.so" -path "*/arm64-v8a*" | head -1)
+          fi
+          if [ -z "$MATMUL_LIB" ]; then
+            echo "⚠️  Could not find libmatmul (a/lo/so), skipping symbol check"
           else
             echo "Checking symbols in $MATMUL_LIB"
             REQUIRED_SYMBOLS=(
@@ -719,12 +729,14 @@ jobs:
             echo "✅ All required symbols found in libmatmul"
           fi
 
-          # 其余架构预热
+          # 其余架构预热（关闭 cc_shared_library 以匹配）
           for arch in android_arm android_x86 android_x86_64; do
             echo "Building @XNNPACK//:XNNPACK for $arch (warmup only)"
             bazel build \
               --override_repository=XNNPACK=/tmp/xnnpack \
               --override_repository=KleidiAI=/tmp/kleidiai_repo \
+              --noexperimental_cc_shared_library \
+              --noincompatible_remove_legacy_whole_archive \
               -c opt \
               --cxxopt=--std=c++17 \
               --config=$arch \
