@@ -186,13 +186,10 @@ jobs:
           # ---------- 合并 TensorFlow 的构建配置 ----------
           cp -r /tmp/tensorflow/third_party/xla/third_party/hwloc/* /tmp/hwloc/
 
-          # 确保 expand_template 所需的模板文件存在（缺失时从 Git 恢复）
-          for template in include/hwloc/autogen/config.h.in include/private/autogen/config.h.in; do
-            if [ ! -f "/tmp/hwloc/$template" ]; then
-              echo "⚠️  Missing $template, restoring from Git..."
-              git -C /tmp/hwloc show HEAD:"$template" > "/tmp/hwloc/$template"
-            fi
-          done
+          # 补全缺失的模板文件：private/autogen/config.h.in 用公共模板复制
+          if [ ! -f /tmp/hwloc/include/private/autogen/config.h.in ]; then
+            cp /tmp/hwloc/include/hwloc/autogen/config.h.in /tmp/hwloc/include/private/autogen/config.h.in
+          fi
 
           cp /tmp/hwloc/hwloc.BUILD /tmp/hwloc/BUILD.bazel
           printf '\nexports_files(["static-components.h"])\n' >> /tmp/hwloc/BUILD.bazel
