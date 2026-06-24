@@ -173,21 +173,21 @@ jobs:
             echo "❌ workspace.bzl not found"
             exit 1
           fi
-
+          
           # 提取原始 URL（忽略 tf_mirror_urls 的包装，直接取括号内的字符串）
           HW_URL=$(grep -oP 'urls\s*=\s*tf_mirror_urls\s*\(\s*"\K[^"]+' "$WORKSPACE_BZL" | head -1)
           if [ -z "$HW_URL" ]; then
             echo "❌ Could not parse hwloc URL from workspace.bzl"
             exit 1
           fi
-
+          
           # 提取 sha256
           HW_SHA256=$(grep -oP 'sha256\s*=\s*"\K[^"]+' "$WORKSPACE_BZL")
           if [ -z "$HW_SHA256" ]; then
             echo "❌ Could not parse hwloc sha256 from workspace.bzl"
             exit 1
           fi
-
+          
           # 提取 strip_prefix（若不指定则使用压缩包默认根目录）
           HW_STRIP=$(grep -oP 'strip_prefix\s*=\s*"\K[^"]+' "$WORKSPACE_BZL" || true)
 
@@ -211,11 +211,18 @@ jobs:
           fi
 
           # ---------- 合并 TensorFlow 的 hwloc 构建配置 ----------
-          # 将整个 third_party/hwloc/ 目录复制到源码目录（包含 hwloc.BUILD、static-components.h、BUILD.system 等）
+          # 复制整个 third_party/hwloc/ 目录到源码目录（覆盖可能重名的文件）
           cp -r /tmp/tensorflow/third_party/xla/third_party/hwloc/* /tmp/hwloc/
-          # 明确使用 hwloc.BUILD 作为 Bazel 的构建入口
+
+          # 使用 hwloc.BUILD 作为 Bazel 构建入口
           cp /tmp/hwloc/hwloc.BUILD /tmp/hwloc/BUILD.bazel
-          # 确保仓库根目录有 WORKSPACE 文件
+
+          # 将原 BUILD 文件中的 exports_files 追加到 BUILD.bazel，确保 static-components.h 可被引用
+          if [ -f /tmp/hwloc/BUILD ]; then
+            grep 'exports_files' /tmp/hwloc/BUILD >> /tmp/hwloc/BUILD.bazel || true
+          fi
+
+          # 确保目录被识别为 Bazel 仓库
           touch /tmp/hwloc/WORKSPACE
 
           # ---------- 修补 BUILD 和 topology-linux.c ----------
