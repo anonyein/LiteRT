@@ -243,6 +243,7 @@ jobs:
               echo "BUILD.bazel not found, skipping"
             fi
 
+            # 修改 topology-linux.c 强制禁用 pthread affinity 函数
             LINUX_SRC="$HWLOC_DIR/hwloc/topology-linux.c"
             if [ -f "$LINUX_SRC" ]; then
               cp "$LINUX_SRC" "$LINUX_SRC.bak"
@@ -255,6 +256,11 @@ jobs:
           else
             echo "hwloc directory not found, skipping"
           fi
+
+          # ---------- 打印最终的 BUILD.bazel 内容 ----------
+          echo "=== Final BUILD.bazel content ==="
+          cat /tmp/hwloc/BUILD.bazel
+
 
       # ===================== 使用源码路径添加 fixedpoint 依赖 =====================
       - name: Add fixedpoint dep to existing deps list
