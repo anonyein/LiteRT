@@ -167,41 +167,34 @@ jobs:
 
       - name: Fetch hwloc and apply fixes
         run: |
-          # ---------- 从 workspace.bzl 提取版本 tag ----------
           WORKSPACE_BZL="/tmp/tensorflow/third_party/xla/third_party/hwloc/workspace.bzl"
-          if [ ! -f "$WORKSPACE_BZL" ]; then echo "❌ workspace.bzl not found"; exit 1; fi
+          HW_URL=$(grep -oP 'urls\s*=\s*tf_mirror_urls\s*\(\s*"\K[^"]+' "$WORKSPACE_BZL" | head -1)
+          HW_SHA256=$(grep -oP 'sha256\s*=\s*"\K[^"]+' "$WORKSPACE_BZL")
+          HW_STRIP=$(grep -oP 'strip_prefix\s*=\s*"\K[^"]+' "$WORKSPACE_BZL" || true)
+          HW_TAG="$HW_STRIP"  # strip_prefix 即 git tag
+          echo "✅ URL: $HW_URL  SHA256: $HW_SHA256  STRIP: $HW_STRIP"
 
-          # 优先取 strip_prefix，它就是 Git tag（如 hwloc-2.7.1）
-          HW_TAG=$(grep -oP 'strip_prefix\s*=\s*"\K[^"]+' "$WORKSPACE_BZL" || true)
-          if [ -z "$HW_TAG" ]; then
-            # 如果没提取到，尝试从 URL 中取最后一个路径组件（去掉 .tar.gz）
-            HW_URL=$(grep -oP 'urls\s*=\s*tf_mirror_urls\s*\(\s*"\K[^"]+' "$WORKSPACE_BZL" | head -1)
-            HW_TAG=$(basename "$HW_URL" .tar.gz)
-          fi
-          echo "✅ Using hwloc tag: $HW_TAG"
+          # 下载并解压 tarball（包含所有 autotools 生成文件）
+          wget -q "$HW_URL" -O /tmp/hwloc.tar.gz
+          echo "$HW_SHA256  /tmp/hwloc.tar.gz" | sha256sum -c --status || exit 1
+          tar -xzf /tmp/hwloc.tar.gz -C /tmp/
+          mv "/tmp/$HW_STRIP" /tmp/hwloc
 
-          # ---------- 从 GitHub 克隆指定 tag ----------
-          git clone --depth 1 --branch "$HW_TAG" https://github.com/open-mpi/hwloc.git /tmp/hwloc
+          # 从 Git 仅提取 Android 专用 static-components.h
+          git clone --depth 1 --branch "$HW_TAG" https://github.com/open-mpi/hwloc.git /tmp/hwloc_git
+          cp /tmp/hwloc_git/contrib/android/include/static-components.h /tmp/hwloc/hwloc/static-components.h
+          rm -rf /tmp/hwloc_git
 
-          # ---------- 合并 TensorFlow 的构建配置 ----------
+          # 合并 TensorFlow 构建配置
           cp -r /tmp/tensorflow/third_party/xla/third_party/hwloc/* /tmp/hwloc/
-
-          # 补全缺失的模板文件：private/autogen/config.h.in 用公共模板复制
-          if [ ! -f /tmp/hwloc/include/private/autogen/config.h.in ]; then
-            cp /tmp/hwloc/include/hwloc/autogen/config.h.in /tmp/hwloc/include/private/autogen/config.h.in
-          fi
-
           cp /tmp/hwloc/hwloc.BUILD /tmp/hwloc/BUILD.bazel
           printf '\nexports_files(["static-components.h"])\n' >> /tmp/hwloc/BUILD.bazel
           touch /tmp/hwloc/WORKSPACE
 
-          # 仅替换 static-components.h，不覆盖 config.h
-          cp /tmp/hwloc/contrib/android/include/static-components.h /tmp/hwloc/hwloc/static-components.h
+          # 修补 BUILD.bazel（单行 Python，无缩进问题）
+          python3 -c "import re; c=open('/tmp/hwloc/BUILD.bazel').read(); c=re.sub(r'expand_template\(\s*\n\s*name = \"move_static_components_h\".*?\n\s*\)\s*\n?', '', c, flags=re.DOTALL); c=c.replace('\"//conditions:default\": _INCLUDE_HWLOC_AUTOIGEN_CONFIG_H_COMMON_SUBS', '\"//conditions:default\": _INCLUDE_HWLOC_AUTOIGEN_CONFIG_H_LINUX_SUBS'); c=re.sub(r'^.*topology-x86(?:_64)?\.c.*\n?', '', c, flags=re.MULTILINE); c=c.replace('\"//conditions:default\": []', '\"//conditions:default\": [\n        \"hwloc/topology-linux.c\",\n        \"include/hwloc/linux.h\",\n    ]'); c=c.replace('\"-Wno-vla\"]', '\"-Wno-vla\", \"-Wno-static-inline\"]'); c=re.sub(r',\s*,', ',', c); c=re.sub(r'\[\s*,', '[', c); c=re.sub(r',\s*\]', ']', c); c=re.sub(r'\[\s*\]', '[]', c); open('/tmp/hwloc/BUILD.bazel','w').write(c); print('✅ BUILD.bazel patched')"
 
-          # 删除 move_static_components_h 规则（避免覆盖我们的文件），修改 default 分支，删除 topology-x86 行
-          python3 -c "import re; c=open('/tmp/hwloc/BUILD.bazel').read(); c=re.sub(r'expand_template\(\s*\n\s*name = \"move_static_components_h\".*?\n\s*\)\s*\n?', '', c, flags=re.DOTALL); c=re.sub(r'^.*topology-x86(?:_64)?\.c.*\n?','',c,flags=re.MULTILINE); c=c.replace('\"//conditions:default\": []','\"//conditions:default\": [\n        \"hwloc/topology-linux.c\",\n        \"include/hwloc/linux.h\",\n    ]'); c=re.sub(r',\s*,',',',c); c=re.sub(r'\[\s*,','[',c); c=re.sub(r',\s*\]',']',c); c=re.sub(r'\[\s*\]','[]',c); open('/tmp/hwloc/BUILD.bazel','w').write(c); print('✅ BUILD.bazel patched')"
-
-          # 修补 topology-linux.c 禁用 pthread affinity
+          # 修补 topology-linux.c
           LINUX_SRC="/tmp/hwloc/hwloc/topology-linux.c"
           if [ -f "$LINUX_SRC" ]; then
             sed -i '/#include "private\/autogen\/config.h"/a #undef HAVE_DECL_PTHREAD_SETAFFINITY_NP\n#define HAVE_DECL_PTHREAD_SETAFFINITY_NP 0\n#undef HAVE_DECL_PTHREAD_GETAFFINITY_NP\n#define HAVE_DECL_PTHREAD_GETAFFINITY_NP 0' "$LINUX_SRC"
