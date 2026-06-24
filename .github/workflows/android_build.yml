@@ -189,13 +189,13 @@ jobs:
           printf '\nexports_files(["static-components.h"])\n' >> /tmp/hwloc/BUILD.bazel
           touch /tmp/hwloc/WORKSPACE
 
-          # ---------- 使用 Git 仓库中自带的 Android 配置文件 ----------
-          cp /tmp/hwloc/contrib/android/include/static-components.h /tmp/hwloc/static-components.h
+          # 复制 Android 专用头文件到 BUILD.bazel 中 srcs 引用的真实路径
           cp /tmp/hwloc/contrib/android/include/private/autogen/config.h /tmp/hwloc/include/private/autogen/config.h
           cp /tmp/hwloc/contrib/android/include/hwloc/autogen/config.h /tmp/hwloc/include/hwloc/autogen/config.h
+          cp /tmp/hwloc/contrib/android/include/static-components.h /tmp/hwloc/hwloc/static-components.h
 
-          # ---------- 修补 BUILD.bazel ----------
-          python3 -c "import re; c=open('/tmp/hwloc/BUILD.bazel').read(); c=re.sub(r'expand_template\(.*?name = \"include_hwloc_autogen_config_h\".*?\)\s*\n?','',c,flags=re.DOTALL); c=re.sub(r'expand_template\(.*?name = \"include_private_hwloc_autogen__config_h\".*?\)\s*\n?','',c,flags=re.DOTALL); c=re.sub(r'^.*topology-x86(?:_64)?\.c.*\n?','',c,flags=re.MULTILINE); c=c.replace('\"//conditions:default\": []','\"//conditions:default\": [\n        \"hwloc/topology-linux.c\",\n        \"include/hwloc/linux.h\",\n    ]'); c=re.sub(r',\s*,',',',c); c=re.sub(r'\[\s*,','[',c); c=re.sub(r',\s*\]',']',c); c=re.sub(r'\[\s*\]','[]',c); open('/tmp/hwloc/BUILD.bazel','w').write(c); print('✅ BUILD.bazel patched')"
+          # 单行 Python 修补 BUILD.bazel：删除所有 expand_template 规则、移除无用的 load、删除 x86 行、修改 default 分支、清理逗号
+          python3 -c "import re; c=open('/tmp/hwloc/BUILD.bazel').read(); c=re.sub(r'expand_template\(.*?\)\s*\n?', '', c, flags=re.DOTALL); c=re.sub(r'^.*topology-x86(?:_64)?\.c.*\n?','',c,flags=re.MULTILINE); c=c.replace('\"//conditions:default\": []','\"//conditions:default\": [\n        \"hwloc/topology-linux.c\",\n        \"include/hwloc/linux.h\",\n    ]'); c=re.sub(r',\s*,',',',c); c=re.sub(r'\[\s*,','[',c); c=re.sub(r',\s*\]',']',c); c=re.sub(r'\[\s*\]','[]',c); c=c.replace('load(\"@bazel_skylib//rules:expand_template.bzl\", \"expand_template\")\n',''); c=c.replace('load(\"@local_config_cuda//cuda:build_defs.bzl\", \"if_cuda\")\n',''); open('/tmp/hwloc/BUILD.bazel','w').write(c); print('✅ BUILD.bazel patched')"
 
           echo "=== Final BUILD.bazel content ==="
           cat /tmp/hwloc/BUILD.bazel
