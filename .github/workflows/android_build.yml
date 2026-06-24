@@ -167,98 +167,33 @@ jobs:
 
       - name: Fetch hwloc and apply fixes
         run: |
-          # ---------- 动态解析 TensorFlow 中 hwloc 的版本信息 ----------
           WORKSPACE_BZL="/tmp/tensorflow/third_party/xla/third_party/hwloc/workspace.bzl"
-          if [ ! -f "$WORKSPACE_BZL" ]; then
-            echo "❌ workspace.bzl not found"
-            exit 1
-          fi
-          
-          # 提取原始 URL（忽略 tf_mirror_urls 的包装，直接取括号内的字符串）
+          if [ ! -f "$WORKSPACE_BZL" ]; then echo "❌ workspace.bzl not found"; exit 1; fi
           HW_URL=$(grep -oP 'urls\s*=\s*tf_mirror_urls\s*\(\s*"\K[^"]+' "$WORKSPACE_BZL" | head -1)
-          if [ -z "$HW_URL" ]; then
-            echo "❌ Could not parse hwloc URL from workspace.bzl"
-            exit 1
-          fi
-          
-          # 提取 sha256
           HW_SHA256=$(grep -oP 'sha256\s*=\s*"\K[^"]+' "$WORKSPACE_BZL")
-          if [ -z "$HW_SHA256" ]; then
-            echo "❌ Could not parse hwloc sha256 from workspace.bzl"
-            exit 1
-          fi
-          
-          # 提取 strip_prefix（若不指定则使用压缩包默认根目录）
           HW_STRIP=$(grep -oP 'strip_prefix\s*=\s*"\K[^"]+' "$WORKSPACE_BZL" || true)
+          echo "✅ URL: $HW_URL  SHA256: $HW_SHA256  STRIP: ${HW_STRIP:-default}"
 
-          echo "✅ Extracted hwloc URL: $HW_URL"
-          echo "✅ Extracted sha256: $HW_SHA256"
-          echo "✅ Extracted strip_prefix: ${HW_STRIP:-default}"
-
-          # ---------- 下载并解压 ----------
           wget -q "$HW_URL" -O /tmp/hwloc.tar.gz
-          echo "$HW_SHA256  /tmp/hwloc.tar.gz" | sha256sum --check --status || {
-            echo "❌ sha256 mismatch, aborting"
-            exit 1
-          }
-
+          echo "$HW_SHA256  /tmp/hwloc.tar.gz" | sha256sum -c --status || exit 1
           tar -xzf /tmp/hwloc.tar.gz -C /tmp/
-          if [ -n "$HW_STRIP" ]; then
-            mv "/tmp/$HW_STRIP" /tmp/hwloc
-          else
-            HW_DIR=$(tar -tzf /tmp/hwloc.tar.gz | head -1 | cut -f1 -d"/")
-            mv "/tmp/$HW_DIR" /tmp/hwloc
+          if [ -n "$HW_STRIP" ]; then mv "/tmp/$HW_STRIP" /tmp/hwloc; else
+            HW_DIR=$(tar -tzf /tmp/hwloc.tar.gz | head -1 | cut -d/ -f1); mv "/tmp/$HW_DIR" /tmp/hwloc;
           fi
 
-          # ---------- 合并 TensorFlow 的 hwloc 构建配置 ----------
-          # 复制整个 third_party/hwloc/ 目录到源码目录（覆盖可能重名的文件）
           cp -r /tmp/tensorflow/third_party/xla/third_party/hwloc/* /tmp/hwloc/
-
-          # 使用 hwloc.BUILD 作为 Bazel 构建入口
+          cp /tmp/hwloc/contrib/android/include/static-components.h /tmp/hwloc/static-components.h
           cp /tmp/hwloc/hwloc.BUILD /tmp/hwloc/BUILD.bazel
-
-          # 追加完整的 exports_files 规则（static-components.h 必须被导出）
           printf '\nexports_files(["static-components.h"])\n' >> /tmp/hwloc/BUILD.bazel
-
-          # 确保目录被识别为 Bazel 仓库
           touch /tmp/hwloc/WORKSPACE
 
-          # ---------- 修补 BUILD 和 topology-linux.c ----------
-          HWLOC_DIR="/tmp/hwloc"
-          if [ -d "$HWLOC_DIR" ]; then
-            echo "Found hwloc at $HWLOC_DIR"
-            BUILD_FILE="$HWLOC_DIR/BUILD.bazel"
-            if [ -f "$BUILD_FILE" ]; then
-              cp "$BUILD_FILE" "$BUILD_FILE.bak"
-              echo "Before patching BUILD file (x86 sources):"
-              grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  No x86 source found"
-              grep -v 'topology-x86.*\.c' "$BUILD_FILE" > "$BUILD_FILE.tmp"
-              mv "$BUILD_FILE.tmp" "$BUILD_FILE"
-              sed -i 's/,\s*,/,/g; s/\[\s*,/[/g; s/,\s*\]/]/g; s/\[\s*\]/[]/g' "$BUILD_FILE"
-              echo "After patching BUILD file:"
-              grep -E 'topology-x86.*\.c' "$BUILD_FILE" || echo "  Success: no x86 source remaining"
-            else
-              echo "BUILD.bazel not found, skipping"
-            fi
+          python3 -c "import re; c=open('/tmp/hwloc/BUILD.bazel').read(); c=re.sub(r'expand_template\(.*?name = \"include_hwloc_autogen_config_h\".*?\)\s*\n?','',c,flags=re.DOTALL); c=re.sub(r'expand_template\(.*?name = \"include_private_hwloc_autogen__config_h\".*?\)\s*\n?','',c,flags=re.DOTALL); c=re.sub(r'^.*topology-x86(?:_64)?\.c.*\n?','',c,flags=re.MULTILINE); c=c.replace('\"//conditions:default\": []','\"//conditions:default\": [\n        \"hwloc/topology-linux.c\",\n        \"include/hwloc/linux.h\",\n    ]'); c=re.sub(r',\s*,',',',c); c=re.sub(r'\[\s*,','[',c); c=re.sub(r',\s*\]',']',c); c=re.sub(r'\[\s*\]','[]',c); open('/tmp/hwloc/BUILD.bazel','w').write(c); print('✅ BUILD.bazel patched')"
 
-            # 修改 topology-linux.c 强制禁用 pthread affinity 函数
-            LINUX_SRC="$HWLOC_DIR/hwloc/topology-linux.c"
-            if [ -f "$LINUX_SRC" ]; then
-              cp "$LINUX_SRC" "$LINUX_SRC.bak"
-              echo "Patching $LINUX_SRC to disable pthread affinity..."
-              sed -i '/#include "private\/autogen\/config.h"/a #undef HAVE_DECL_PTHREAD_SETAFFINITY_NP\n#define HAVE_DECL_PTHREAD_SETAFFINITY_NP 0\n#undef HAVE_DECL_PTHREAD_GETAFFINITY_NP\n#define HAVE_DECL_PTHREAD_GETAFFINITY_NP 0' "$LINUX_SRC"
-              echo "Patched topology-linux.c"
-            else
-              echo "topology-linux.c not found, skipping"
-            fi
-          else
-            echo "hwloc directory not found, skipping"
-          fi
+          cp /tmp/hwloc/contrib/android/include/private/autogen/config.h /tmp/hwloc/include/private/autogen/config.h
+          cp /tmp/hwloc/contrib/android/include/hwloc/autogen/config.h /tmp/hwloc/include/hwloc/autogen/config.h
 
-          # ---------- 打印最终的 BUILD.bazel 内容 ----------
           echo "=== Final BUILD.bazel content ==="
           cat /tmp/hwloc/BUILD.bazel
-
 
       # ===================== 使用源码路径添加 fixedpoint 依赖 =====================
       - name: Add fixedpoint dep to existing deps list
@@ -1158,6 +1093,25 @@ jobs:
               || echo "Prebuild for $arch completed with warnings (cache partial)"
           done
       # ========================================================================================
+
+      # ✅ 在这里插入 hwloc 校验步骤
+      - name: Pre-build hwloc for all Android architectures (compile check)
+        run: |
+          for arch in android_arm64 android_arm android_x86 android_x86_64; do
+            echo "=== Building @hwloc//:hwloc for $arch ==="
+            bazel build \
+              --override_repository=XNNPACK=/tmp/xnnpack \
+              --override_repository=KleidiAI=/tmp/kleidiai_repo \
+              --noexperimental_cc_shared_library \
+              --noincompatible_remove_legacy_whole_archive \
+              -c opt \
+              --cxxopt=--std=c++17 \
+              --config=$arch \
+              --fat_apk_cpu=x86,x86_64,arm64-v8a,armeabi-v7a \
+              @hwloc//:hwloc \
+              || { echo "❌ hwloc build failed for $arch"; exit 1; }
+          done
+          echo "✅ hwloc compiled successfully for all Android architectures"
 
       # - name: Diagnostic - Check if KleidiAI is actually linked
       #   continue-on-error: true
