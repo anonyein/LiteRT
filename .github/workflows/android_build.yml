@@ -194,8 +194,8 @@ jobs:
           cp /tmp/hwloc/contrib/android/include/hwloc/autogen/config.h /tmp/hwloc/include/hwloc/autogen/config.h
           cp /tmp/hwloc/contrib/android/include/static-components.h /tmp/hwloc/hwloc/static-components.h
 
-          # 单行 Python 修补 BUILD.bazel：删除所有 expand_template 规则、移除无用的 load、删除 x86 行、修改 default 分支、清理逗号
-          python3 -c "import re; c=open('/tmp/hwloc/BUILD.bazel').read(); c=re.sub(r'expand_template\(.*?\)\s*\n?', '', c, flags=re.DOTALL); c=re.sub(r'^.*topology-x86(?:_64)?\.c.*\n?','',c,flags=re.MULTILINE); c=c.replace('\"//conditions:default\": []','\"//conditions:default\": [\n        \"hwloc/topology-linux.c\",\n        \"include/hwloc/linux.h\",\n    ]'); c=re.sub(r',\s*,',',',c); c=re.sub(r'\[\s*,','[',c); c=re.sub(r',\s*\]',']',c); c=re.sub(r'\[\s*\]','[]',c); c=c.replace('load(\"@bazel_skylib//rules:expand_template.bzl\", \"expand_template\")\n',''); c=c.replace('load(\"@local_config_cuda//cuda:build_defs.bzl\", \"if_cuda\")\n',''); open('/tmp/hwloc/BUILD.bazel','w').write(c); print('✅ BUILD.bazel patched')"
+          # 修补 BUILD.bazel（完整删除 expand_template 块、修改 default 分支、清理逗号）
+          python3 -c "import re; c=open('/tmp/hwloc/BUILD.bazel').read(); c=re.sub(r'expand_template\(.*?\n\)\s*\n?', '', c, flags=re.DOTALL); c=re.sub(r'^.*topology-x86(?:_64)?\.c.*\n?','',c,flags=re.MULTILINE); c=c.replace('\"//conditions:default\": []','\"//conditions:default\": [\n        \"hwloc/topology-linux.c\",\n        \"include/hwloc/linux.h\",\n    ]'); c=re.sub(r',\s*,',',',c); c=re.sub(r'\[\s*,','[',c); c=re.sub(r',\s*\]',']',c); c=re.sub(r'\[\s*\]','[]',c); c=c.replace('load(\"@bazel_skylib//rules:expand_template.bzl\", \"expand_template\")\n',''); c=c.replace('load(\"@local_config_cuda//cuda:build_defs.bzl\", \"if_cuda\")\n',''); open('/tmp/hwloc/BUILD.bazel','w').write(c); print('✅ BUILD.bazel patched')"
 
           echo "=== Final BUILD.bazel content ==="
           cat /tmp/hwloc/BUILD.bazel
