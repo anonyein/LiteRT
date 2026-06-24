@@ -167,30 +167,35 @@ jobs:
 
       - name: Fetch hwloc and apply fixes
         run: |
+          # ---------- 从 workspace.bzl 提取版本 tag ----------
           WORKSPACE_BZL="/tmp/tensorflow/third_party/xla/third_party/hwloc/workspace.bzl"
           if [ ! -f "$WORKSPACE_BZL" ]; then echo "❌ workspace.bzl not found"; exit 1; fi
-          HW_URL=$(grep -oP 'urls\s*=\s*tf_mirror_urls\s*\(\s*"\K[^"]+' "$WORKSPACE_BZL" | head -1)
-          HW_SHA256=$(grep -oP 'sha256\s*=\s*"\K[^"]+' "$WORKSPACE_BZL")
-          HW_STRIP=$(grep -oP 'strip_prefix\s*=\s*"\K[^"]+' "$WORKSPACE_BZL" || true)
-          echo "✅ URL: $HW_URL  SHA256: $HW_SHA256  STRIP: ${HW_STRIP:-default}"
 
-          wget -q "$HW_URL" -O /tmp/hwloc.tar.gz
-          echo "$HW_SHA256  /tmp/hwloc.tar.gz" | sha256sum -c --status || exit 1
-          tar -xzf /tmp/hwloc.tar.gz -C /tmp/
-          if [ -n "$HW_STRIP" ]; then mv "/tmp/$HW_STRIP" /tmp/hwloc; else
-            HW_DIR=$(tar -tzf /tmp/hwloc.tar.gz | head -1 | cut -d/ -f1); mv "/tmp/$HW_DIR" /tmp/hwloc;
+          # 优先取 strip_prefix，它就是 Git tag（如 hwloc-2.7.1）
+          HW_TAG=$(grep -oP 'strip_prefix\s*=\s*"\K[^"]+' "$WORKSPACE_BZL" || true)
+          if [ -z "$HW_TAG" ]; then
+            # 如果没提取到，尝试从 URL 中取最后一个路径组件（去掉 .tar.gz）
+            HW_URL=$(grep -oP 'urls\s*=\s*tf_mirror_urls\s*\(\s*"\K[^"]+' "$WORKSPACE_BZL" | head -1)
+            HW_TAG=$(basename "$HW_URL" .tar.gz)
           fi
+          echo "✅ Using hwloc tag: $HW_TAG"
 
+          # ---------- 从 GitHub 克隆指定 tag ----------
+          git clone --depth 1 --branch "$HW_TAG" https://github.com/open-mpi/hwloc.git /tmp/hwloc
+
+          # ---------- 合并 TensorFlow 的构建配置 ----------
           cp -r /tmp/tensorflow/third_party/xla/third_party/hwloc/* /tmp/hwloc/
-          cp /tmp/hwloc/contrib/android/include/static-components.h /tmp/hwloc/static-components.h
           cp /tmp/hwloc/hwloc.BUILD /tmp/hwloc/BUILD.bazel
           printf '\nexports_files(["static-components.h"])\n' >> /tmp/hwloc/BUILD.bazel
           touch /tmp/hwloc/WORKSPACE
 
-          python3 -c "import re; c=open('/tmp/hwloc/BUILD.bazel').read(); c=re.sub(r'expand_template\(.*?name = \"include_hwloc_autogen_config_h\".*?\)\s*\n?','',c,flags=re.DOTALL); c=re.sub(r'expand_template\(.*?name = \"include_private_hwloc_autogen__config_h\".*?\)\s*\n?','',c,flags=re.DOTALL); c=re.sub(r'^.*topology-x86(?:_64)?\.c.*\n?','',c,flags=re.MULTILINE); c=c.replace('\"//conditions:default\": []','\"//conditions:default\": [\n        \"hwloc/topology-linux.c\",\n        \"include/hwloc/linux.h\",\n    ]'); c=re.sub(r',\s*,',',',c); c=re.sub(r'\[\s*,','[',c); c=re.sub(r',\s*\]',']',c); c=re.sub(r'\[\s*\]','[]',c); open('/tmp/hwloc/BUILD.bazel','w').write(c); print('✅ BUILD.bazel patched')"
-
+          # ---------- 使用 Git 仓库中自带的 Android 配置文件 ----------
+          cp /tmp/hwloc/contrib/android/include/static-components.h /tmp/hwloc/static-components.h
           cp /tmp/hwloc/contrib/android/include/private/autogen/config.h /tmp/hwloc/include/private/autogen/config.h
           cp /tmp/hwloc/contrib/android/include/hwloc/autogen/config.h /tmp/hwloc/include/hwloc/autogen/config.h
+
+          # ---------- 修补 BUILD.bazel ----------
+          python3 -c "import re; c=open('/tmp/hwloc/BUILD.bazel').read(); c=re.sub(r'expand_template\(.*?name = \"include_hwloc_autogen_config_h\".*?\)\s*\n?','',c,flags=re.DOTALL); c=re.sub(r'expand_template\(.*?name = \"include_private_hwloc_autogen__config_h\".*?\)\s*\n?','',c,flags=re.DOTALL); c=re.sub(r'^.*topology-x86(?:_64)?\.c.*\n?','',c,flags=re.MULTILINE); c=c.replace('\"//conditions:default\": []','\"//conditions:default\": [\n        \"hwloc/topology-linux.c\",\n        \"include/hwloc/linux.h\",\n    ]'); c=re.sub(r',\s*,',',',c); c=re.sub(r'\[\s*,','[',c); c=re.sub(r',\s*\]',']',c); c=re.sub(r'\[\s*\]','[]',c); open('/tmp/hwloc/BUILD.bazel','w').write(c); print('✅ BUILD.bazel patched')"
 
           echo "=== Final BUILD.bazel content ==="
           cat /tmp/hwloc/BUILD.bazel
