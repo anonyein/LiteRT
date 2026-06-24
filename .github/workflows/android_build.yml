@@ -189,13 +189,20 @@ jobs:
           printf '\nexports_files(["static-components.h"])\n' >> /tmp/hwloc/BUILD.bazel
           touch /tmp/hwloc/WORKSPACE
 
-          # 复制 Android 专用头文件到 BUILD.bazel 中 srcs 引用的真实路径
-          cp /tmp/hwloc/contrib/android/include/private/autogen/config.h /tmp/hwloc/include/private/autogen/config.h
-          cp /tmp/hwloc/contrib/android/include/hwloc/autogen/config.h /tmp/hwloc/include/hwloc/autogen/config.h
+          # 仅替换 static-components.h，不覆盖 config.h
           cp /tmp/hwloc/contrib/android/include/static-components.h /tmp/hwloc/hwloc/static-components.h
 
-          # 修补 BUILD.bazel（完整删除 expand_template 块、修改 default 分支、清理逗号）
-          python3 -c "import re; c=open('/tmp/hwloc/BUILD.bazel').read(); c=re.sub(r'expand_template\(.*?\n\)\s*\n?', '', c, flags=re.DOTALL); c=re.sub(r'^.*topology-x86(?:_64)?\.c.*\n?','',c,flags=re.MULTILINE); c=c.replace('\"//conditions:default\": []','\"//conditions:default\": [\n        \"hwloc/topology-linux.c\",\n        \"include/hwloc/linux.h\",\n    ]'); c=re.sub(r',\s*,',',',c); c=re.sub(r'\[\s*,','[',c); c=re.sub(r',\s*\]',']',c); c=re.sub(r'\[\s*\]','[]',c); c=c.replace('load(\"@bazel_skylib//rules:expand_template.bzl\", \"expand_template\")\n',''); c=c.replace('load(\"@local_config_cuda//cuda:build_defs.bzl\", \"if_cuda\")\n',''); open('/tmp/hwloc/BUILD.bazel','w').write(c); print('✅ BUILD.bazel patched')"
+          # 删除 move_static_components_h 规则（避免覆盖我们的文件），修改 default 分支，删除 topology-x86 行
+          python3 -c "import re; c=open('/tmp/hwloc/BUILD.bazel').read(); c=re.sub(r'expand_template\(\s*\n\s*name = \"move_static_components_h\".*?\n\s*\)\s*\n?', '', c, flags=re.DOTALL); c=re.sub(r'^.*topology-x86(?:_64)?\.c.*\n?','',c,flags=re.MULTILINE); c=c.replace('\"//conditions:default\": []','\"//conditions:default\": [\n        \"hwloc/topology-linux.c\",\n        \"include/hwloc/linux.h\",\n    ]'); c=re.sub(r',\s*,',',',c); c=re.sub(r'\[\s*,','[',c); c=re.sub(r',\s*\]',']',c); c=re.sub(r'\[\s*\]','[]',c); open('/tmp/hwloc/BUILD.bazel','w').write(c); print('✅ BUILD.bazel patched')"
+
+          # 修补 topology-linux.c 禁用 pthread affinity
+          LINUX_SRC="/tmp/hwloc/hwloc/topology-linux.c"
+          if [ -f "$LINUX_SRC" ]; then
+            sed -i '/#include "private\/autogen\/config.h"/a #undef HAVE_DECL_PTHREAD_SETAFFINITY_NP\n#define HAVE_DECL_PTHREAD_SETAFFINITY_NP 0\n#undef HAVE_DECL_PTHREAD_GETAFFINITY_NP\n#define HAVE_DECL_PTHREAD_GETAFFINITY_NP 0' "$LINUX_SRC"
+            echo "Patched topology-linux.c"
+          else
+            echo "topology-linux.c not found, skipping"
+          fi
 
           echo "=== Final BUILD.bazel content ==="
           cat /tmp/hwloc/BUILD.bazel
