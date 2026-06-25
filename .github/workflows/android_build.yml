@@ -624,8 +624,11 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 openjdk-17-jdk build-essential
+          sudo apt-get install -y python3 openjdk-17-jdk build-essential clang-18
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
+          echo "CC=/usr/lib/llvm-18/bin/clang" >> "$GITHUB_ENV"
+          echo "CXX=/usr/lib/llvm-18/bin/clang++" >> "$GITHUB_ENV"
+      # ===========================================================================
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
@@ -657,6 +660,9 @@ jobs:
           echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
+          echo "build --action_env=CC" >> .bazelrc
+          echo "build --action_env=CXX" >> .bazelrc
+      # ==================================================================================================
 
       - name: Disable layering_check globally and for monolithic config
         run: |
