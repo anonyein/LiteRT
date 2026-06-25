@@ -663,18 +663,6 @@ jobs:
           echo "build --action_env=CC" >> .bazelrc
           echo "build --action_env=CXX" >> .bazelrc
 
-      # ================== 新增：删除硬编码的 Clang 路径和封闭式工具链设置 ==================
-      - name: Remove hardcoded Clang paths and hermetic toolchain
-        run: |
-          # 删除 .litert_configure.bazelrc 中强制使用 Clang 18 的行
-          sed -i '/CLANG_COMPILER_PATH=\/usr\/lib\/llvm-18\/bin\/clang/d' .litert_configure.bazelrc
-          sed -i '/repo_env=CC=\/usr\/lib\/llvm-18\/bin\/clang/d' .litert_configure.bazelrc
-          sed -i '/repo_env=BAZEL_COMPILER=\/usr\/lib\/llvm-18\/bin\/clang/d' .litert_configure.bazelrc
-          # 删除 .bazelrc 中可能导致跳过自动检测的 USE_HERMETIC_CC_TOOLCHAIN=1
-          sed -i '/USE_HERMETIC_CC_TOOLCHAIN=1/d' .bazelrc
-          echo "✅ Removed hardcoded Clang paths and hermetic toolchain setting"
-      # =============================================================================
-
       - name: Disable layering_check globally and for monolithic config
         run: |
           echo "build --features=-layering_check" >> .bazelrc
@@ -733,6 +721,23 @@ jobs:
           TF_NEED_ANDROID: 1
           TF_SET_ANDROID_WORKSPACE: 1
 
+      - name: Clean up hardcoded Clang paths and hermetic toolchain
+        run: |
+          # 清理 .litert_configure.bazelrc 中的硬编码 Clang 18 路径
+          if [ -f .litert_configure.bazelrc ]; then
+            sed -i '/CLANG_COMPILER_PATH=\/usr\/lib\/llvm-18\/bin\/clang/d' .litert_configure.bazelrc
+            sed -i '/repo_env=CC=\/usr\/lib\/llvm-18\/bin\/clang/d' .litert_configure.bazelrc
+            sed -i '/repo_env=BAZEL_COMPILER=\/usr\/lib\/llvm-18\/bin\/clang/d' .litert_configure.bazelrc
+            echo "✅ Cleaned .litert_configure.bazelrc"
+          else
+            echo "⚠️ .litert_configure.bazelrc not found"
+          fi
+          # 清理 .bazelrc 中的封闭式工具链设置
+          if [ -f .bazelrc ]; then
+            sed -i '/USE_HERMETIC_CC_TOOLCHAIN=1/d' .bazelrc
+            echo "✅ Removed USE_HERMETIC_CC_TOOLCHAIN=1 from .bazelrc"
+          fi
+          
       # 打印当前的 .bazelrc 以便调试
       - name: Dump .bazelrc after configure
         run: |
