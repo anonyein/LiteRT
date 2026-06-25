@@ -624,12 +624,8 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 openjdk-17-jdk build-essential
-          # 强制重新安装 clang-18，即使已存在
-          sudo apt-get install --reinstall -y clang-18
+          sudo apt-get install -y python3 openjdk-17-jdk
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
-          echo "CC=/usr/bin/gcc" >> "$GITHUB_ENV"
-          echo "CXX=/usr/bin/g++" >> "$GITHUB_ENV"
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
