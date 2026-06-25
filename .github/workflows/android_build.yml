@@ -67,9 +67,9 @@ jobs:
               ]
               for flag, marker in flags_to_add:
                   if marker not in inner:
-                      if inner.strip() and not inner.strip().endswith(','):
-                          inner = inner.rstrip() + ',\n'
-                      inner += f'\n    "{flag}",'
+                      if inner.strip() and not inner.strip().endswith('\n'):
+                          inner += '\n'
+                      inner += f'    "{flag}"\n'
               return m.group(1) + inner + m.group(3)
       
           content = re.sub(build_flags_pattern, add_flags, content, flags=re.DOTALL)
