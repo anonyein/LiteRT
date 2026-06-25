@@ -706,6 +706,9 @@ jobs:
           echo "✅ Injected XNNPACK, KleidiAI overrides and static link flags"
           grep -n 'bazel build' ci/build_android_package.sh | head -5
 
+      - name: Install xz-utils for LLVM toolchain extraction
+        run: sudo apt-get install -y xz-utils
+
       # ---------- 环境配置与构建（不涉及 bazel 命令的部分提前） ----------
       - name: Install system dependencies
         run: |
