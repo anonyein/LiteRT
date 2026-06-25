@@ -732,24 +732,36 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
 
       # 以下修改 .bazelrc、配置等均不涉及 bazel 命令，提前至此
-      - name: Configure .bazelrc for NDK and overrides   # <-- 修改：在此统一配置 NDK 和仓库覆盖
+      # ---------- 确保 android_ndk_repository 存在并注册工具链 ----------
+      - name: Configure .bazelrc for NDK and overrides
         run: |
           echo "build --repo_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
           echo "build --action_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
-          # 将覆盖仓库写入 .bazelrc，确保所有构建自动应用
           echo "build --override_repository=XNNPACK=/tmp/xnnpack" >> .bazelrc
           echo "build --override_repository=KleidiAI=/tmp/kleidiai_repo" >> .bazelrc
           echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
 
-          # 注册 Android NDK 工具链以支持新式工具链解析
-          if grep -q 'android_ndk_repository\s*(' WORKSPACE; then
-            echo "WORKSPACE already has android_ndk_repository, registering its toolchains"
-            echo "build --extra_toolchains=@androidndk//:toolchain-libcpp" >> .bazelrc
+          # 1. 如果 WORKSPACE 中没有 android_ndk_repository，则追加定义
+          if ! grep -q 'android_ndk_repository\s*(' WORKSPACE; then
+            echo "Adding android_ndk_repository to WORKSPACE"
+            cat >> WORKSPACE << 'EOF'
+
+          # Android NDK repository
+          load("@bazel_tools//tools/build_defs/repo:android.bzl", "android_ndk_repository")
+          android_ndk_repository(
+              name = "androidndk",
+              path = "/tmp/android-ndk-r27",   # 直接使用固定路径（与 ANDROID_NDK_HOME 一致）
+              api_level = 26,
+          )
+          EOF
           else
-            echo "No android_ndk_repository in WORKSPACE, this may cause toolchain resolution failures"
+            echo "android_ndk_repository already in WORKSPACE"
           fi
+
+          # 2. 全局注册 Android NDK 提供的所有工具链（新式解析必需）
+          echo "build --extra_toolchains=@androidndk//:all" >> .bazelrc
           
       # 新增：彻底移除旧的 noincompatible 行，并强制 clang_local 也启用新解析
       - name: Force enable new toolchain resolution everywhere
