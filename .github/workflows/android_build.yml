@@ -768,6 +768,25 @@ jobs:
         uses: bazel-contrib/setup-bazel@0.9.0
         with:
           bazel-version: 7.0.0
+      
+      - name: Verify C++ toolchain resolution
+        run: |
+          echo "=== Checking C++ toolchain (toolchain_type) ==="
+          # 使用 --output=build 和 --toolchain_resolution_debug 捕获解析过程
+          bazel cquery \
+            --toolchain_resolution_debug='@bazel_tools//tools/cpp:toolchain_type' \
+            @bazel_tools//tools/cpp:toolchain_type \
+            --output=build 2>&1 | tee /tmp/toolchain_check.log
+      
+          # 检查是否出现工具链未找到错误
+          if grep -q -E "No matching toolchains|Unable to find a CC toolchain" /tmp/toolchain_check.log; then
+            echo "❌ C++ toolchain resolution FAILED!"
+            echo "---- Detailed debug output ----"
+            grep -A10 -B5 "No matching toolchains\|Unable to find a CC toolchain" /tmp/toolchain_check.log
+            exit 1
+          else
+            echo "✅ C++ toolchain seems resolvable."
+          fi
 
       # ===================== 新增：提前清空分析缓存，确保后续所有操作使用干净缓存 =====================
       - name: Purge Bazel analysis cache before any fetch/build
@@ -779,21 +798,20 @@ jobs:
       - name: Verify C++ toolchain resolution
         run: |
           echo "=== Checking C++ toolchain (toolchain_type) ==="
-          # 使用 cquery 仅分析，不实际构建，速度较快
-          # 并开启详细的工具链解析调试信息，方便定位问题
+          # 使用 --output=build 和 --toolchain_resolution_debug 捕获解析过程
           bazel cquery \
             --toolchain_resolution_debug='@bazel_tools//tools/cpp:toolchain_type' \
             @bazel_tools//tools/cpp:toolchain_type \
-            --output=summary 2>&1 | tee /tmp/toolchain_check.log
+            --output=build 2>&1 | tee /tmp/toolchain_check.log
       
-          # 检查输出中是否有 “No matching toolchains” 错误
-          if grep -q "No matching toolchains" /tmp/toolchain_check.log; then
+          # 检查是否出现工具链未找到错误
+          if grep -q -E "No matching toolchains|Unable to find a CC toolchain" /tmp/toolchain_check.log; then
             echo "❌ C++ toolchain resolution FAILED!"
             echo "---- Detailed debug output ----"
-            cat /tmp/toolchain_check.log
+            grep -A10 -B5 "No matching toolchains\|Unable to find a CC toolchain" /tmp/toolchain_check.log
             exit 1
           else
-            echo "✅ C++ toolchain seems resolvable (no 'No matching toolchains' found)."
+            echo "✅ C++ toolchain seems resolvable."
           fi
 
       # ======================= 以下步骤涉及 bazel fetch / info / build，保持原顺序 =======================
