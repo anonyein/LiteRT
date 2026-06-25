@@ -721,6 +721,13 @@ jobs:
           ANDROID_API_LEVEL: ${{ env.ANDROID_API_LEVEL }}
           TF_NEED_ANDROID: 1
           TF_SET_ANDROID_WORKSPACE: 1
+          
+      - name: Remove hardcoded Clang paths from .litert_configure.bazelrc
+        run: |
+          sed -i '/^build.*--repo_env=CC=\/usr\/lib\/llvm-18\/bin\/clang/d' .litert_configure.bazelrc
+          sed -i '/^build.*--repo_env=BAZEL_COMPILER=\/usr\/lib\/llvm-18\/bin\/clang/d' .litert_configure.bazelrc
+          sed -i '/^build.*--action_env CLANG_COMPILER_PATH=\/usr\/lib\/llvm-18\/bin\/clang/d' .litert_configure.bazelrc
+          echo "✅ Removed hardcoded Clang paths, Bazel will auto-detect GCC"
 
       # 打印当前的 .bazelrc 以便调试
       - name: Dump .bazelrc after configure
