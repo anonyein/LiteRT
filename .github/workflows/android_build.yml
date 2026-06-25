@@ -73,6 +73,7 @@ jobs:
                   '--copt=-UINTEL_MKL',
                   '--linkopt=-Wl,--undefined-version',
                   '--linkopt=-Wl,--allow-multiple-definition',
+                  '--incompatible_enable_android_toolchain_resolution=false',
               ]
               existing = set(re.findall(r'"([^"]*)"', block))
               new_flags = [f for f in required_flags if f not in existing]
@@ -732,56 +733,16 @@ jobs:
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
 
       # 以下修改 .bazelrc、配置等均不涉及 bazel 命令，提前至此
-      # ---------- 确保 android_ndk_repository 存在并注册工具链 ----------
-      - name: Configure .bazelrc for NDK and overrides
+      - name: Configure .bazelrc for NDK and overrides   # <-- 修改：在此统一配置 NDK 和仓库覆盖
         run: |
           echo "build --repo_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
           echo "build --action_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
+          # 将覆盖仓库写入 .bazelrc，确保所有构建自动应用
           echo "build --override_repository=XNNPACK=/tmp/xnnpack" >> .bazelrc
           echo "build --override_repository=KleidiAI=/tmp/kleidiai_repo" >> .bazelrc
           echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
-
-          # 1. 如果 WORKSPACE 中没有 android_ndk_repository，则追加定义
-          if ! grep -q 'android_ndk_repository\s*(' WORKSPACE; then
-            echo "Adding android_ndk_repository to WORKSPACE"
-            cat >> WORKSPACE << 'EOF'
-
-          # Android NDK repository
-          load("@bazel_tools//tools/build_defs/repo:android.bzl", "android_ndk_repository")
-          android_ndk_repository(
-              name = "androidndk",
-              path = "/tmp/android-ndk-r27",   # 直接使用固定路径（与 ANDROID_NDK_HOME 一致）
-              api_level = 26,
-          )
-          EOF
-          else
-            echo "android_ndk_repository already in WORKSPACE"
-          fi
-
-          # 2. 全局注册 Android NDK 提供的所有工具链（新式解析必需）
-          echo "build --extra_toolchains=@androidndk//:all" >> .bazelrc
-          
-      # 新增：彻底移除旧的 noincompatible 行，并强制 clang_local 也启用新解析
-      - name: Force enable new toolchain resolution everywhere
-        run: |
-          # 彻底删除所有旧模式禁用行
-          sed -i '/noincompatible_enable_cc_toolchain_resolution/d' .bazelrc
-          sed -i '/noincompatible_enable_android_toolchain_resolution/d' .bazelrc
-          # 删除旧的 crosstool_top 和 host_crosstool_top 配置
-          sed -i '/crosstool_top/d' .bazelrc
-          sed -i '/host_crosstool_top/d' .bazelrc
-          # 显式启用新模式（全局）
-          echo "build --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          echo "build --incompatible_enable_android_toolchain_resolution" >> .bazelrc
-          # 覆盖 clang_local 和 android，确保它们也使用新模式
-          echo "build:clang_local --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          echo "build:clang_local --incompatible_enable_android_toolchain_resolution" >> .bazelrc
-          echo "build:android --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          echo "build:android --incompatible_enable_android_toolchain_resolution" >> .bazelrc
-          echo "=== Final .bazelrc ==="
-          cat .bazelrc
 
       - name: Disable layering_check globally and for monolithic config
         run: |
@@ -1186,6 +1147,7 @@ jobs:
             -c opt \
             --cxxopt=--std=c++17 \
             --config=android_arm64 \
+            --fat_apk_cpu=x86,x86_64,arm64-v8a,armeabi-v7a \
             @XNNPACK//:XNNPACK \
             || { echo "❌ XNNPACK build failed"; exit 1; }
       
@@ -1198,7 +1160,6 @@ jobs:
             --noexperimental_cc_shared_library \
             --noincompatible_remove_legacy_whole_archive \
             -c opt \
-            --cxxopt=--std=c++17 \
             --config=android_arm64 \
             @KleidiAI//:matmul
           # 查找库文件：优先 .a，其次 .so，最后 .lo
