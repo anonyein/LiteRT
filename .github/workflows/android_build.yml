@@ -800,7 +800,13 @@ jobs:
           echo "=== Purging Bazel analysis cache to ensure all BUILD/bzl/tpl changes are picked up ==="
           bazel clean --expunge_async
           echo "✅ Cache purged. All subsequent bazel commands will re-analyze everything."
-
+      
+      - name: Generate host C++ toolchain explicitly
+        run: |
+          export CC=/usr/bin/gcc
+          export CXX=/usr/bin/g++
+          bazel run @bazel_tools//tools/cpp:cc_configure
+          echo "✅ Host toolchain generated"
 
       # ======================= 以下步骤涉及 bazel fetch / info / build，保持原顺序 =======================
       # 修复 libwebp：删除其 BUILD 文件中的 -msse4.1 选项
