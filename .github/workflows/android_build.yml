@@ -37,58 +37,91 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE"
           chmod +x ./ci/build_android_package.sh
-      
+
           # 备份原始脚本
           cp ./ci/build_android_package.sh ./ci/build_android_package.sh.bak
-      
+
           # ---------- 使用 Python 精确修补脚本 ----------
           python3 << 'PYEOF'
           import re
-      
+
           script_path = 'ci/build_android_package.sh'
           with open(script_path, 'r') as f:
               content = f.read()
-      
+
           # 1. 注释掉环境变量注入行
-          content = re.sub(r'^BUILD_FLAGS\+=\(\$\{BAZEL_CONFIG_FLAGS\}\)', r'# \g<0>', content, flags=re.MULTILINE)
-      
-          # 2. 移除所有 -mno-sse* 选项（出现在 bazel build 命令行中）
+          content = re.sub(
+              r'^BUILD_FLAGS\+=\(\$\{BAZEL_CONFIG_FLAGS\}\)',
+              r'# \g<0>',
+              content,
+              flags=re.MULTILINE
+          )
+
+          # 2. 移除所有 --copt=-mno-sse* 选项
           content = re.sub(r' --copt=-mno-sse4[^ ]*', '', content)
-      
-          # 3. 在 BUILD_FLAGS 数组中插入必要的编译/链接标志（如果不存在）
-          build_flags_pattern = r'(BUILD_FLAGS\s*=\s*\()([^)]*)(\))'
-          def add_flags(m):
-              inner = m.group(2)
-              flags_to_add = [
-                  ('--copt=-D__ANDROID__', '-D__ANDROID__'),
-                  ('--copt=-UINTEL_MKL', '-UINTEL_MKL'),
-                  ('--linkopt=-Wl,--undefined-version', '--undefined-version'),
-                  ('--linkopt=-Wl,--allow-multiple-definition', '--allow-multiple-definition'),
+
+          # 3. 修复 bazel build ... select-tf-ops 命令中的多余续行符
+          #    匹配模式：...lite \   （续行符后是换行）
+          #               \          （多余的续行符单独一行）
+          #               //tflite...
+          #    将其替换为：...lite \
+          #               //tflite...
+          content = re.sub(
+              r'(--define=TENSORFLOW_PROTOS=lite\s*\\\s*\n)\s*\\\s*\n(\s*//tflite/java:tensorflow-lite-select-tf-ops)',
+              r'\1\2',
+              content
+          )
+
+          # 4. 在 BUILD_FLAGS 数组中按原有格式插入必需的标志
+          def expand_build_flags(m):
+              block = m.group(0)            # 整个 BUILD_FLAGS=(...)
+              required_flags = [
+                  '--copt=-D__ANDROID__',
+                  '--copt=-UINTEL_MKL',
+                  '--linkopt=-Wl,--undefined-version',
+                  '--linkopt=-Wl,--allow-multiple-definition',
               ]
-              for flag, marker in flags_to_add:
-                  if marker not in inner:
-                      if inner.strip() and not inner.strip().endswith('\n'):
-                          inner += '\n'
-                      inner += f'    "{flag}"\n'
-              return m.group(1) + inner + m.group(3)
-      
-          content = re.sub(build_flags_pattern, add_flags, content, flags=re.DOTALL)
-      
+              existing = set(re.findall(r'"([^"]*)"', block))
+              new_flags = [f for f in required_flags if f not in existing]
+              if not new_flags:
+                  return block
+
+              # 构建新行：保留原缩进，最后一个原标志行末尾加 \，然后插入新标志
+              indent = '    '
+              # 匹配最后一个标志行（以 " 结尾，后跟可选空格和 ) ）
+              modified_block = re.sub(
+                  r'(\s*"(--show_timestamps|[^"]*)")(\s*\))$',
+                  lambda m: m.group(1) + ' \\\n' + \
+                            '\n'.join(f'{indent}"{flag}" \\' for flag in new_flags[:-1]) + \
+                            (f'\n{indent}"{new_flags[-1]}"' if new_flags else '') + \
+                            '\n)',
+                  block,
+                  flags=re.MULTILINE
+              )
+              return modified_block
+
+          content = re.sub(
+              r'BUILD_FLAGS\s*=\s*\(.*?\)',
+              expand_build_flags,
+              content,
+              flags=re.DOTALL
+          )
+
           with open(script_path, 'w') as f:
               f.write(content)
-      
+
           print("✅ Script patched successfully")
           PYEOF
-      
+
           # ---------- 打印修改后的完整脚本（带行号） ----------
           echo "=== Patched script content (full file) ==="
           cat -n ./ci/build_android_package.sh
           echo "=== Total lines: $(wc -l < ./ci/build_android_package.sh) ==="
-      
+
           # ---------- 打印差异 ----------
           echo "=== Diff from original ==="
           diff ./ci/build_android_package.sh.bak ./ci/build_android_package.sh || true
-      
+
           echo "=== Final build commands after patching ==="
           grep -n 'bazel build' ci/build_android_package.sh
 
