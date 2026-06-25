@@ -1194,7 +1194,13 @@ jobs:
           ./ci/build_android_package.sh
         env:
           RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
-          BAZEL_CONFIG_FLAGS: ${{ env.BAZEL_CONFIG_FLAGS }}
+          BAZEL_CONFIG_FLAGS: >-
+            ${{ env.BAZEL_CONFIG_FLAGS }}
+            --repo_env=USE_HERMETIC_CC_TOOLCHAIN=0
+            --repo_env=CC=/usr/bin/gcc
+            --repo_env=BAZEL_COMPILER=/usr/bin/gcc
+            --action_env=CC=/usr/bin/gcc
+            --action_env=CXX=/usr/bin/g++
 
       - name: List generated files
         run: find ./ci/gen -type f
