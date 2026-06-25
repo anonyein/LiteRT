@@ -17,7 +17,7 @@ concurrency:
 jobs:
   build-and-package:
     name: "Build AARs with Bazel"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04      # ← 从 ubuntu-latest 改为 ubuntu-22.04
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
       # 保持原有的编译选项，不在这里添加 override_repository
@@ -800,13 +800,6 @@ jobs:
           echo "=== Purging Bazel analysis cache to ensure all BUILD/bzl/tpl changes are picked up ==="
           bazel clean --expunge_async
           echo "✅ Cache purged. All subsequent bazel commands will re-analyze everything."
-      
-      - name: Generate host C++ toolchain explicitly
-        run: |
-          export CC=/usr/bin/gcc
-          export CXX=/usr/bin/g++
-          bazel run @bazel_tools//tools/cpp:cc_configure
-          echo "✅ Host toolchain generated"
 
       # ======================= 以下步骤涉及 bazel fetch / info / build，保持原顺序 =======================
       # 修复 libwebp：删除其 BUILD 文件中的 -msse4.1 选项
@@ -1155,33 +1148,6 @@ jobs:
           done
           echo "✅ hwloc compiled successfully for all Android architectures"
 
-      # - name: Diagnostic - Check if KleidiAI is actually linked
-      #   continue-on-error: true
-      #   run: |
-      #     set +e
-      #     echo "=== Building libtensorflowlite_jni.so to inspect link command ==="
-      #     bazel build --config=android_arm64 \
-      #       --override_repository=XNNPACK=/tmp/xnnpack \
-      #       --override_repository=KleidiAI=/tmp/kleidiai_repo \
-      #       -c opt \
-      #       --cxxopt=--std=c++17 \
-      #       --subcommands=pretty_print \
-      #       --verbose_failures \
-      #       //tflite/java:libtensorflowlite_jni.so 2>&1 | tee /tmp/link.log
-
-      #     echo ""
-      #     echo "=== Checking link log for KleidiAI libraries ==="
-      #     if grep -qi 'kleidiai\|libmatmul\|libcommon' /tmp/link.log; then
-      #       echo "✅ KleidiAI reference found in link command!"
-      #       grep -i 'kleidiai\|libmatmul\|libcommon' /tmp/link.log
-      #     else
-      #       echo "❌ No KleidiAI reference found in link command."
-      #     fi
-
-      #     echo ""
-      #     echo "=== Checking for parameter files ==="
-      #     find bazel-out/ -name 'libtensorflowlite_jni.so-2.params' -exec sh -c 'echo "--- {} ---"; cat "{}"' \;
-
       - name: Run build_android_package.sh
         run: |
           echo "=== Verifying BUILD file patch ==="
@@ -1203,13 +1169,7 @@ jobs:
           ./ci/build_android_package.sh
         env:
           RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
-          BAZEL_CONFIG_FLAGS: >-
-            ${{ env.BAZEL_CONFIG_FLAGS }}
-            --repo_env=USE_HERMETIC_CC_TOOLCHAIN=0
-            --repo_env=CC=/usr/bin/gcc
-            --repo_env=BAZEL_COMPILER=/usr/bin/gcc
-            --action_env=CC=/usr/bin/gcc
-            --action_env=CXX=/usr/bin/g++
+          BAZEL_CONFIG_FLAGS: ${{ env.BAZEL_CONFIG_FLAGS }}
 
       - name: List generated files
         run: find ./ci/gen -type f
