@@ -30,7 +30,12 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
-
+          
+      - name: Revert litert_builder_impl back to litert_builder
+        run: |
+          sed -i 's/":litert_builder_impl"/":litert_builder"/' litert/c/BUILD
+          grep -n 'litert_builder' litert/c/BUILD
+          
       - name: Patch build_android_package.sh
         run: |
           cd "$GITHUB_WORKSPACE"
