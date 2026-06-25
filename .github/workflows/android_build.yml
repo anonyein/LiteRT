@@ -749,6 +749,7 @@ jobs:
           echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
+          echo "build --noincompatible_enable_cc_toolchain_resolution" >> .bazelrc   # ← 添加这一行
 
       - name: Disable layering_check globally and for monolithic config
         run: |
