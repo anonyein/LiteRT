@@ -769,22 +769,22 @@ jobs:
         with:
           bazel-version: 7.0.0
       
-      - name: Verify Android C++ toolchain (android_arm64)
-        run: |
-          echo "=== Checking C++ toolchain for android_arm64 ==="
-          bazel cquery \
-            --config=android_arm64 \
-            --toolchain_resolution_debug='@bazel_tools//tools/cpp:toolchain_type' \
-            @bazel_tools//tools/cpp:toolchain_type \
-            --output=build 2>&1 | tee /tmp/android_toolchain_check.log
+      # - name: Verify Android C++ toolchain (android_arm64)
+      #   run: |
+      #     echo "=== Checking C++ toolchain for android_arm64 ==="
+      #     bazel cquery \
+      #       --config=android_arm64 \
+      #       --toolchain_resolution_debug='@bazel_tools//tools/cpp:toolchain_type' \
+      #       @bazel_tools//tools/cpp:toolchain_type \
+      #       --output=build 2>&1 | tee /tmp/android_toolchain_check.log
       
-          if grep -q -E "No matching toolchains|Unable to find a CC toolchain" /tmp/android_toolchain_check.log; then
-            echo "❌ Android C++ toolchain resolution FAILED!"
-            grep -A10 -B5 "No matching toolchains\|Unable to find a CC toolchain" /tmp/android_toolchain_check.log
-            exit 1
-          else
-            echo "✅ Android C++ toolchain seems resolvable."
-          fi
+      #     if grep -q -E "No matching toolchains|Unable to find a CC toolchain" /tmp/android_toolchain_check.log; then
+      #       echo "❌ Android C++ toolchain resolution FAILED!"
+      #       grep -A10 -B5 "No matching toolchains\|Unable to find a CC toolchain" /tmp/android_toolchain_check.log
+      #       exit 1
+      #     else
+      #       echo "✅ Android C++ toolchain seems resolvable."
+      #     fi
 
       # ===================== 新增：提前清空分析缓存，确保后续所有操作使用干净缓存 =====================
       - name: Purge Bazel analysis cache before any fetch/build
@@ -793,22 +793,37 @@ jobs:
           bazel clean --expunge_async
           echo "✅ Cache purged. All subsequent bazel commands will re-analyze everything."
 
-      - name: Verify Android C++ toolchain (android_arm64)
+      - name: Verify Android C++ toolchain for all architectures
         run: |
-          echo "=== Checking C++ toolchain for android_arm64 ==="
-          bazel cquery \
-            --config=android_arm64 \
-            --toolchain_resolution_debug='@bazel_tools//tools/cpp:toolchain_type' \
-            @bazel_tools//tools/cpp:toolchain_type \
-            --output=build 2>&1 | tee /tmp/android_toolchain_check.log
+          # 定义架构与对应平台的映射
+          declare -A ARCH_MAP
+          ARCH_MAP=(
+            ["arm64-v8a"]="@org_tensorflow//tensorflow/tools/toolchains/android:arm64-v8a"
+            ["armeabi-v7a"]="@org_tensorflow//tensorflow/tools/toolchains/android:armeabi-v7a"
+            ["x86"]="@org_tensorflow//tensorflow/tools/toolchains/android:x86"
+            ["x86_64"]="@org_tensorflow//tensorflow/tools/toolchains/android:x86_64"
+          )
       
-          if grep -q -E "No matching toolchains|Unable to find a CC toolchain" /tmp/android_toolchain_check.log; then
-            echo "❌ Android C++ toolchain resolution FAILED!"
-            grep -A10 -B5 "No matching toolchains\|Unable to find a CC toolchain" /tmp/android_toolchain_check.log
-            exit 1
-          else
-            echo "✅ Android C++ toolchain seems resolvable."
-          fi
+          for cpu in "${!ARCH_MAP[@]}"; do
+            platform="${ARCH_MAP[$cpu]}"
+            echo "=== Checking C++ toolchain for cpu=$cpu, platform=$platform ==="
+            bazel cquery \
+              --cpu="$cpu" \
+              --platforms="$platform" \
+              --crosstool_top=//external:android/crosstool \
+              --host_crosstool_top=@bazel_tools//tools/cpp:toolchain \
+              --toolchain_resolution_debug='@bazel_tools//tools/cpp:toolchain_type' \
+              @bazel_tools//tools/cpp:toolchain_type \
+              --output=build 2>&1 | tee "/tmp/android_toolchain_check_${cpu}.log"
+      
+            if grep -q -E "No matching toolchains|Unable to find a CC toolchain" "/tmp/android_toolchain_check_${cpu}.log"; then
+              echo "❌ Android C++ toolchain resolution FAILED for $cpu!"
+              grep -A10 -B5 "No matching toolchains\|Unable to find a CC toolchain" "/tmp/android_toolchain_check_${cpu}.log"
+              exit 1
+            else
+              echo "✅ Android C++ toolchain seems resolvable for $cpu."
+            fi
+          done
 
       # ======================= 以下步骤涉及 bazel fetch / info / build，保持原顺序 =======================
       # 修复 libwebp：删除其 BUILD 文件中的 -msse4.1 选项
