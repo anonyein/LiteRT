@@ -33,6 +33,63 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      - name: Patch build_android_package.sh
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          chmod +x ./ci/build_android_package.sh
+      
+          # 备份原始脚本
+          cp ./ci/build_android_package.sh ./ci/build_android_package.sh.bak
+      
+          # ---------- 使用 Python 精确修补脚本 ----------
+          python3 << 'PYEOF'
+          import re
+      
+          script_path = 'ci/build_android_package.sh'
+          with open(script_path, 'r') as f:
+              content = f.read()
+      
+          # 1. 注释掉环境变量注入行
+          content = re.sub(r'^BUILD_FLAGS\+=\(\$\{BAZEL_CONFIG_FLAGS\}\)', r'# \g<0>', content, flags=re.MULTILINE)
+      
+          # 2. 移除所有 -mno-sse* 选项（出现在 bazel build 命令行中）
+          content = re.sub(r' --copt=-mno-sse4[^ ]*', '', content)
+      
+          # 3. 在 BUILD_FLAGS 数组中插入必要的编译/链接标志（如果不存在）
+          build_flags_pattern = r'(BUILD_FLAGS\s*=\s*\()([^)]*)(\))'
+          def add_flags(m):
+              inner = m.group(2)
+              flags_to_add = [
+                  ('--copt=-D__ANDROID__', '-D__ANDROID__'),
+                  ('--copt=-UINTEL_MKL', '-UINTEL_MKL'),
+                  ('--linkopt=-Wl,--undefined-version', '--undefined-version'),
+                  ('--linkopt=-Wl,--allow-multiple-definition', '--allow-multiple-definition'),
+              ]
+              for flag, marker in flags_to_add:
+                  if marker not in inner:
+                      if inner.strip() and not inner.strip().endswith(','):
+                          inner = inner.rstrip() + ',\n'
+                      inner += f'\n    "{flag}",'
+              return m.group(1) + inner + m.group(3)
+      
+          content = re.sub(build_flags_pattern, add_flags, content, flags=re.DOTALL)
+      
+          with open(script_path, 'w') as f:
+              f.write(content)
+      
+          print("✅ Script patched successfully")
+          PYEOF
+      
+          # ---------- 打印修改后的脚本和差异 ----------
+          echo "=== Patched script content ==="
+          cat ./ci/build_android_package.sh
+      
+          echo "=== Diff from original ==="
+          diff ./ci/build_android_package.sh.bak ./ci/build_android_package.sh || true
+      
+          echo "=== Final build commands after patching (first 5) ==="
+          grep -n 'bazel build' ci/build_android_package.sh | head -5
+
       # ==================== 新增：克隆 TensorFlow 源码 ====================
       - name: Clone TensorFlow source
         run: |
@@ -1175,78 +1232,12 @@ jobs:
 
       - name: Run build_android_package.sh
         run: |
-          echo "=== Verifying BUILD file patch ==="
-          if grep -q '@KleidiAI' tflite/java/BUILD; then
-            echo "✅ BUILD file contains KleidiAI"
-          else
-            echo "❌ BUILD file MISSING KleidiAI"
-            exit 1
-          fi
-      
-          echo "=== Context around libtensorflowlite_jni.so target ==="
-          grep -n -B5 -A20 'name = "libtensorflowlite_jni.so"' tflite/java/BUILD
-      
           cd "$GITHUB_WORKSPACE"
-          chmod +x ./ci/build_android_package.sh
-      
-          # ---------- 备份原始脚本 ----------
-          cp ./ci/build_android_package.sh ./ci/build_android_package.sh.bak
-      
-          # ---------- 精确修补脚本（使用 Python） ----------
-          python3 << 'PYEOF'
-          import re
-      
-          script_path = 'ci/build_android_package.sh'
-          with open(script_path, 'r') as f:
-              content = f.read()
-      
-          # 1. 注释掉环境变量注入行：BUILD_FLAGS+=(${BAZEL_CONFIG_FLAGS})
-          content = re.sub(r'^BUILD_FLAGS\+=\(\$\{BAZEL_CONFIG_FLAGS\}\)', r'# \g<0>', content, flags=re.MULTILINE)
-      
-          # 2. 移除所有 -mno-sse* 选项（出现在 bazel build 命令行中）
-          content = re.sub(r' --copt=-mno-sse4[^ ]*', '', content)
-      
-          # 3. 在 BUILD_FLAGS 数组中插入必要的编译标志（如果还没有）
-          build_flags_pattern = r'(BUILD_FLAGS\s*=\s*\()([^)]*)(\))'
-          def add_flags(m):
-              inner = m.group(2)
-              # 检查是否已存在
-              if '-D__ANDROID__' not in inner:
-                  if inner.strip() and not inner.strip().endswith(','):
-                      inner = inner.rstrip() + ',\n'
-                  inner += '\n    "--copt=-D__ANDROID__",'
-              if '-UINTEL_MKL' not in inner:
-                  if inner.strip() and not inner.strip().endswith(','):
-                      inner = inner.rstrip() + ',\n'
-                  inner += '\n    "--copt=-UINTEL_MKL",'
-              return m.group(1) + inner + m.group(3)
-      
-          content = re.sub(build_flags_pattern, add_flags, content, flags=re.DOTALL)
-      
-          with open(script_path, 'w') as f:
-              f.write(content)
-      
-          print("✅ Script patched successfully")
-          PYEOF
-      
-          # ---------- 打印修改后的脚本 ----------
-          echo "=== Patched script content ==="
-          cat ./ci/build_android_package.sh
-      
-          echo "=== Diff from original ==="
-          diff ./ci/build_android_package.sh.bak ./ci/build_android_package.sh || true
-      
-          echo "=== Final build commands after patching (first 5) ==="
-          grep -n 'bazel build' ci/build_android_package.sh | head -5
-      
-          # 5. 清除环境变量，防止脚本中其他位置引用
-          unset BAZEL_CONFIG_FLAGS
-      
-          # 6. 运行修补后的脚本
+          # 不再需要修补，直接运行
           ./ci/build_android_package.sh
         env:
           RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
-          # 不再传递 BAZEL_CONFIG_FLAGS
+          # 不传递 BAZEL_CONFIG_FLAGS
 
       - name: List generated files
         run: find ./ci/gen -type f
