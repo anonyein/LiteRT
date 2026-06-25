@@ -743,19 +743,12 @@ jobs:
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
 
-          # 关键：使用 --android_ndk_repository 标志让 Bazel 自动注册 @androidndk 工具链
-          # 如果主仓库 WORKSPACE 已经定义了 android_ndk_repository，则改用 --extra_toolchains 注册已有工具链
+          # 注册 Android NDK 工具链以支持新式工具链解析
           if grep -q 'android_ndk_repository\s*(' WORKSPACE; then
             echo "WORKSPACE already has android_ndk_repository, registering its toolchains"
-            echo "build:android --extra_toolchains=@androidndk//:toolchain-libcpp" >> .bazelrc
-            echo "build:android_arm64 --extra_toolchains=@androidndk//:toolchain-libcpp" >> .bazelrc
-            echo "build:android_arm   --extra_toolchains=@androidndk//:toolchain-libcpp" >> .bazelrc
-            echo "build:android_x86   --extra_toolchains=@androidndk//:toolchain-libcpp" >> .bazelrc
-            echo "build:android_x86_64 --extra_toolchains=@androidndk//:toolchain-libcpp" >> .bazelrc
+            echo "build --extra_toolchains=@androidndk//:toolchain-libcpp" >> .bazelrc
           else
-            echo "No android_ndk_repository in WORKSPACE, using --android_ndk_repository flag"
-            echo "build --android_ndk_repository=$ANDROID_NDK_HOME" >> .bazelrc
-            echo "build --android_sdk_repository=$ANDROID_SDK_HOME" >> .bazelrc
+            echo "No android_ndk_repository in WORKSPACE, this may cause toolchain resolution failures"
           fi
           
       # 新增：彻底移除旧的 noincompatible 行，并强制 clang_local 也启用新解析
