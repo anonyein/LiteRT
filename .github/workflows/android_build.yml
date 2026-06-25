@@ -662,6 +662,9 @@ jobs:
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
           echo "build --action_env=CC" >> .bazelrc
           echo "build --action_env=CXX" >> .bazelrc
+          # 新增以下两行，让 Bazel 在自动检测时能找到 GCC
+          echo "build --repo_env=CC=/usr/bin/gcc" >> .bazelrc
+          echo "build --repo_env=CXX=/usr/bin/g++" >> .bazelrc
 
       - name: Disable layering_check globally and for monolithic config
         run: |
