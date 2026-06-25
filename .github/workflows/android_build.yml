@@ -769,23 +769,21 @@ jobs:
         with:
           bazel-version: 7.0.0
       
-      - name: Verify C++ toolchain resolution
+      - name: Verify Android C++ toolchain (android_arm64)
         run: |
-          echo "=== Checking C++ toolchain (toolchain_type) ==="
-          # 使用 --output=build 和 --toolchain_resolution_debug 捕获解析过程
+          echo "=== Checking C++ toolchain for android_arm64 ==="
           bazel cquery \
+            --config=android_arm64 \
             --toolchain_resolution_debug='@bazel_tools//tools/cpp:toolchain_type' \
             @bazel_tools//tools/cpp:toolchain_type \
-            --output=build 2>&1 | tee /tmp/toolchain_check.log
+            --output=build 2>&1 | tee /tmp/android_toolchain_check.log
       
-          # 检查是否出现工具链未找到错误
-          if grep -q -E "No matching toolchains|Unable to find a CC toolchain" /tmp/toolchain_check.log; then
-            echo "❌ C++ toolchain resolution FAILED!"
-            echo "---- Detailed debug output ----"
-            grep -A10 -B5 "No matching toolchains\|Unable to find a CC toolchain" /tmp/toolchain_check.log
+          if grep -q -E "No matching toolchains|Unable to find a CC toolchain" /tmp/android_toolchain_check.log; then
+            echo "❌ Android C++ toolchain resolution FAILED!"
+            grep -A10 -B5 "No matching toolchains\|Unable to find a CC toolchain" /tmp/android_toolchain_check.log
             exit 1
           else
-            echo "✅ C++ toolchain seems resolvable."
+            echo "✅ Android C++ toolchain seems resolvable."
           fi
 
       # ===================== 新增：提前清空分析缓存，确保后续所有操作使用干净缓存 =====================
@@ -795,23 +793,21 @@ jobs:
           bazel clean --expunge_async
           echo "✅ Cache purged. All subsequent bazel commands will re-analyze everything."
 
-      - name: Verify C++ toolchain resolution
+      - name: Verify Android C++ toolchain (android_arm64)
         run: |
-          echo "=== Checking C++ toolchain (toolchain_type) ==="
-          # 使用 --output=build 和 --toolchain_resolution_debug 捕获解析过程
+          echo "=== Checking C++ toolchain for android_arm64 ==="
           bazel cquery \
+            --config=android_arm64 \
             --toolchain_resolution_debug='@bazel_tools//tools/cpp:toolchain_type' \
             @bazel_tools//tools/cpp:toolchain_type \
-            --output=build 2>&1 | tee /tmp/toolchain_check.log
+            --output=build 2>&1 | tee /tmp/android_toolchain_check.log
       
-          # 检查是否出现工具链未找到错误
-          if grep -q -E "No matching toolchains|Unable to find a CC toolchain" /tmp/toolchain_check.log; then
-            echo "❌ C++ toolchain resolution FAILED!"
-            echo "---- Detailed debug output ----"
-            grep -A10 -B5 "No matching toolchains\|Unable to find a CC toolchain" /tmp/toolchain_check.log
+          if grep -q -E "No matching toolchains|Unable to find a CC toolchain" /tmp/android_toolchain_check.log; then
+            echo "❌ Android C++ toolchain resolution FAILED!"
+            grep -A10 -B5 "No matching toolchains\|Unable to find a CC toolchain" /tmp/android_toolchain_check.log
             exit 1
           else
-            echo "✅ C++ toolchain seems resolvable."
+            echo "✅ Android C++ toolchain seems resolvable."
           fi
 
       # ======================= 以下步骤涉及 bazel fetch / info / build，保持原顺序 =======================
