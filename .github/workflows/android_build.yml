@@ -21,10 +21,9 @@ jobs:
     env:
       RELEASE_VERSION: "0.0.0-nightly-SNAPSHOT"
       # 保持原有的编译选项，不在这里添加 override_repository
-      # 移除了干扰工具链解析的 --incompatible_enable_android_toolchain_resolution=false
-      BAZEL_CONFIG_FLAGS: "--linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL"
+      BAZEL_CONFIG_FLAGS: "--incompatible_enable_android_toolchain_resolution=false --linkopt=-Wl,--undefined-version --linkopt=-Wl,--allow-multiple-definition --copt=-D__ANDROID__ --copt=-UINTEL_MKL"
       ANDROID_API_LEVEL: "36"
-      NDK_VERSION: "r27"
+      NDK_VERSION: "r29"
       KLEIDIAI_COMMIT: "51f7190558e51b7415d9ba24994fb477d7371446"
 
     steps:
@@ -617,7 +616,6 @@ jobs:
       # ---------- Inject overrides into build script ----------  ← 【修改 3】同时注入 --noexperimental_cc_shared_library
       - name: Inject overrides into build script
         run: |
-          # 不要在 sed 中注入 ANDROID_NDK_API_LEVEL，它将自动从 bazelrc 读取环境变量
           sed -i 's/bazel build/bazel build --override_repository=XNNPACK=\/tmp\/xnnpack --override_repository=KleidiAI=\/tmp\/kleidiai_repo --noexperimental_cc_shared_library --noincompatible_remove_legacy_whole_archive /g' ci/build_android_package.sh
           echo "✅ Injected XNNPACK, KleidiAI overrides and static link flags"
           grep -n 'bazel build' ci/build_android_package.sh | head -5
@@ -648,7 +646,7 @@ jobs:
           echo "ANDROID_SDK_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
 
-      # 【修复4】在 .bazelrc 显式关闭 Android CC 工具链解析，回归传统 crosstool
+      # 以下修改 .bazelrc、配置等均不涉及 bazel 命令，提前至此
       - name: Configure .bazelrc for NDK and overrides   # <-- 修改：在此统一配置 NDK 和仓库覆盖
         run: |
           echo "build --repo_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
@@ -659,16 +657,6 @@ jobs:
           echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
-
-          # 【修复核心】：全面封杀新版 CC 工具链解析，同时修复宿主机构建通道
-          echo "build --noincompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          # 明确指定宿主机编译也不走新机制的工具链解析，而是走 hermetic 旧通道
-          echo "build --host_crosstool_top=@bazel_tools//tools/cpp:toolchain" >> .bazelrc
-          
-          for arch in android android_arm64 android_arm android_x86 android_x86_64; do
-            echo "build:${arch} --noincompatible_enable_cc_toolchain_resolution" >> .bazelrc
-            echo "build:${arch} --noincompatible_enable_android_toolchain_resolution" >> .bazelrc
-          done
 
       - name: Disable layering_check globally and for monolithic config
         run: |
