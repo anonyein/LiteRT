@@ -624,7 +624,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 openjdk-17-jdk
+          sudo apt-get install -y python3 openjdk-17-jdk build-essential
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
 
       - name: Set up Android SDK
