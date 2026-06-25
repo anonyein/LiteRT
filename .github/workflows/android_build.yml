@@ -80,15 +80,17 @@ jobs:
           print("✅ Script patched successfully")
           PYEOF
       
-          # ---------- 打印修改后的脚本和差异 ----------
-          echo "=== Patched script content ==="
-          cat ./ci/build_android_package.sh
+          # ---------- 打印修改后的完整脚本（带行号） ----------
+          echo "=== Patched script content (full file) ==="
+          cat -n ./ci/build_android_package.sh
+          echo "=== Total lines: $(wc -l < ./ci/build_android_package.sh) ==="
       
+          # ---------- 打印差异 ----------
           echo "=== Diff from original ==="
           diff ./ci/build_android_package.sh.bak ./ci/build_android_package.sh || true
       
-          echo "=== Final build commands after patching (first 5) ==="
-          grep -n 'bazel build' ci/build_android_package.sh | head -5
+          echo "=== Final build commands after patching ==="
+          grep -n 'bazel build' ci/build_android_package.sh
 
       # ==================== 新增：克隆 TensorFlow 源码 ====================
       - name: Clone TensorFlow source
