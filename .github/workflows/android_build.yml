@@ -749,18 +749,12 @@ jobs:
           echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
-          # 启用新工具链解析（修复 fat APK 构建时 toolchain 找不到的问题）
-          echo "build --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
-
+          
       # 新增：彻底移除旧的 noincompatible 行，并强制 clang_local 也启用新解析
       - name: Force enable new toolchain resolution everywhere
         run: |
           # 删除所有 noincompatible_enable_cc_toolchain_resolution 行（包括配置块内的）
           sed -i '/--noincompatible_enable_cc_toolchain_resolution/d' .bazelrc
-          # 确保 clang_local 启用新解析，避免被原始配置覆盖
-          echo "build:clang_local --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          # 同时也为 android 配置添加（因为 android 继承 clang_local）
-          echo "build:android --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
           # 打印 .bazelrc 验证
           echo "=== Final .bazelrc ==="
           cat .bazelrc
