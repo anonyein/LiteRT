@@ -660,18 +660,15 @@ jobs:
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
 
-          # 强制全局及所有 Android 配置禁用 CC/Android platform-based toolchain resolution
+          # 【修复核心】：全面封杀新版 CC 工具链解析，同时修复宿主机构建通道
           echo "build --noincompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          echo "build:android --noincompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          echo "build:android --noincompatible_enable_android_toolchain_resolution" >> .bazelrc
-          echo "build:android_arm64 --noincompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          echo "build:android_arm64 --noincompatible_enable_android_toolchain_resolution" >> .bazelrc
-          echo "build:android_arm --noincompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          echo "build:android_arm --noincompatible_enable_android_toolchain_resolution" >> .bazelrc
-          echo "build:android_x86 --noincompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          echo "build:android_x86 --noincompatible_enable_android_toolchain_resolution" >> .bazelrc
-          echo "build:android_x86_64 --noincompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          echo "build:android_x86_64 --noincompatible_enable_android_toolchain_resolution" >> .bazelrc
+          # 明确指定宿主机编译也不走新机制的工具链解析，而是走 hermetic 旧通道
+          echo "build --host_crosstool_top=@bazel_tools//tools/cpp:toolchain" >> .bazelrc
+          
+          for arch in android android_arm64 android_arm android_x86 android_x86_64; do
+            echo "build:${arch} --noincompatible_enable_cc_toolchain_resolution" >> .bazelrc
+            echo "build:${arch} --noincompatible_enable_android_toolchain_resolution" >> .bazelrc
+          done
 
       - name: Disable layering_check globally and for monolithic config
         run: |
