@@ -754,6 +754,9 @@ jobs:
           # 彻底删除所有旧模式禁用行
           sed -i '/noincompatible_enable_cc_toolchain_resolution/d' .bazelrc
           sed -i '/noincompatible_enable_android_toolchain_resolution/d' .bazelrc
+          # 删除旧的 crosstool_top 和 host_crosstool_top 配置
+          sed -i '/crosstool_top/d' .bazelrc
+          sed -i '/host_crosstool_top/d' .bazelrc
           # 显式启用新模式（全局）
           echo "build --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
           echo "build --incompatible_enable_android_toolchain_resolution" >> .bazelrc
@@ -1236,6 +1239,7 @@ jobs:
               -c opt \
               --cxxopt=--std=c++17 \
               --config=$arch \
+              --fat_apk_cpu=x86,x86_64,arm64-v8a,armeabi-v7a \
               @XNNPACK//:XNNPACK \
               || echo "Prebuild for $arch completed with warnings (cache partial)"
           done
@@ -1254,6 +1258,7 @@ jobs:
               -c opt \
               --cxxopt=--std=c++17 \
               --config=$arch \
+              --fat_apk_cpu=x86,x86_64,arm64-v8a,armeabi-v7a \
               @hwloc//:hwloc \
               || { echo "❌ hwloc build failed for $arch"; exit 1; }
           done
