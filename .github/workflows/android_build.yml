@@ -31,11 +31,6 @@ jobs:
           fetch-depth: 0
           submodules: recursive
           
-      - name: Revert litert_builder_impl back to litert_builder
-        run: |
-          sed -i 's/":litert_builder_impl"/":litert_builder"/' litert/c/BUILD
-          grep -n 'litert_builder' litert/c/BUILD
-          
       - name: Patch build_android_package.sh
         run: |
           cd "$GITHUB_WORKSPACE"
@@ -78,7 +73,7 @@ jobs:
                   '--copt=-UINTEL_MKL',
                   '--linkopt=-Wl,--undefined-version',
                   '--linkopt=-Wl,--allow-multiple-definition',
-                  '--incompatible_enable_android_toolchain_resolution=false',
+                  '--incompatible_enable_android_toolchain_resolution=true',
               ]
               existing = set(re.findall(r'"([^"]*)"', block))
               new_flags = [f for f in required_flags if f not in existing]
