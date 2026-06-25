@@ -625,9 +625,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3 openjdk-17-jdk build-essential clang-18
+          # 创建符号链接，让 Bazel 能通过 cc/gcc 找到 clang
+          sudo ln -sf /usr/lib/llvm-18/bin/clang /usr/bin/cc
+          sudo ln -sf /usr/lib/llvm-18/bin/clang++ /usr/bin/c++
+          sudo ln -sf /usr/lib/llvm-18/bin/clang /usr/bin/gcc
+          sudo ln -sf /usr/lib/llvm-18/bin/clang++ /usr/bin/g++
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
           echo "CC=/usr/lib/llvm-18/bin/clang" >> "$GITHUB_ENV"
           echo "CXX=/usr/lib/llvm-18/bin/clang++" >> "$GITHUB_ENV"
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
       # ===========================================================================
 
       - name: Set up Android SDK
