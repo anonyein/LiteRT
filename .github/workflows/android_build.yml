@@ -750,13 +750,7 @@ jobs:
         run: |
           WORKSPACE="/tmp/tensorflow/WORKSPACE"
           if ! grep -q 'android_ndk_repository' "$WORKSPACE"; then
-            cat >> "$WORKSPACE" << EOF
-            android_ndk_repository(
-                name = "androidndk",
-                path = "$ANDROID_NDK_HOME",
-                api_level = 26,
-            )
-            EOF
+            printf '\nandroid_ndk_repository(\n    name = "androidndk",\n    path = "%s",\n    api_level = 26,\n)\n' "$ANDROID_NDK_HOME" >> "$WORKSPACE"
             echo "✅ Added NDK repository"
           else
             echo "✅ NDK repository already present"
