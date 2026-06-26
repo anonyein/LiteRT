@@ -62,22 +62,6 @@ jobs:
       
           echo "=== Fixed WORKSPACE (full content) ==="
           cat WORKSPACE
-      
-      - name: Verify NDK toolchain registration
-        run: |
-          cd "$GITHUB_WORKSPACE"
-          bazel query @androidndk//:toolchain --output=build 2>&1 | head -10 || {
-            echo "❌ NDK toolchain not found"
-            exit 1
-          }
-          echo "✅ NDK toolchain exists"
-      
-      - name: Run build_android_package.sh
-        env:
-          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
-        run: |
-          cd "$GITHUB_WORKSPACE"
-          ./ci/build_android_package.sh
     
       - name: Patch build_android_package.sh
         run: |
