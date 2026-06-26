@@ -31,6 +31,54 @@ jobs:
           fetch-depth: 0
           submodules: recursive
           
+      - name: Fix WORKSPACE NDK (add rules_android_ndk, reorder)
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          cp WORKSPACE WORKSPACE.bak
+      
+          # 生成官方 NDK 配置块文件，避免 heredoc 缩进问题
+          printf '%s\n' \
+            'load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")' \
+            'http_archive(' \
+            '    name = "rules_android_ndk",' \
+            '    sha256 = "07e7a2777113bb3d0a432265d1c78cfaa140a5bc4c82be4c8cd988b34382ec90",' \
+            '    strip_prefix = "rules_android_ndk-0.1.5",' \
+            '    url = "https://github.com/bazelbuild/rules_android_ndk/releases/download/v0.1.5/rules_android_ndk-v0.1.5.tar.gz",' \
+            ')' \
+            'load("@rules_android_ndk//:rules.bzl", "android_ndk_repository")' \
+            '' \
+            'android_ndk_repository(name = "androidndk")' \
+            '' \
+            'register_toolchains("@androidndk//:all")' \
+            > /tmp/ndk_block.txt
+      
+          # 删除 WORKSPACE 末尾旧的 NDK 块（从 "# Android rules." 到 "register_toolchains(@androidndk"）
+          sed -i '/^# Android rules\. Need latest/,/^register_toolchains(@androidndk/d' WORKSPACE
+      
+          # 在 workspace(name = "litert") 之后插入新配置块
+          WS_LINE=$(grep -n '^workspace(name = "litert")' WORKSPACE | head -1 | cut -d: -f1)
+          sed -i "${WS_LINE}r /tmp/ndk_block.txt" WORKSPACE
+      
+          echo "=== Fixed WORKSPACE (full content) ==="
+          cat WORKSPACE
+      
+      - name: Verify NDK toolchain registration
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          bazel query @androidndk//:toolchain --output=build 2>&1 | head -10 || {
+            echo "❌ NDK toolchain not found"
+            exit 1
+          }
+          echo "✅ NDK toolchain exists"
+      
+      - name: Run build_android_package.sh
+        env:
+          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          ./ci/build_android_package.sh
+    
       - name: Patch build_android_package.sh
         run: |
           cd "$GITHUB_WORKSPACE"
