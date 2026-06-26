@@ -1262,7 +1262,16 @@ jobs:
       - name: Run build_android_package.sh
         run: |
           cd "$GITHUB_WORKSPACE"
-          # 不再需要修补，直接运行
+          
+          echo "=== Contents of build_android_package.sh ==="
+          cat ./ci/build_android_package.sh
+          echo "==========================================="
+          
+          echo "=== Android environment variables ==="
+          env | grep -E 'ANDROID|RELEASE_VERSION' || echo "(none)"
+          echo "======================================"
+          
+          echo "=== Now executing build script ==="
           ./ci/build_android_package.sh
         env:
           RELEASE_VERSION: ${{ env.RELEASE_VERSION }}
