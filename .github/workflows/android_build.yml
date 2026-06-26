@@ -748,7 +748,7 @@ jobs:
 
       - name: Manually register Android NDK in WORKSPACE
         run: |
-          WORKSPACE="$GITHUB_WORKSPACE/tmp/tensorflow/WORKSPACE"
+          WORKSPACE="/tmp/tensorflow/WORKSPACE"
           if ! grep -q 'android_ndk_repository' "$WORKSPACE"; then
             printf '\nandroid_ndk_repository(\n    name = "androidndk",\n    path = "%s",\n    api_level = 26,\n)\n' "$ANDROID_NDK_HOME" >> "$WORKSPACE"
             echo "✅ Added NDK repository"
