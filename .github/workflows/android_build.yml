@@ -139,6 +139,7 @@ jobs:
                   '--linkopt=-Wl,--allow-multiple-definition',
                   '--noincompatible_enable_android_toolchain_resolution',
                   '--noincompatible_enable_cc_toolchain_resolution',
+                  '--platforms=',
               ]
               existing = set(re.findall(r'"([^"]*)"', block))
               new_flags = [f for f in required_flags if f not in existing]
