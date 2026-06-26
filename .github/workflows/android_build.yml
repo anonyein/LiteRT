@@ -55,6 +55,7 @@ jobs:
       
           # 2. 生成 NDK 配置块（不重复 load(http_archive)，因为原文件已有）
           printf '%s\n' \
+            'load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")' \
             'http_archive(' \
             '    name = "rules_android_ndk",' \
             '    sha256 = "07e7a2777113bb3d0a432265d1c78cfaa140a5bc4c82be4c8cd988b34382ec90",' \
