@@ -131,7 +131,7 @@ jobs:
                   '--copt=-UINTEL_MKL',
                   '--linkopt=-Wl,--undefined-version',
                   '--linkopt=-Wl,--allow-multiple-definition',
-                  # '--incompatible_enable_android_toolchain_resolution=false',
+                  '--incompatible_enable_android_toolchain_resolution=false',
               ]
               existing = set(re.findall(r'"([^"]*)"', block))
               new_flags = [f for f in required_flags if f not in existing]
