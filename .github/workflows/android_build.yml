@@ -73,7 +73,7 @@ jobs:
                   '--copt=-UINTEL_MKL',
                   '--linkopt=-Wl,--undefined-version',
                   '--linkopt=-Wl,--allow-multiple-definition',
-                  '--incompatible_enable_android_toolchain_resolution=false',
+                  # '--incompatible_enable_android_toolchain_resolution=false',
               ]
               existing = set(re.findall(r'"([^"]*)"', block))
               new_flags = [f for f in required_flags if f not in existing]
@@ -1254,10 +1254,10 @@ jobs:
           echo "=== Final .bazelrc ==="
           cat .bazelrc
           
-      - name: Remove conflicting android_toolchain_resolution=false from build script
-        run: |
-          sed -i 's/'--incompatible_enable_android_toolchain_resolution=false',//g' ci/build_android_package.sh
-          grep -n 'incompatible_enable_android_toolchain_resolution' ci/build_android_package.sh || echo "Cleaned"
+      # - name: Remove conflicting android_toolchain_resolution=false from build script
+      #   run: |
+      #     sed -i 's/'--incompatible_enable_android_toolchain_resolution=false',//g' ci/build_android_package.sh
+      #     grep -n 'incompatible_enable_android_toolchain_resolution' ci/build_android_package.sh || echo "Cleaned"
     
       - name: Run build_android_package.sh
         run: |
