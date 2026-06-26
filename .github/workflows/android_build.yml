@@ -746,6 +746,22 @@ jobs:
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
 
+      - name: Manually register Android NDK in WORKSPACE
+        run: |
+          WORKSPACE="/tmp/tensorflow/WORKSPACE"
+          if ! grep -q 'android_ndk_repository' "$WORKSPACE"; then
+            cat >> "$WORKSPACE" << EOF
+            android_ndk_repository(
+                name = "androidndk",
+                path = "$ANDROID_NDK_HOME",
+                api_level = 26,
+            )
+            EOF
+            echo "✅ Added NDK repository"
+          else
+            echo "✅ NDK repository already present"
+          fi
+
       # 在 Enable KleidiAI for arm64 + fix hwloc x86 步骤中
       - name: Enable KleidiAI for arm64 (and disable for x86) + fix hwloc x86
         run: |
@@ -1258,6 +1274,16 @@ jobs:
       #   run: |
       #     sed -i 's/'--incompatible_enable_android_toolchain_resolution=false',//g' ci/build_android_package.sh
       #     grep -n 'incompatible_enable_android_toolchain_resolution' ci/build_android_package.sh || echo "Cleaned"
+      
+      - name: Force NDK toolchain for all Android configs
+        run: |
+          for config in android_arm64 android_arm android_x86 android_x86_64; do
+            if ! grep -q "build:$config --crosstool_top=@androidndk" .bazelrc; then
+              echo "build:$config --crosstool_top=@androidndk//:toolchain" >> .bazelrc
+              echo "build:$config --host_crosstool_top=@bazel_tools//tools/cpp:toolchain" >> .bazelrc
+            fi
+          done
+          echo "✅ .bazelrc updated for all Android configs"
     
       - name: Run build_android_package.sh
         run: |
