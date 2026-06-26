@@ -37,9 +37,24 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           cp WORKSPACE WORKSPACE.bak
       
-          # 生成官方 NDK 配置块（不包含 load(http_archive)，因为原文件已有）
+          # 1. 保存原文件末尾的 SDK 块（从 "# Conditionally declare Android SDK" 开始到文件结束）
+          if grep -q "^# Conditionally declare Android SDK" WORKSPACE; then
+            sed -n '/^# Conditionally declare Android SDK/,$ p' WORKSPACE > /tmp/sdk_block.txt
+          else
+            # 如果原文件没有，就用一个默认的
+            cat > /tmp/sdk_block.txt <<'SDKEOF'
+          # Conditionally declare Android SDK repository at the bottom using built-in maybe.
+          load("@bazel_tools//tools/build_defs/repo:utils.bzl", "maybe")
+      
+          maybe(
+              android_sdk_repository,
+              name = "androidsdk",
+          )
+          SDKEOF
+          fi
+      
+          # 2. 生成 NDK 配置块（不重复 load(http_archive)，因为原文件已有）
           printf '%s\n' \
-            'load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")' \
             'http_archive(' \
             '    name = "rules_android_ndk",' \
             '    sha256 = "07e7a2777113bb3d0a432265d1c78cfaa140a5bc4c82be4c8cd988b34382ec90",' \
@@ -53,17 +68,19 @@ jobs:
             'register_toolchains("@androidndk//:all")' \
             > /tmp/ndk_block.txt
       
-          # 精确删除旧 NDK 块（从 "# Android rules." 到 "register_toolchains(@androidndk" 那一行）
-          # 注意：不删除下面的 maybe(android_sdk_repository...)
-          sed -i '/^# Android rules\. Need latest/,/^register_toolchains(@androidndk/d' WORKSPACE
+          # 3. 从原 WORKSPACE 中删除所有旧的 NDK 相关行和 SDK 块（即从 "# Android rules." 到文件末尾）
+          #    先找到 "# Android rules." 第一次出现的位置，删除其后所有内容
+          if grep -q "^# Android rules\. Need latest" WORKSPACE; then
+            LINE_NUM=$(grep -n "^# Android rules\. Need latest" WORKSPACE | head -1 | cut -d: -f1)
+            sed -i "${LINE_NUM},\$d" WORKSPACE
+          fi
       
-          # 同时删除旧 NDK 块后面可能残留的环境检测 load 和 check 调用（若有）
-          # 例如 "load(\"//:android_ndk_env.bzl\"...)" 和 "check_android_ndk_env" 等行，它们已经不需要了
-          sed -i '/^load("\/\/:android_ndk_env\.bzl"/,/^register_toolchains(@androidndk/d' WORKSPACE
-      
-          # 在 workspace(name = "litert") 之后插入新配置块
+          # 4. 在 workspace 行后插入新的 NDK 块
           WS_LINE=$(grep -n '^workspace(name = "litert")' WORKSPACE | head -1 | cut -d: -f1)
           sed -i "${WS_LINE}r /tmp/ndk_block.txt" WORKSPACE
+      
+          # 5. 在文件末尾追加 SDK 块
+          cat /tmp/sdk_block.txt >> WORKSPACE
       
           echo "=== Fixed WORKSPACE (full content) ==="
           cat WORKSPACE
