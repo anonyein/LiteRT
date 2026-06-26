@@ -67,6 +67,10 @@ jobs:
             'android_ndk_repository(name = "androidndk")' \
             '' \
             'register_toolchains("@androidndk//:all")' \
+            '' \
+            'load("@bazel_tools//tools/jdk:remote_jdk11_repo.bzl", "remote_jdk11_repo")' \
+            'remote_jdk11_repo(name = "remote_jdk11")' \
+            'register_toolchains("@remote_jdk11//:toolchain")' \
             > /tmp/ndk_block.txt
       
           # 3. 从原 WORKSPACE 中删除所有旧的 NDK 相关行和 SDK 块（即从 "# Android rules." 到文件末尾）
@@ -76,7 +80,7 @@ jobs:
             sed -i "${LINE_NUM},\$d" WORKSPACE
           fi
       
-          # 4. 在 workspace 行后插入新的 NDK 块
+          # 4. 在 workspace 行后插入新的 NDK + JDK 块
           WS_LINE=$(grep -n '^workspace(name = "litert")' WORKSPACE | head -1 | cut -d: -f1)
           sed -i "${WS_LINE}r /tmp/ndk_block.txt" WORKSPACE
       
@@ -85,6 +89,7 @@ jobs:
       
           echo "=== Fixed WORKSPACE (full content) ==="
           cat WORKSPACE
+
     
       - name: Patch build_android_package.sh
         run: |
