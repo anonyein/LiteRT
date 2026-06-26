@@ -1262,7 +1262,7 @@ jobs:
       - name: Run build_android_package.sh
         run: |
           cd "$GITHUB_WORKSPACE"
-          
+          sed -i '/BUILD_FLAGS=(/a\    "--toolchain_resolution_debug=@bazel_tools//tools/cpp:toolchain_type" \\' ./ci/build_android_package.sh
           echo "=== Contents of build_android_package.sh ==="
           cat ./ci/build_android_package.sh
           echo "==========================================="
