@@ -140,6 +140,7 @@ jobs:
                   '--noincompatible_enable_android_toolchain_resolution',
                   '--noincompatible_enable_cc_toolchain_resolution',
                   '--platforms=',
+                  '--crosstool_top=@androidndk//:toolchain-libcpp',
               ]
               existing = set(re.findall(r'"([^"]*)"', block))
               new_flags = [f for f in required_flags if f not in existing]
