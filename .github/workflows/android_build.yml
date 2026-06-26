@@ -922,6 +922,49 @@ jobs:
           echo "=== Modified .bazelrc (android config line) ==="
           grep -n 'with_xla_support' .bazelrc || echo "No with_xla_support lines found"
       # ================================================================
+      
+      # ===================== 新增：预置修补后的 cpuinfo 仓库 =====================
+      - name: Prepare fixed cpuinfo repository
+        run: |
+          CPUINFO_DIR="/tmp/cpuinfo_fixed"
+          git clone --depth 1 https://github.com/pytorch/cpuinfo.git "$CPUINFO_DIR"
+          BUILD_FILE="$CPUINFO_DIR/BUILD.bazel"
+
+          # 使用Python修改BUILD.bazel，为cpuinfo_impl的select添加default条件
+          python3 << 'PYEOF'
+          import re
+
+          build_file = "/tmp/cpuinfo_fixed/BUILD.bazel"
+          with open(build_file, "r") as f:
+              content = f.read()
+
+          # 找到android_arm64条件的srcs列表
+          arm64_match = re.search(r'"@@cpuinfo//:android_arm64"\s*:\s*(\[.*?\])', content, re.DOTALL)
+          if not arm64_match:
+              print("❌ Could not find android_arm64 condition in cpuinfo BUILD, falling back to linux_aarch64")
+              # 尝试使用linux_aarch64的列表作为默认
+              arm64_match = re.search(r'"@@cpuinfo//:linux_aarch64"\s*:\s*(\[.*?\])', content, re.DOTALL)
+              if not arm64_match:
+                  raise Exception("Neither android_arm64 nor linux_aarch64 condition found")
+          arm64_srcs = arm64_match.group(1)
+
+          # 在select的最后一个条件后插入default条件
+          def add_default(m):
+              inner = m.group(1)
+              # 在最后一个 "}," 或 "}" 之前插入
+              new_inner = inner.rstrip() + ',\n        "//conditions:default": ' + arm64_srcs + '\n    '
+              return 'select({' + new_inner + '})'
+
+          # 匹配整个select块（假设只有一个select用于cpuinfo_impl的srcs）
+          content = re.sub(r'(select\(\{.*?\}\))', add_default, content, flags=re.DOTALL)
+
+          with open(build_file, "w") as f:
+              f.write(content)
+          print("✅ Added default condition to cpuinfo_impl select")
+          PYEOF
+
+          echo "=== Patched cpuinfo BUILD (first 50 lines) ==="
+          head -50 "$BUILD_FILE"
 
       # ---------- 至此，所有不涉及 bazel 命令的修改文件步骤已完成，接下来安装 bazel ----------
       - name: Setup Bazel
@@ -935,6 +978,12 @@ jobs:
           echo "=== Purging Bazel analysis cache to ensure all BUILD/bzl/tpl changes are picked up ==="
           bazel clean --expunge_async
           echo "✅ Cache purged. All subsequent bazel commands will re-analyze everything."
+
+      - name: Override cpuinfo with fixed repository
+        run: |
+          echo "build --override_repository=cpuinfo=/tmp/cpuinfo_fixed" >> .bazelrc
+          echo "✅ cpuinfo override added to .bazelrc"
+      # ====================================================================
 
       - name: Verify Android C++ toolchain for all architectures
         run: |
