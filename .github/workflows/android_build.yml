@@ -1256,7 +1256,7 @@ jobs:
           
       - name: Remove conflicting android_toolchain_resolution=false from build script
         run: |
-          sed -i 's/--incompatible_enable_android_toolchain_resolution=false//g' ci/build_android_package.sh
+          sed -i 's/'--incompatible_enable_android_toolchain_resolution=false',//g' ci/build_android_package.sh
           grep -n 'incompatible_enable_android_toolchain_resolution' ci/build_android_package.sh || echo "Cleaned"
     
       - name: Run build_android_package.sh
