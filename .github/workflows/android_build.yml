@@ -31,13 +31,13 @@ jobs:
           fetch-depth: 0
           submodules: recursive
           
-      - name: Fix WORKSPACE NDK (add rules_android_ndk, reorder)
+      - name: Fix WORKSPACE NDK (add rules_android_ndk, reorder, preserve SDK)
         run: |
           set -e
           cd "$GITHUB_WORKSPACE"
           cp WORKSPACE WORKSPACE.bak
       
-          # 生成官方 NDK 配置块文件，避免 heredoc 缩进问题
+          # 生成官方 NDK 配置块（不包含 load(http_archive)，因为原文件已有）
           printf '%s\n' \
             'load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")' \
             'http_archive(' \
@@ -53,8 +53,13 @@ jobs:
             'register_toolchains("@androidndk//:all")' \
             > /tmp/ndk_block.txt
       
-          # 删除 WORKSPACE 末尾旧的 NDK 块（从 "# Android rules." 到 "register_toolchains(@androidndk"）
+          # 精确删除旧 NDK 块（从 "# Android rules." 到 "register_toolchains(@androidndk" 那一行）
+          # 注意：不删除下面的 maybe(android_sdk_repository...)
           sed -i '/^# Android rules\. Need latest/,/^register_toolchains(@androidndk/d' WORKSPACE
+      
+          # 同时删除旧 NDK 块后面可能残留的环境检测 load 和 check 调用（若有）
+          # 例如 "load(\"//:android_ndk_env.bzl\"...)" 和 "check_android_ndk_env" 等行，它们已经不需要了
+          sed -i '/^load("\/\/:android_ndk_env\.bzl"/,/^register_toolchains(@androidndk/d' WORKSPACE
       
           # 在 workspace(name = "litert") 之后插入新配置块
           WS_LINE=$(grep -n '^workspace(name = "litert")' WORKSPACE | head -1 | cut -d: -f1)
