@@ -735,22 +735,33 @@ jobs:
           echo "ANDROID_SDK_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> "$GITHUB_ENV"
 
-      # 以下修改 .bazelrc、配置等均不涉及 bazel 命令，提前至此
-      - name: Configure .bazelrc for NDK and overrides   # <-- 修改：在此统一配置 NDK 和仓库覆盖
+      # ---------- 配置 .bazelrc 和 WORKSPACE ----------
+      - name: Configure .bazelrc for NDK and overrides
         run: |
           echo "build --repo_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
           echo "build --action_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
-          # 将覆盖仓库写入 .bazelrc，确保所有构建自动应用
           echo "build --override_repository=XNNPACK=/tmp/xnnpack" >> .bazelrc
           echo "build --override_repository=KleidiAI=/tmp/kleidiai_repo" >> .bazelrc
           echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
 
-      - name: Disable layering_check globally and for monolithic config
-        run: |
-          echo "build --features=-layering_check" >> .bazelrc
-          echo "build:monolithic --features=-layering_check" >> .bazelrc
+          # 若 WORKSPACE 无 android_ndk_repository，则用 echo 追加（避免 heredoc 缩进问题）
+          if ! grep -q 'android_ndk_repository\s*(' WORKSPACE; then
+            echo "Adding android_ndk_repository to WORKSPACE"
+            echo "" >> WORKSPACE
+            echo "load(\"@bazel_tools//tools/build_defs/repo:android.bzl\", \"android_ndk_repository\")" >> WORKSPACE
+            echo "android_ndk_repository(" >> WORKSPACE
+            echo "    name = \"androidndk\"," >> WORKSPACE
+            echo "    path = \"/tmp/android-ndk-r27\"," >> WORKSPACE
+            echo "    api_level = 26," >> WORKSPACE
+            echo ")" >> WORKSPACE
+          else
+            echo "android_ndk_repository already in WORKSPACE"
+          fi
+
+          # 注册 NDK 工具链（新式解析必需）
+          echo "build --extra_toolchains=@androidndk//:all" >> .bazelrc
 
       # 在 Enable KleidiAI for arm64 + fix hwloc x86 步骤中
       - name: Enable KleidiAI for arm64 (and disable for x86) + fix hwloc x86
@@ -1260,6 +1271,11 @@ jobs:
           echo "=== Final .bazelrc ==="
           cat .bazelrc
           
+      - name: Remove conflicting android_toolchain_resolution=false from build script
+        run: |
+          sed -i 's/--incompatible_enable_android_toolchain_resolution=false//g' ci/build_android_package.sh
+          grep -n 'incompatible_enable_android_toolchain_resolution' ci/build_android_package.sh || echo "Cleaned"
+    
       - name: Run build_android_package.sh
         run: |
           cd "$GITHUB_WORKSPACE"
