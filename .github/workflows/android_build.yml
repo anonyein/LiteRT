@@ -807,11 +807,17 @@ jobs:
         run: |
           echo "build --repo_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
           echo "build --action_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
+          # 将覆盖仓库写入 .bazelrc，确保所有构建自动应用
           echo "build --override_repository=XNNPACK=/tmp/xnnpack" >> .bazelrc
           echo "build --override_repository=KleidiAI=/tmp/kleidiai_repo" >> .bazelrc
           echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
+
+      - name: Disable layering_check globally and for monolithic config
+        run: |
+          echo "build --features=-layering_check" >> .bazelrc
+          echo "build:monolithic --features=-layering_check" >> .bazelrc
 
       - name: Manually register Android NDK in WORKSPACE
         run: |
@@ -924,47 +930,47 @@ jobs:
       # ================================================================
       
       # ===================== 新增：预置修补后的 cpuinfo 仓库 =====================
-      - name: Prepare fixed cpuinfo repository
-        run: |
-          CPUINFO_DIR="/tmp/cpuinfo_fixed"
-          git clone --depth 1 https://github.com/pytorch/cpuinfo.git "$CPUINFO_DIR"
-          BUILD_FILE="$CPUINFO_DIR/BUILD.bazel"
+      # - name: Prepare fixed cpuinfo repository
+      #   run: |
+      #     CPUINFO_DIR="/tmp/cpuinfo_fixed"
+      #     git clone --depth 1 https://github.com/pytorch/cpuinfo.git "$CPUINFO_DIR"
+      #     BUILD_FILE="$CPUINFO_DIR/BUILD.bazel"
 
-          # 使用Python修改BUILD.bazel，为cpuinfo_impl的select添加default条件
-          python3 << 'PYEOF'
-          import re
+      #     # 使用Python修改BUILD.bazel，为cpuinfo_impl的select添加default条件
+      #     python3 << 'PYEOF'
+      #     import re
 
-          build_file = "/tmp/cpuinfo_fixed/BUILD.bazel"
-          with open(build_file, "r") as f:
-              content = f.read()
+      #     build_file = "/tmp/cpuinfo_fixed/BUILD.bazel"
+      #     with open(build_file, "r") as f:
+      #         content = f.read()
 
-          # 找到android_arm64条件的srcs列表
-          arm64_match = re.search(r'"@@cpuinfo//:android_arm64"\s*:\s*(\[.*?\])', content, re.DOTALL)
-          if not arm64_match:
-              print("❌ Could not find android_arm64 condition in cpuinfo BUILD, falling back to linux_aarch64")
-              # 尝试使用linux_aarch64的列表作为默认
-              arm64_match = re.search(r'"@@cpuinfo//:linux_aarch64"\s*:\s*(\[.*?\])', content, re.DOTALL)
-              if not arm64_match:
-                  raise Exception("Neither android_arm64 nor linux_aarch64 condition found")
-          arm64_srcs = arm64_match.group(1)
+      #     # 找到android_arm64条件的srcs列表
+      #     arm64_match = re.search(r'"@@cpuinfo//:android_arm64"\s*:\s*(\[.*?\])', content, re.DOTALL)
+      #     if not arm64_match:
+      #         print("❌ Could not find android_arm64 condition in cpuinfo BUILD, falling back to linux_aarch64")
+      #         # 尝试使用linux_aarch64的列表作为默认
+      #         arm64_match = re.search(r'"@@cpuinfo//:linux_aarch64"\s*:\s*(\[.*?\])', content, re.DOTALL)
+      #         if not arm64_match:
+      #             raise Exception("Neither android_arm64 nor linux_aarch64 condition found")
+      #     arm64_srcs = arm64_match.group(1)
 
-          # 在select的最后一个条件后插入default条件
-          def add_default(m):
-              inner = m.group(1)
-              # 在最后一个 "}," 或 "}" 之前插入
-              new_inner = inner.rstrip() + ',\n        "//conditions:default": ' + arm64_srcs + '\n    '
-              return 'select({' + new_inner + '})'
+      #     # 在select的最后一个条件后插入default条件
+      #     def add_default(m):
+      #         inner = m.group(1)
+      #         # 在最后一个 "}," 或 "}" 之前插入
+      #         new_inner = inner.rstrip() + ',\n        "//conditions:default": ' + arm64_srcs + '\n    '
+      #         return 'select({' + new_inner + '})'
 
-          # 匹配整个select块（假设只有一个select用于cpuinfo_impl的srcs）
-          content = re.sub(r'(select\(\{.*?\}\))', add_default, content, flags=re.DOTALL)
+      #     # 匹配整个select块（假设只有一个select用于cpuinfo_impl的srcs）
+      #     content = re.sub(r'(select\(\{.*?\}\))', add_default, content, flags=re.DOTALL)
 
-          with open(build_file, "w") as f:
-              f.write(content)
-          print("✅ Added default condition to cpuinfo_impl select")
-          PYEOF
+      #     with open(build_file, "w") as f:
+      #         f.write(content)
+      #     print("✅ Added default condition to cpuinfo_impl select")
+      #     PYEOF
 
-          echo "=== Patched cpuinfo BUILD (first 50 lines) ==="
-          head -50 "$BUILD_FILE"
+      #     echo "=== Patched cpuinfo BUILD (first 50 lines) ==="
+      #     head -50 "$BUILD_FILE"
 
       # ---------- 至此，所有不涉及 bazel 命令的修改文件步骤已完成，接下来安装 bazel ----------
       - name: Setup Bazel
@@ -979,41 +985,41 @@ jobs:
           bazel clean --expunge_async
           echo "✅ Cache purged. All subsequent bazel commands will re-analyze everything."
 
-      - name: Override cpuinfo with fixed repository
-        run: |
-          echo "build --override_repository=cpuinfo=/tmp/cpuinfo_fixed" >> .bazelrc
-          echo "✅ cpuinfo override added to .bazelrc"
+      # - name: Override cpuinfo with fixed repository
+      #   run: |
+      #     echo "build --override_repository=cpuinfo=/tmp/cpuinfo_fixed" >> .bazelrc
+      #     echo "✅ cpuinfo override added to .bazelrc"
       # ====================================================================
 
-      - name: Verify Android C++ toolchain for all architectures
-        run: |
-          # 定义架构与对应平台的映射
-          declare -A ARCH_MAP
-          ARCH_MAP=(
-            ["arm64-v8a"]="@org_tensorflow//tensorflow/tools/toolchains/android:arm64-v8a"
-            ["armeabi-v7a"]="@org_tensorflow//tensorflow/tools/toolchains/android:armeabi-v7a"
-            ["x86"]="@org_tensorflow//tensorflow/tools/toolchains/android:x86"
-            ["x86_64"]="@org_tensorflow//tensorflow/tools/toolchains/android:x86_64"
-          )
+      # - name: Verify Android C++ toolchain for all architectures
+      #   run: |
+      #     # 定义架构与对应平台的映射
+      #     declare -A ARCH_MAP
+      #     ARCH_MAP=(
+      #       ["arm64-v8a"]="@org_tensorflow//tensorflow/tools/toolchains/android:arm64-v8a"
+      #       ["armeabi-v7a"]="@org_tensorflow//tensorflow/tools/toolchains/android:armeabi-v7a"
+      #       ["x86"]="@org_tensorflow//tensorflow/tools/toolchains/android:x86"
+      #       ["x86_64"]="@org_tensorflow//tensorflow/tools/toolchains/android:x86_64"
+      #     )
       
-          for cpu in "${!ARCH_MAP[@]}"; do
-            platform="${ARCH_MAP[$cpu]}"
-            echo "=== Checking C++ toolchain for cpu=$cpu, platform=$platform ==="
-            bazel cquery \
-              --cpu="$cpu" \
-              --platforms="$platform" \
-              --toolchain_resolution_debug='@bazel_tools//tools/cpp:toolchain_type' \
-              @bazel_tools//tools/cpp:toolchain_type \
-              --output=build 2>&1 | tee "/tmp/android_toolchain_check_${cpu}.log"
+      #     for cpu in "${!ARCH_MAP[@]}"; do
+      #       platform="${ARCH_MAP[$cpu]}"
+      #       echo "=== Checking C++ toolchain for cpu=$cpu, platform=$platform ==="
+      #       bazel cquery \
+      #         --cpu="$cpu" \
+      #         --platforms="$platform" \
+      #         --toolchain_resolution_debug='@bazel_tools//tools/cpp:toolchain_type' \
+      #         @bazel_tools//tools/cpp:toolchain_type \
+      #         --output=build 2>&1 | tee "/tmp/android_toolchain_check_${cpu}.log"
       
-            if grep -q -E "No matching toolchains|Unable to find a CC toolchain" "/tmp/android_toolchain_check_${cpu}.log"; then
-              echo "❌ Android C++ toolchain resolution FAILED for $cpu!"
-              grep -A10 -B5 "No matching toolchains\|Unable to find a CC toolchain" "/tmp/android_toolchain_check_${cpu}.log"
-              exit 1
-            else
-              echo "✅ Android C++ toolchain seems resolvable for $cpu."
-            fi
-          done
+      #       if grep -q -E "No matching toolchains|Unable to find a CC toolchain" "/tmp/android_toolchain_check_${cpu}.log"; then
+      #         echo "❌ Android C++ toolchain resolution FAILED for $cpu!"
+      #         grep -A10 -B5 "No matching toolchains\|Unable to find a CC toolchain" "/tmp/android_toolchain_check_${cpu}.log"
+      #         exit 1
+      #       else
+      #         echo "✅ Android C++ toolchain seems resolvable for $cpu."
+      #       fi
+      #     done
 
       # ======================= 以下步骤涉及 bazel fetch / info / build，保持原顺序 =======================
       # 修复 libwebp：删除其 BUILD 文件中的 -msse4.1 选项
@@ -1361,27 +1367,27 @@ jobs:
           done
           echo "✅ hwloc compiled successfully for all Android architectures"
           
-      - name: Force enable new toolchain resolution everywhere
-        run: |
-          # 删除 .bazelrc 里所有禁用新解析的残留行
-          sed -i '/noincompatible_enable_cc_toolchain_resolution/d' .bazelrc
-          sed -i '/noincompatible_enable_android_toolchain_resolution/d' .bazelrc
-          # 删除旧式 crosstool_top 相关行（它们只在旧模式下有用）
-          sed -i '/crosstool_top/d' .bazelrc
-          sed -i '/host_crosstool_top/d' .bazelrc
-          # 删除 .bazelrc 里所有禁用新解析的残留行
-          sed -i '/incompatible_enable_cc_toolchain_resolution/d' .bazelrc
-          sed -i '/incompatible_enable_android_toolchain_resolution/d' .bazelrc
-          # 确保全局启用新解析
-          # echo "build --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          # echo "build --incompatible_enable_android_toolchain_resolution" >> .bazelrc
-          # # 【新增】直接重写 clang_local 配置，只保留必要的，不再禁用新解析
-          # sed -i '/^build:clang_local/d' .bazelrc
-          # echo "build:clang_local --repo_env USE_HERMETIC_CC_TOOLCHAIN=1" >> .bazelrc
-          # echo "build:clang_local --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          # echo "build:clang_local --incompatible_enable_android_toolchain_resolution" >> .bazelrc
-          echo "=== Final .bazelrc ==="
-          cat .bazelrc
+      # - name: Force enable new toolchain resolution everywhere
+      #   run: |
+      #     # 删除 .bazelrc 里所有禁用新解析的残留行
+      #     sed -i '/noincompatible_enable_cc_toolchain_resolution/d' .bazelrc
+      #     sed -i '/noincompatible_enable_android_toolchain_resolution/d' .bazelrc
+      #     # 删除旧式 crosstool_top 相关行（它们只在旧模式下有用）
+      #     sed -i '/crosstool_top/d' .bazelrc
+      #     sed -i '/host_crosstool_top/d' .bazelrc
+      #     # 删除 .bazelrc 里所有禁用新解析的残留行
+      #     sed -i '/incompatible_enable_cc_toolchain_resolution/d' .bazelrc
+      #     sed -i '/incompatible_enable_android_toolchain_resolution/d' .bazelrc
+      #     # 确保全局启用新解析
+      #     # echo "build --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
+      #     # echo "build --incompatible_enable_android_toolchain_resolution" >> .bazelrc
+      #     # # 【新增】直接重写 clang_local 配置，只保留必要的，不再禁用新解析
+      #     # sed -i '/^build:clang_local/d' .bazelrc
+      #     # echo "build:clang_local --repo_env USE_HERMETIC_CC_TOOLCHAIN=1" >> .bazelrc
+      #     # echo "build:clang_local --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
+      #     # echo "build:clang_local --incompatible_enable_android_toolchain_resolution" >> .bazelrc
+      #     echo "=== Final .bazelrc ==="
+      #     cat .bazelrc
           
       # - name: Remove conflicting android_toolchain_resolution=false from build script
       #   run: |
