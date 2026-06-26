@@ -755,13 +755,6 @@ jobs:
           else
             echo "✅ NDK repository already present"
           fi
-          WORKSPACE="$GITHUB_WORKSPACE/WORKSPACE"
-          if ! grep -q 'android_ndk_repository' "$WORKSPACE"; then
-            printf '\nandroid_ndk_repository(\n    name = "androidndk",\n    path = "%s",\n    api_level = 26,\n)\n' "$ANDROID_NDK_HOME" >> "$WORKSPACE"
-            echo "✅ Added NDK repository"
-          else
-            echo "✅ NDK repository already present"
-          fi
 
       # 在 Enable KleidiAI for arm64 + fix hwloc x86 步骤中
       - name: Enable KleidiAI for arm64 (and disable for x86) + fix hwloc x86
