@@ -131,8 +131,8 @@ jobs:
                   '--copt=-UINTEL_MKL',
                   '--linkopt=-Wl,--undefined-version',
                   '--linkopt=-Wl,--allow-multiple-definition',
-                  '--incompatible_enable_android_toolchain_resolution=false',
-                  '--incompatible_enable_cc_toolchain_resolution=false',
+                  '--noincompatible_enable_android_toolchain_resolution',
+                  '--noincompatible_enable_cc_toolchain_resolution',
               ]
               existing = set(re.findall(r'"([^"]*)"', block))
               new_flags = [f for f in required_flags if f not in existing]
@@ -1312,14 +1312,17 @@ jobs:
           # 删除旧式 crosstool_top 相关行（它们只在旧模式下有用）
           sed -i '/crosstool_top/d' .bazelrc
           sed -i '/host_crosstool_top/d' .bazelrc
+          # 删除 .bazelrc 里所有禁用新解析的残留行
+          sed -i '/incompatible_enable_cc_toolchain_resolution/d' .bazelrc
+          sed -i '/incompatible_enable_android_toolchain_resolution/d' .bazelrc
           # 确保全局启用新解析
-          echo "build --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          echo "build --incompatible_enable_android_toolchain_resolution" >> .bazelrc
-          # 【新增】直接重写 clang_local 配置，只保留必要的，不再禁用新解析
-          sed -i '/^build:clang_local/d' .bazelrc
-          echo "build:clang_local --repo_env USE_HERMETIC_CC_TOOLCHAIN=1" >> .bazelrc
-          echo "build:clang_local --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
-          echo "build:clang_local --incompatible_enable_android_toolchain_resolution" >> .bazelrc
+          # echo "build --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
+          # echo "build --incompatible_enable_android_toolchain_resolution" >> .bazelrc
+          # # 【新增】直接重写 clang_local 配置，只保留必要的，不再禁用新解析
+          # sed -i '/^build:clang_local/d' .bazelrc
+          # echo "build:clang_local --repo_env USE_HERMETIC_CC_TOOLCHAIN=1" >> .bazelrc
+          # echo "build:clang_local --incompatible_enable_cc_toolchain_resolution" >> .bazelrc
+          # echo "build:clang_local --incompatible_enable_android_toolchain_resolution" >> .bazelrc
           echo "=== Final .bazelrc ==="
           cat .bazelrc
           
