@@ -748,7 +748,14 @@ jobs:
 
       - name: Manually register Android NDK in WORKSPACE
         run: |
-          WORKSPACE="/tmp/tensorflow/WORKSPACE"
+          WORKSPACE="$GITHUB_WORKSPACE/tmp/tensorflow/WORKSPACE"
+          if ! grep -q 'android_ndk_repository' "$WORKSPACE"; then
+            printf '\nandroid_ndk_repository(\n    name = "androidndk",\n    path = "%s",\n    api_level = 26,\n)\n' "$ANDROID_NDK_HOME" >> "$WORKSPACE"
+            echo "✅ Added NDK repository"
+          else
+            echo "✅ NDK repository already present"
+          fi
+          WORKSPACE="$GITHUB_WORKSPACE/WORKSPACE"
           if ! grep -q 'android_ndk_repository' "$WORKSPACE"; then
             printf '\nandroid_ndk_repository(\n    name = "androidndk",\n    path = "%s",\n    api_level = 26,\n)\n' "$ANDROID_NDK_HOME" >> "$WORKSPACE"
             echo "✅ Added NDK repository"
@@ -1269,15 +1276,24 @@ jobs:
       #     sed -i 's/'--incompatible_enable_android_toolchain_resolution=false',//g' ci/build_android_package.sh
       #     grep -n 'incompatible_enable_android_toolchain_resolution' ci/build_android_package.sh || echo "Cleaned"
       
-      - name: Force NDK toolchain for all Android configs
+      # - name: Force NDK toolchain for all Android configs
+      #   run: |
+      #     for config in android_arm64 android_arm android_x86 android_x86_64; do
+      #       if ! grep -q "build:$config --crosstool_top=@androidndk" .bazelrc; then
+      #         echo "build:$config --crosstool_top=@androidndk//:toolchain" >> .bazelrc
+      #         echo "build:$config --host_crosstool_top=@bazel_tools//tools/cpp:toolchain" >> .bazelrc
+      #       fi
+      #     done
+      #     echo "✅ .bazelrc updated for all Android configs"
+      
+      - name: Verify NDK toolchain registration
         run: |
-          for config in android_arm64 android_arm android_x86 android_x86_64; do
-            if ! grep -q "build:$config --crosstool_top=@androidndk" .bazelrc; then
-              echo "build:$config --crosstool_top=@androidndk//:toolchain" >> .bazelrc
-              echo "build:$config --host_crosstool_top=@bazel_tools//tools/cpp:toolchain" >> .bazelrc
-            fi
-          done
-          echo "✅ .bazelrc updated for all Android configs"
+          cd "$GITHUB_WORKSPACE"
+          bazel query @androidndk//:toolchain --output=build 2>&1 | head -10 || {
+            echo "❌ NDK toolchain not found"
+            exit 1
+          }
+          echo "✅ NDK toolchain exists"
     
       - name: Run build_android_package.sh
         run: |
