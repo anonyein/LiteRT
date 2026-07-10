@@ -189,18 +189,15 @@ jobs:
       - name: Fix segmentation_example BUILD (add litert_profiler deps)
         run: |
           cd "$GITHUB_WORKSPACE"
-          # 备份原文件（可选）
           cp tensor/examples/segmentation/BUILD tensor/examples/segmentation/BUILD.bak
       
-          # 在 deps 列表中插入两个 profiler 依赖
-          sed -i '/"\/\/tensor\/runners\/litert:litert_dynamic_runner",/a \        "//litert/c:litert_profiler",\n        "//litert/cc:litert_profiler",' tensor/examples/segmentation/BUILD
+          # 只匹配非注释行（行首为空格/制表符，然后双引号）
+          sed -i '/^[[:space:]]*"\/\/tensor\/runners\/litert:litert_dynamic_runner",/a \        "//litert/c:litert_profiler",\n        "//litert/cc:litert_profiler",' tensor/examples/segmentation/BUILD
       
           echo "✅ Patched tensor/examples/segmentation/BUILD"
           echo "=== Modified BUILD file (full content) ==="
           cat tensor/examples/segmentation/BUILD
           echo "=== End of BUILD file ==="
-      
-          # 可选：只显示相关行验证
           echo "=== Relevant deps lines ==="
           grep -A 5 -B 5 'litert_profiler' tensor/examples/segmentation/BUILD || true
 
