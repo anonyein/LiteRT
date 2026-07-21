@@ -306,19 +306,31 @@ jobs:
           PYEOF
 
       # ==================== 新增：克隆 TensorFlow 源码 ====================
-      # 注意：固定到 TF master 在 LLVM 集成 commit 之前的最后一个稳定版本，
-      # 避免 TF upstream 的 lit_test.patch 与新版 LLVM 内容不匹配导致的
-      # CONTENT_DOES_NOT_MATCH_TARGET 错误（参考 730dd99d478d 这次集成）。
       - name: Clone TensorFlow source
         run: |
-          git init -q /tmp/tensorflow
-          cd /tmp/tensorflow
-          git remote add origin https://github.com/tensorflow/tensorflow.git
-          # --filter=blob:none 只拉所需 object，配合 fetch 单个 commit 更省
-          git fetch --depth 1 origin 4f1b7de8a37a03452565bc612c148a1d2d9d6cfc
-          git checkout FETCH_HEAD
-          echo "✅ TensorFlow checked out at $(git rev-parse HEAD)"
+          git clone --depth 1 https://github.com/tensorflow/tensorflow.git /tmp/tensorflow
+          echo "✅ TensorFlow cloned to /tmp/tensorflow"
       # ====================================================================
+
+      # ================== 修复 XLA lit_test.patch 与新版 LLVM 不匹配 ==================
+      # TF upstream commit 730dd99d478d (2026-07-21) 集成了 LLVM 963e226d9a6b，
+      # 新版 lit_test.bzl 内容已不再匹配 xla/third_party/llvm/lit_test.patch，
+      # 导致 bazel fetch @@llvm-raw 时 CONTENT_DOES_NOT_MATCH_TARGET。
+      # 此 patch 仅用于 Windows 上避免同名 lit_test 文件冲突，对 Android 构建无影响，
+      # 因此在 fetch 之前直接从 workspace.bzl 的 patch_file 列表里移除它。
+      - name: Drop incompatible XLA lit_test.patch before fetch
+        run: |
+          set -e
+          WS_BZL="/tmp/tensorflow/third_party/xla/third_party/llvm/workspace.bzl"
+          if [ -f "$WS_BZL" ]; then
+            cp "$WS_BZL" "$WS_BZL.bak"
+            sed -i '/\/\/third_party\/llvm:lit_test\.patch,/d' "$WS_BZL"
+            echo "=== Removed lit_test.patch from $WS_BZL ==="
+            grep -n "patch_file\|lit_test\|run_lit" "$WS_BZL" || true
+          else
+            echo "⚠️ $WS_BZL not found, skipping"
+          fi
+      # ===============================================================================
 
 
       # 彻底删除 org_tensorflow 中所有文件里的 -msse3 / -msse4.1 / -msse4.2 / -DWEBP_HAVE_SSE41，并精确对比修改前后相同行（含上下文）
