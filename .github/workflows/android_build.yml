@@ -732,6 +732,59 @@ jobs:
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
           
+      - name: Fix cpuinfo to recognize aarch64 constraint
+        run: |
+          git clone --depth 1 https://github.com/pytorch/cpuinfo.git /tmp/cpuinfo_fixed
+          cat > /tmp/patch_cpuinfo.py << 'EOF'
+          import re
+
+          build_file = "/tmp/cpuinfo_fixed/BUILD.bazel"
+          with open(build_file) as f:
+              content = f.read()
+
+          new_setting = '''
+          config_setting(
+              name = "android_arm64_aarch64",
+              constraint_values = [
+                  "@platforms//os:android",
+                  "@platforms//cpu:aarch64",
+              ],
+              visibility = ["//visibility:public"],
+          )
+          '''
+
+          match = re.search(
+              r'(config_setting\(\s*name\s*=\s*"android_riscv64".*?\))',
+              content,
+              flags=re.DOTALL
+          )
+          if match:
+              pos = match.end()
+              print(f"Found android_riscv64 config_setting, inserting new_setting at position {pos}")
+              content = content[:pos] + new_setting + content[pos:]
+          else:
+              print("WARNING: android_riscv64 config_setting not found, insertion skipped")
+
+          old = '":android_arm64": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS + ANDROID_ARM_SRCS,'
+          new = old + '\n        ":android_arm64_aarch64": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS + ANDROID_ARM_SRCS,'
+
+          if old in content:
+              content = content.replace(old, new, 1)
+              print("Select entry added for android_arm64_aarch64")
+          else:
+              print("ERROR: android_arm64 select entry not found, replacement failed")
+
+          with open(build_file, 'w') as f:
+              f.write(content)
+          print("✅ cpuinfo patched for aarch64")
+          EOF
+          python3 /tmp/patch_cpuinfo.py
+
+          echo "=== Verification of cpuinfo BUILD ==="
+          grep -n "android_arm64_aarch64" /tmp/cpuinfo_fixed/BUILD.bazel || echo "ERROR: new config_setting not found"
+          grep -n '":android_arm64":\|":android_arm64_aarch64":' /tmp/cpuinfo_fixed/BUILD.bazel | head -5
+          echo "build --override_repository=cpuinfo=/tmp/cpuinfo_fixed" >> .bazelrc
+          
       # ---------- 修补 XNNPACK BUILD（给 packing/pack_lh 加 common 依赖） ----------
       - name: Patch XNNPACK BUILD – add KleidiAI deps and alwayslink
         run: |
