@@ -783,7 +783,6 @@ jobs:
           echo "=== Verification of cpuinfo BUILD ==="
           grep -n "android_arm64_aarch64" /tmp/cpuinfo_fixed/BUILD.bazel || echo "ERROR: new config_setting not found"
           grep -n '":android_arm64":\|":android_arm64_aarch64":' /tmp/cpuinfo_fixed/BUILD.bazel | head -5
-          echo "build --override_repository=cpuinfo=/tmp/cpuinfo_fixed" >> .bazelrc
           
       # ---------- 修补 XNNPACK BUILD（给 packing/pack_lh 加 common 依赖） ----------
       - name: Patch XNNPACK BUILD – add KleidiAI deps and alwayslink
@@ -984,6 +983,7 @@ jobs:
           echo "build --override_repository=KleidiAI=/tmp/kleidiai_repo" >> .bazelrc
           echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
+          echo "build --override_repository=cpuinfo=/tmp/cpuinfo_fixed" >> .bazelrc
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
 
       - name: Disable layering_check globally and for monolithic config
