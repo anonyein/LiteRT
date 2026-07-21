@@ -316,19 +316,41 @@ jobs:
       # TF upstream commit 730dd99d478d (2026-07-21) 集成了 LLVM 963e226d9a6b，
       # 新版 lit_test.bzl 内容已不再匹配 xla/third_party/llvm/lit_test.patch，
       # 导致 bazel fetch @@llvm-raw 时 CONTENT_DOES_NOT_MATCH_TARGET。
-      # 此 patch 仅用于 Windows 上避免同名 lit_test 文件冲突，对 Android 构建无影响，
-      # 因此在 fetch 之前直接从 workspace.bzl 的 patch_file 列表里移除它。
+      # 此 patch 仅用于 Windows 上避免同名 lit_test 文件冲突，对 Android 构建无影响。
+      # 因此两步兜底：
+      #   1) 从 workspace.bzl 的 patch_file 列表里移除 lit_test.patch 引用
+      #   2) 把 lit_test.patch 文件本身清空，避免 bazel 仍尝试应用导致内容不匹配错误
       - name: Drop incompatible XLA lit_test.patch before fetch
         run: |
           set -e
           WS_BZL="/tmp/tensorflow/third_party/xla/third_party/llvm/workspace.bzl"
-          if [ -f "$WS_BZL" ]; then
-            cp "$WS_BZL" "$WS_BZL.bak"
-            sed -i '/\/\/third_party\/llvm:lit_test\.patch,/d' "$WS_BZL"
-            echo "=== Removed lit_test.patch from $WS_BZL ==="
-            grep -n "patch_file\|lit_test\|run_lit" "$WS_BZL" || true
-          else
+          LIT_PATCH="/tmp/tensorflow/third_party/xla/third_party/llvm/lit_test.patch"
+          if [ ! -f "$WS_BZL" ]; then
             echo "⚠️ $WS_BZL not found, skipping"
+            exit 0
+          fi
+          cp "$WS_BZL" "$WS_BZL.bak"
+          export WS_BZL
+          python3 <<'PYEOF'
+          import os, re
+          p = os.environ["WS_BZL"]
+          txt = open(p).read()
+          new = re.sub(r'^[ \t]*"//third_party/llvm:lit_test\.patch".*$', '', txt, flags=re.MULTILINE)
+          new = re.sub(r',\s*,', ',', new)
+          new = re.sub(r'\[\s*,', '[', new)
+          new = re.sub(r',\s*\]', ']', new)
+          new = re.sub(r'\n{3,}', '\n\n', new)
+          if new != txt:
+              open(p, 'w').write(new)
+              print("✅ lit_test.patch reference removed from workspace.bzl")
+          else:
+              print("⚠️ lit_test.patch reference not found in workspace.bzl")
+          PYEOF
+          echo "=== After: $WS_BZL (patch_file section) ==="
+          grep -nE 'patch_file|lit_test|run_lit|generated|b514740398|build\.patch|platforms_config|toolchains\.patch' "$WS_BZL" || true
+          if [ -f "$LIT_PATCH" ]; then
+            : > "$LIT_PATCH"
+            echo "✅ Emptied $LIT_PATCH (size now $(wc -c < "$LIT_PATCH") bytes)"
           fi
       # ===============================================================================
 
