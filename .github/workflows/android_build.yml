@@ -732,7 +732,7 @@ jobs:
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
           
-      - name: Fix cpuinfo to recognize aarch64 constraint
+      - name: Fix cpuinfo for all Android architectures
         run: |
           git clone --depth 1 https://github.com/pytorch/cpuinfo.git /tmp/cpuinfo_fixed
           cat > /tmp/patch_cpuinfo.py << 'EOF'
@@ -742,7 +742,19 @@ jobs:
           with open(build_file) as f:
               content = f.read()
 
-          new_setting = '''
+          # 新增 config_setting：android_arm (匹配 cpu:arm)
+          arm_setting = '''
+          config_setting(
+              name = "android_arm",
+              constraint_values = [
+                  "@platforms//os:android",
+                  "@platforms//cpu:arm",
+              ],
+              visibility = ["//visibility:public"],
+          )
+          '''
+          # 新增 config_setting：android_arm64_aarch64 (匹配 cpu:aarch64)
+          arm64_setting = '''
           config_setting(
               name = "android_arm64_aarch64",
               constraint_values = [
@@ -753,6 +765,7 @@ jobs:
           )
           '''
 
+          # 插入到最后一个 android_* config_setting 之后
           match = re.search(
               r'(config_setting\(\s*name\s*=\s*"android_riscv64".*?\))',
               content,
@@ -760,29 +773,39 @@ jobs:
           )
           if match:
               pos = match.end()
-              print(f"Found android_riscv64 config_setting, inserting new_setting at position {pos}")
-              content = content[:pos] + new_setting + content[pos:]
+              content = content[:pos] + arm_setting + arm64_setting + content[pos:]
+              print("Inserted new config_settings after android_riscv64")
           else:
-              print("WARNING: android_riscv64 config_setting not found, insertion skipped")
+              print("ERROR: cannot find insertion point")
+              exit(1)
 
-          old = '":android_arm64": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS + ANDROID_ARM_SRCS,'
-          new = old + '\n        ":android_arm64_aarch64": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS + ANDROID_ARM_SRCS,'
-
-          if old in content:
-              content = content.replace(old, new, 1)
-              print("Select entry added for android_arm64_aarch64")
+          # 在 select 中为 arm64_aarch64 添加条目（放在 android_arm64 之后）
+          old_arm64 = '":android_arm64": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS + ANDROID_ARM_SRCS,'
+          new_arm64 = old_arm64 + '\n        ":android_arm64_aarch64": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS + ANDROID_ARM_SRCS,'
+          if old_arm64 in content:
+              content = content.replace(old_arm64, new_arm64, 1)
+              print("Added select entry for android_arm64_aarch64")
           else:
-              print("ERROR: android_arm64 select entry not found, replacement failed")
+              print("ERROR: android_arm64 line not found")
+
+          # 在 select 中为 arm 添加条目（放在 android_armv7 之后）
+          old_armv7 = '":android_armv7": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM32_SRCS + ANDROID_ARM_SRCS,'
+          new_armv7 = old_armv7 + '\n        ":android_arm": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM32_SRCS + ANDROID_ARM_SRCS,'
+          if old_armv7 in content:
+              content = content.replace(old_armv7, new_armv7, 1)
+              print("Added select entry for android_arm")
+          else:
+              print("ERROR: android_armv7 line not found")
 
           with open(build_file, 'w') as f:
               f.write(content)
-          print("✅ cpuinfo patched for aarch64")
+          print("✅ cpuinfo patched")
           EOF
           python3 /tmp/patch_cpuinfo.py
 
-          echo "=== Verification of cpuinfo BUILD ==="
-          grep -n "android_arm64_aarch64" /tmp/cpuinfo_fixed/BUILD.bazel || echo "ERROR: new config_setting not found"
-          grep -n '":android_arm64":\|":android_arm64_aarch64":' /tmp/cpuinfo_fixed/BUILD.bazel | head -5
+          echo "=== Verification ==="
+          grep -n "android_arm\|android_arm64_aarch64" /tmp/cpuinfo_fixed/BUILD.bazel | head -10
+          grep -n '":android_armv7"\|":android_arm":\|":android_arm64"\|":android_arm64_aarch64"' /tmp/cpuinfo_fixed/BUILD.bazel | head -10
           
       # ---------- 修补 XNNPACK BUILD（给 packing/pack_lh 加 common 依赖） ----------
       - name: Patch XNNPACK BUILD – add KleidiAI deps and alwayslink
