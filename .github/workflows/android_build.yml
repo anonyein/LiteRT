@@ -732,93 +732,97 @@ jobs:
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
           
-      - name: Fix cpuinfo for Android cross-compilation (no conflicts)
+      - name: Fix cpuinfo with exact NDK constraints (final)
         run: |
           rm -rf /tmp/cpuinfo_fixed
           git clone --depth 1 https://github.com/pytorch/cpuinfo.git /tmp/cpuinfo_fixed
-          python3 << 'PYEOF'
+          cat > /tmp/patch_cpuinfo.py << 'EOF'
           import re
 
           build_file = "/tmp/cpuinfo_fixed/BUILD.bazel"
           with open(build_file) as f:
               content = f.read()
 
-          # 新增 config_setting：要求 OS 为 Android，并用 values 匹配具体 --cpu
+          # 1. 删除所有原有的 android_* config_setting，避免残留干扰
+          content = re.sub(r'config_setting\(\s*name\s*=\s*"android_.*?\)\n?', '', content, flags=re.DOTALL)
+          # 清理可能出现的多余空行
+          content = re.sub(r'\n{3,}', '\n\n', content)
+
+          # 2. 追加精确匹配的 config_setting
           new_configs = '''
           config_setting(
-              name = "android_arm64_cpu",
+              name = "android_armv7_exact",
               constraint_values = [
                   "@platforms//os:android",
+                  "@platforms//cpu:armv7",
               ],
-              values = {"cpu": "arm64-v8a"},
               visibility = ["//visibility:public"],
           )
 
           config_setting(
-              name = "android_arm_cpu",
+              name = "android_arm64_exact",
               constraint_values = [
                   "@platforms//os:android",
+                  "@platforms//cpu:aarch64",
               ],
-              values = {"cpu": "armeabi-v7a"},
               visibility = ["//visibility:public"],
           )
 
           config_setting(
-              name = "android_x86_cpu",
+              name = "android_x86_exact",
               constraint_values = [
                   "@platforms//os:android",
+                  "@platforms//cpu:x86_32",
               ],
-              values = {"cpu": "x86"},
               visibility = ["//visibility:public"],
           )
 
           config_setting(
-              name = "android_x86_64_cpu",
+              name = "android_x86_64_exact",
               constraint_values = [
                   "@platforms//os:android",
+                  "@platforms//cpu:x86_64",
               ],
-              values = {"cpu": "x86_64"},
               visibility = ["//visibility:public"],
           )
           '''
 
-          # 插入到最后一个 android_* config_setting 之后
-          last_android = re.search(
-              r'(config_setting\(\s*name\s*=\s*"android_riscv64".*?\))',
+          # 插入到最后一个 config_setting 之后
+          last_setting = re.search(
+              r'(config_setting\(\s*name\s*=\s*"emscripten_asmjs".*?\))',
               content,
               flags=re.DOTALL
           )
-          if not last_android:
-              raise SystemExit("Could not find android_riscv64 config_setting")
-          pos = last_android.end()
-          content = content[:pos] + new_configs + content[pos:]
+          if last_setting:
+              pos = last_setting.end()
+              content = content[:pos] + new_configs + content[pos:]
 
-          # 在 select 块中原条目前插入对应的 _cpu 条目（保留逗号）
-          replacements = [
-              (r'(        )(":android_arm64":\s*COMMON_SRCS\s*\+\s*ARM_SRCS\s*\+\s*LINUX_SRCS\s*\+\s*LINUX_ARM64_SRCS\s*\+\s*ANDROID_ARM_SRCS,)',
-               r'\1":android_arm64_cpu": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS + ANDROID_ARM_SRCS,\n\1\2'),
-              (r'(        )(":android_armv7":\s*COMMON_SRCS\s*\+\s*ARM_SRCS\s*\+\s*LINUX_SRCS\s*\+\s*LINUX_ARM32_SRCS\s*\+\s*ANDROID_ARM_SRCS,)',
-               r'\1":android_arm_cpu": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM32_SRCS + ANDROID_ARM_SRCS,\n\1\2'),
-              (r'(        )(":android_x86":\s*COMMON_SRCS\s*\+\s*X86_SRCS\s*\+\s*LINUX_SRCS\s*\+\s*LINUX_X86_SRCS,)',
-               r'\1":android_x86_cpu": COMMON_SRCS + X86_SRCS + LINUX_SRCS + LINUX_X86_SRCS,\n\1\2'),
-              (r'(        )(":android_x86_64":\s*COMMON_SRCS\s*\+\s*X86_SRCS\s*\+\s*LINUX_SRCS\s*\+\s*LINUX_X86_SRCS,)',
-               r'\1":android_x86_64_cpu": COMMON_SRCS + X86_SRCS + LINUX_SRCS + LINUX_X86_SRCS,\n\1\2'),
-          ]
-          for pattern, repl in replacements:
-              content, n = re.subn(pattern, repl, content, count=1)
-              if n == 0:
-                  print(f"WARNING: substitution failed for {pattern[:60]}...")
+          # 3. 完全替换 cpuinfo_impl 的 srcs select 块
+          new_select = (
+              'srcs = select({\n'
+              '        ":android_armv7_exact": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM32_SRCS + ANDROID_ARM_SRCS,\n'
+              '        ":android_arm64_exact": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS + ANDROID_ARM_SRCS,\n'
+              '        ":android_x86_exact": COMMON_SRCS + X86_SRCS + LINUX_SRCS + LINUX_X86_SRCS,\n'
+              '        ":android_x86_64_exact": COMMON_SRCS + X86_SRCS + LINUX_SRCS + LINUX_X86_SRCS,\n'
+              '        "//conditions:default": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS,\n'
+              '    }),'
+          )
+          content = re.sub(
+              r'srcs\s*=\s*select\(\{.*?\}\),',
+              new_select,
+              content,
+              flags=re.DOTALL
+          )
 
           with open(build_file, 'w') as f:
               f.write(content)
+          print("✅ cpuinfo rewritten with exact constraints")
+          EOF
+          python3 /tmp/patch_cpuinfo.py
 
-          print("✅ cpuinfo patched (platform‑aware, no conflicts)")
-          # 输出相关行校验
-          with open(build_file) as f:
-              for i, line in enumerate(f, 1):
-                  if 'android_arm' in line or 'android_x86' in line:
-                      print(f"{i}: {line.rstrip()}")
-          PYEOF
+          # 校验
+          echo "=== Verification ==="
+          grep -n "android_armv7_exact\|android_arm64_exact\|android_x86_exact\|android_x86_64_exact" /tmp/cpuinfo_fixed/BUILD.bazel
           
       # ---------- 修补 XNNPACK BUILD（给 packing/pack_lh 加 common 依赖） ----------
       - name: Patch XNNPACK BUILD – add KleidiAI deps and alwayslink
