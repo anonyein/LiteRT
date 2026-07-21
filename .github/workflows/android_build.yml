@@ -732,7 +732,7 @@ jobs:
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
           
-      - name: Fix cpuinfo with cpu-based conditions (safe version)
+      - name: Fix cpuinfo for Android cross-compilation (no conflicts)
         run: |
           rm -rf /tmp/cpuinfo_fixed
           git clone --depth 1 https://github.com/pytorch/cpuinfo.git /tmp/cpuinfo_fixed
@@ -743,28 +743,40 @@ jobs:
           with open(build_file) as f:
               content = f.read()
 
-          # 新增基于 --cpu 值的 config_setting
+          # 新增 config_setting：要求 OS 为 Android，并用 values 匹配具体 --cpu
           new_configs = '''
           config_setting(
               name = "android_arm64_cpu",
+              constraint_values = [
+                  "@platforms//os:android",
+              ],
               values = {"cpu": "arm64-v8a"},
               visibility = ["//visibility:public"],
           )
 
           config_setting(
               name = "android_arm_cpu",
+              constraint_values = [
+                  "@platforms//os:android",
+              ],
               values = {"cpu": "armeabi-v7a"},
               visibility = ["//visibility:public"],
           )
 
           config_setting(
               name = "android_x86_cpu",
+              constraint_values = [
+                  "@platforms//os:android",
+              ],
               values = {"cpu": "x86"},
               visibility = ["//visibility:public"],
           )
 
           config_setting(
               name = "android_x86_64_cpu",
+              constraint_values = [
+                  "@platforms//os:android",
+              ],
               values = {"cpu": "x86_64"},
               visibility = ["//visibility:public"],
           )
@@ -781,28 +793,27 @@ jobs:
           pos = last_android.end()
           content = content[:pos] + new_configs + content[pos:]
 
-          # 在 select 块中，在原条目之前插入对应的 _cpu 条目，并保留原条目逗号
-          # 使用精确的正则替换，确保逗号完整
+          # 在 select 块中原条目前插入对应的 _cpu 条目（保留逗号）
           replacements = [
-              (r'(        )(":android_arm64":\s*COMMON_SRCS\s*\+\s*ARM_SRCS.*?,)',
+              (r'(        )(":android_arm64":\s*COMMON_SRCS\s*\+\s*ARM_SRCS\s*\+\s*LINUX_SRCS\s*\+\s*LINUX_ARM64_SRCS\s*\+\s*ANDROID_ARM_SRCS,)',
                r'\1":android_arm64_cpu": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS + ANDROID_ARM_SRCS,\n\1\2'),
-              (r'(        )(":android_armv7":\s*COMMON_SRCS\s*\+\s*ARM_SRCS.*?,)',
+              (r'(        )(":android_armv7":\s*COMMON_SRCS\s*\+\s*ARM_SRCS\s*\+\s*LINUX_SRCS\s*\+\s*LINUX_ARM32_SRCS\s*\+\s*ANDROID_ARM_SRCS,)',
                r'\1":android_arm_cpu": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM32_SRCS + ANDROID_ARM_SRCS,\n\1\2'),
-              (r'(        )(":android_x86":\s*COMMON_SRCS\s*\+\s*X86_SRCS.*?,)',
+              (r'(        )(":android_x86":\s*COMMON_SRCS\s*\+\s*X86_SRCS\s*\+\s*LINUX_SRCS\s*\+\s*LINUX_X86_SRCS,)',
                r'\1":android_x86_cpu": COMMON_SRCS + X86_SRCS + LINUX_SRCS + LINUX_X86_SRCS,\n\1\2'),
-              (r'(        )(":android_x86_64":\s*COMMON_SRCS\s*\+\s*X86_SRCS.*?,)',
+              (r'(        )(":android_x86_64":\s*COMMON_SRCS\s*\+\s*X86_SRCS\s*\+\s*LINUX_SRCS\s*\+\s*LINUX_X86_SRCS,)',
                r'\1":android_x86_64_cpu": COMMON_SRCS + X86_SRCS + LINUX_SRCS + LINUX_X86_SRCS,\n\1\2'),
           ]
           for pattern, repl in replacements:
               content, n = re.subn(pattern, repl, content, count=1)
               if n == 0:
-                  print(f"WARNING: substitution failed for pattern {pattern[:60]}...")
+                  print(f"WARNING: substitution failed for {pattern[:60]}...")
 
           with open(build_file, 'w') as f:
               f.write(content)
 
-          print("✅ cpuinfo safely patched")
-          # 输出 select 块中 arm/x86 相关行用于校验
+          print("✅ cpuinfo patched (platform‑aware, no conflicts)")
+          # 输出相关行校验
           with open(build_file) as f:
               for i, line in enumerate(f, 1):
                   if 'android_arm' in line or 'android_x86' in line:
