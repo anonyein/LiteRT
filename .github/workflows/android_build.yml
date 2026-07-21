@@ -306,10 +306,18 @@ jobs:
           PYEOF
 
       # ==================== 新增：克隆 TensorFlow 源码 ====================
+      # 注意：固定到 TF master 在 LLVM 集成 commit 之前的最后一个稳定版本，
+      # 避免 TF upstream 的 lit_test.patch 与新版 LLVM 内容不匹配导致的
+      # CONTENT_DOES_NOT_MATCH_TARGET 错误（参考 730dd99d478d 这次集成）。
       - name: Clone TensorFlow source
         run: |
-          git clone --depth 1 https://github.com/tensorflow/tensorflow.git /tmp/tensorflow
-          echo "✅ TensorFlow cloned to /tmp/tensorflow"
+          git init -q /tmp/tensorflow
+          cd /tmp/tensorflow
+          git remote add origin https://github.com/tensorflow/tensorflow.git
+          # --filter=blob:none 只拉所需 object，配合 fetch 单个 commit 更省
+          git fetch --depth 1 origin 4f1b7de8a37a03452565bc612c148a1d2d9d6cfc
+          git checkout FETCH_HEAD
+          echo "✅ TensorFlow checked out at $(git rev-parse HEAD)"
       # ====================================================================
 
 
