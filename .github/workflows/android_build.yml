@@ -798,13 +798,17 @@ jobs:
               content = content[:pos] + new_configs + content[pos:]
 
           # 3. 完全替换 cpuinfo_impl 的 srcs select 块
+          #    注意：default 分支必须为空列表，否则在 x86_64 等 Android ABI 下会
+          #    落到 default 并编译 aarch64 源文件 (aarch64-isa.c)，导致 clang 用
+          #    x86_64 triple 找不到 arm 头文件中的符号 (struct cpuinfo_arm_isa 等)。
+          #    select 无匹配时 srcs 为空，与原始 cpuinfo BUILD.bazel 行为一致。
           new_select = (
               'srcs = select({\n'
               '        ":android_armv7_exact": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM32_SRCS + ANDROID_ARM_SRCS,\n'
               '        ":android_arm64_exact": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS + ANDROID_ARM_SRCS,\n'
               '        ":android_x86_exact": COMMON_SRCS + X86_SRCS + LINUX_SRCS + LINUX_X86_SRCS,\n'
               '        ":android_x86_64_exact": COMMON_SRCS + X86_SRCS + LINUX_SRCS + LINUX_X86_SRCS,\n'
-              '        "//conditions:default": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS,\n'
+              '        "//conditions:default": [],\n'
               '    }),'
           )
           content = re.sub(
