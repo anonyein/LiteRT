@@ -732,18 +732,19 @@ jobs:
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
           
-      - name: Fix cpuinfo using --cpu values for all Android architectures
+      - name: Fix cpuinfo with cpu-based conditions (safe version)
         run: |
+          rm -rf /tmp/cpuinfo_fixed
           git clone --depth 1 https://github.com/pytorch/cpuinfo.git /tmp/cpuinfo_fixed
-          cat > /tmp/patch_cpuinfo.py << 'EOF'
+          python3 << 'PYEOF'
           import re
 
           build_file = "/tmp/cpuinfo_fixed/BUILD.bazel"
           with open(build_file) as f:
               content = f.read()
 
-          # 新增基于 --cpu 标志的 config_setting
-          new_settings = '''
+          # 新增基于 --cpu 值的 config_setting
+          new_configs = '''
           config_setting(
               name = "android_arm64_cpu",
               values = {"cpu": "arm64-v8a"},
@@ -770,49 +771,43 @@ jobs:
           '''
 
           # 插入到最后一个 android_* config_setting 之后
-          match = re.search(
+          last_android = re.search(
               r'(config_setting\(\s*name\s*=\s*"android_riscv64".*?\))',
               content,
               flags=re.DOTALL
           )
-          if match:
-              pos = match.end()
-              content = content[:pos] + new_settings + content[pos:]
-          else:
-              print("ERROR: cannot find insertion point")
-              exit(1)
+          if not last_android:
+              raise SystemExit("Could not find android_riscv64 config_setting")
+          pos = last_android.end()
+          content = content[:pos] + new_configs + content[pos:]
 
-          # 在 select 的对应位置前插入新条目（优先匹配）
+          # 在 select 块中，在原条目之前插入对应的 _cpu 条目，并保留原条目逗号
+          # 使用精确的正则替换，确保逗号完整
           replacements = [
-              ('":android_arm64":', '":android_arm64_cpu": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS + ANDROID_ARM_SRCS,\n        :android_arm64'),
-              ('":android_armv7":', '":android_arm_cpu": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM32_SRCS + ANDROID_ARM_SRCS,\n        :android_armv7'),
-              ('":android_x86":',   '":android_x86_cpu": COMMON_SRCS + X86_SRCS + LINUX_SRCS + LINUX_X86_SRCS,\n        :android_x86'),
-              ('":android_x86_64":','":android_x86_64_cpu": COMMON_SRCS + X86_SRCS + LINUX_SRCS + LINUX_X86_SRCS,\n        :android_x86_64'),
+              (r'(        )(":android_arm64":\s*COMMON_SRCS\s*\+\s*ARM_SRCS.*?,)',
+               r'\1":android_arm64_cpu": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS + ANDROID_ARM_SRCS,\n\1\2'),
+              (r'(        )(":android_armv7":\s*COMMON_SRCS\s*\+\s*ARM_SRCS.*?,)',
+               r'\1":android_arm_cpu": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM32_SRCS + ANDROID_ARM_SRCS,\n\1\2'),
+              (r'(        )(":android_x86":\s*COMMON_SRCS\s*\+\s*X86_SRCS.*?,)',
+               r'\1":android_x86_cpu": COMMON_SRCS + X86_SRCS + LINUX_SRCS + LINUX_X86_SRCS,\n\1\2'),
+              (r'(        )(":android_x86_64":\s*COMMON_SRCS\s*\+\s*X86_SRCS.*?,)',
+               r'\1":android_x86_64_cpu": COMMON_SRCS + X86_SRCS + LINUX_SRCS + LINUX_X86_SRCS,\n\1\2'),
           ]
-          for old_start, new_entry in replacements:
-              # 把 old_start 替换为 new_entry（注意逗号保留）
-              # 由于可能带有前导空格，使用正则替换更安全
-              pattern = re.compile(r'(        )(":android_(arm64|armv7|x86|x86_64)":.+,)')
-              # 我们直接替换第一次出现的完整行
-              if old_start in content:
-                  # 找到完整的原行
-                  idx = content.index(old_start)
-                  # 找到该行的逗号结束位置
-                  line_end = content.index(',\n', idx) + 1  # 保留逗号
-                  original_line = content[idx:line_end]
-                  new_line = new_entry
-                  content = content[:idx] + new_line + content[line_end:]
-              else:
-                  print(f"WARNING: {old_start} not found")
+          for pattern, repl in replacements:
+              content, n = re.subn(pattern, repl, content, count=1)
+              if n == 0:
+                  print(f"WARNING: substitution failed for pattern {pattern[:60]}...")
 
           with open(build_file, 'w') as f:
               f.write(content)
-          print("✅ cpuinfo patched with cpu-based conditions")
-          EOF
-          python3 /tmp/patch_cpuinfo.py
 
-          echo "=== Verification ==="
-          grep -n "android_arm64_cpu\|android_arm_cpu\|android_x86_cpu\|android_x86_64_cpu" /tmp/cpuinfo_fixed/BUILD.bazel | head -20
+          print("✅ cpuinfo safely patched")
+          # 输出 select 块中 arm/x86 相关行用于校验
+          with open(build_file) as f:
+              for i, line in enumerate(f, 1):
+                  if 'android_arm' in line or 'android_x86' in line:
+                      print(f"{i}: {line.rstrip()}")
+          PYEOF
           
       # ---------- 修补 XNNPACK BUILD（给 packing/pack_lh 加 common 依赖） ----------
       - name: Patch XNNPACK BUILD – add KleidiAI deps and alwayslink
