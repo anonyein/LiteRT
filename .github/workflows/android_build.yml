@@ -201,6 +201,11 @@ jobs:
                   'after_dep': '//tensor/runners/litert:litert_dynamic_runner',
               },
               {
+                  'file': 'tensor/examples/gemma3/BUILD',
+                  'target': 'litert_main',
+                  'after_dep': '//tensor/runners/litert:litert_dynamic_runner',
+              },
+              {
                   'file': 'tensor/runners/litert/BUILD',
                   'target': 'lambda_model_runner_test',
                   'after_dep': None,  # None 表示插入到 deps 列表末尾（最后一个元素之前）
