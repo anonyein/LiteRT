@@ -786,9 +786,15 @@ jobs:
        #   2) 自定义 *_exact config_setting 用 @platforms//cpu:aarch64 是错的，上游用的是
        #      @platforms//cpu:arm64，导致 arm64 构建时 select 落空 → cpuinfo 不编译 →
        #      libtensorflowlite_jni.so 链接报 “undefined symbol: cpuinfo_initialize” 等。
-       # 因此这里改为完全不覆盖 cpuinfo：让 bazel 用上游 TF pinned 的 commit
-       # (ea6b9f1bb6e1001d8b21574d5bc78ddef62e499d)，其源文件/头文件/select 都是配套的，
-       # 直接 build 即可。对应地 Configure .bazelrc 步骤也不再生成 --override_repository=cpuinfo。
+       # 因此这里先改为完全不覆盖 cpuinfo：让 bazel 用上游 TF pinned 的 commit
+       # (ea6b9f1bb6e1001d8b21574d5bc78ddef62e499d)，其源文件/头文件/select 都是配套的。
+       # 但后来发现 --fat_apk_cpu split transition 下 @platforms//os:android + @platforms//cpu:arm64
+       # 在 bazel 7 + @platforms 1.0.0 下不被正确解析到 ad-hoc 目标平台，arm64-v8a split
+       # 反而落到 :linux_x86_64 分支去编 src/x86/cache/deterministic.c → cpuid.h 报错。
+       # 所以最终方案改回 *覆盖* cpuinfo，且在 Prepare/Override fixed cpuinfo repository
+       # 步骤里把上游 select 替换成基于 --cpu 字符串值的 config_setting（values={"cpu":"arm64-v8a"} 等），
+       # 在 split transition 下稳定且不相互污染，未命中分支走 //conditions:default=[]（不会错编架构）。
+       # 下面留空（具体覆盖逻辑见后续 "Prepare fixed cpuinfo repository" 步骤）。
 
           
       # ---------- 修补 XNNPACK BUILD（给 packing/pack_lh 加 common 依赖） ----------
@@ -990,7 +996,10 @@ jobs:
           echo "build --override_repository=KleidiAI=/tmp/kleidiai_repo" >> .bazelrc
           echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
-          # 注意：不再 override cpuinfo，用上游 TF pinned 的 cpuinfo (commit ea6b9f1b)
+          # 注意：cpuinfo 的 override 放到后续 "Override cpuinfo with fixed repository" 步骤里，
+          # 因为 /tmp/cpuinfo_fixed 需要先由 "Prepare fixed cpuinfo repository" 步骤克隆+重写 BUILD。
+          # 这里不写 --override_repository=cpuinfo=... 以免该步骤尚未生成 /tmp/cpuinfo_fixed 时
+          # 把这条 flag 写进 .bazelrc 后未生效（顺序无影响），统一交给后面那步。
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
 
       - name: Disable layering_check globally and for monolithic config
@@ -1108,48 +1117,87 @@ jobs:
           grep -n 'with_xla_support' .bazelrc || echo "No with_xla_support lines found"
       # ================================================================
       
-      # ===================== 新增：预置修补后的 cpuinfo 仓库 =====================
-      # - name: Prepare fixed cpuinfo repository
-      #   run: |
-      #     CPUINFO_DIR="/tmp/cpuinfo_fixed"
-      #     git clone --depth 1 https://github.com/pytorch/cpuinfo.git "$CPUINFO_DIR"
-      #     BUILD_FILE="$CPUINFO_DIR/BUILD.bazel"
+      # ===================== 预置修补后的 cpuinfo 仓库 =====================
+      # 根因：上游 cpuinfo BUILD.bazel 的 :android_arm64 config_setting 用
+      # constraint_values=["@platforms//os:android","@platforms//cpu:arm64"]，
+      # 但 --fat_apk_cpu 的 split transition 在当前 bazel 7 + @platforms 1.0.0 +
+      # rules_ml_toolchain 下，平台约束未被正确解析到 split 后的 ad-hoc 目标平台，
+      # 导致 arm64-v8a split 落到 :linux_x86_64 分支 → 编 src/x86/cache/deterministic.c
+      # → 触发 cpuid.h "this header is for x86 only" 报错。
+      # 修复：用基于 --cpu 字符串值的 config_setting（values={"cpu": "arm64-v8a"} 等）
+      # 取代跨仓库的 @platforms 约束。--cpu 在 split transition 下是确定且不互相污染的：
+      #   arm64-v8a split → --cpu=arm64-v8a → 命中 android_cpu_arm64 → ARM 源
+      #   x86       split → --cpu=x86        → 命中 android_cpu_x86  → x86 源
+      #   x86_64    split → --cpu=x86_64     → 命中 android_cpu_x86_64 → x86 源
+      #   armeabi-v7a split → --cpu=armeabi-v7a → 命中 android_cpu_armv7 → ARM32 源
+      # 未命中任何分支 → //conditions:default = [] （不会错编架构的源，只会少连，报错更清晰）
+      - name: Prepare fixed cpuinfo repository
+        run: |
+          set -e
+          CPUINFO_DIR="/tmp/cpuinfo_fixed"
+          # 上游 TF pin 的 cpuinfo commit（与 org_tensorflow 中一致）
+          CPUINFO_COMMIT="ea6b9f1bb6e1001d8b21574d5bc78ddef62e499d"
+          git clone https://github.com/pytorch/cpuinfo.git "$CPUINFO_DIR"
+          cd "$CPUINFO_DIR"
+          git checkout "$CPUINFO_COMMIT"
+          echo "✅ cpuinfo at $(git rev-parse HEAD)"
 
-      #     # 使用Python修改BUILD.bazel，为cpuinfo_impl的select添加default条件
-      #     python3 << 'PYEOF'
-      #     import re
+          # 用 Python 把 BUILD.bazel 里 cpuinfo_impl 的 srcs/select 改成基于 --cpu 的版本，
+          # 并把所有依赖 @platforms//... 的 config_setting 替换成对应的 --cpu 值版本。
+          python3 << 'PYEOF'
+          import re
+          p = "/tmp/cpuinfo_fixed/BUILD.bazel"
+          c = open(p).read()
 
-      #     build_file = "/tmp/cpuinfo_fixed/BUILD.bazel"
-      #     with open(build_file, "r") as f:
-      #         content = f.read()
+          # 1) 替换 cpuinfo_impl 的 srcs select（整块替换）
+          #    保留原 COMMON/ARM/X86/... 常量，重建基于 cpu 值的条件映射
+          m = re.search(r"cc_library\(\s*name\s*=\s*\"cpuinfo_impl\".*?\)\s*(?=\ncc_library)",
+                        c, flags=re.DOTALL)
+          assert m, "could not locate cpuinfo_impl target"
+          old = m.group(0)
 
-      #     # 找到android_arm64条件的srcs列表
-      #     arm64_match = re.search(r'"@@cpuinfo//:android_arm64"\s*:\s*(\[.*?\])', content, re.DOTALL)
-      #     if not arm64_match:
-      #         print("❌ Could not find android_arm64 condition in cpuinfo BUILD, falling back to linux_aarch64")
-      #         # 尝试使用linux_aarch64的列表作为默认
-      #         arm64_match = re.search(r'"@@cpuinfo//:linux_aarch64"\s*:\s*(\[.*?\])', content, re.DOTALL)
-      #         if not arm64_match:
-      #             raise Exception("Neither android_arm64 nor linux_aarch64 condition found")
-      #     arm64_srcs = arm64_match.group(1)
+          # 注：为保持 YAML 块标量缩进一致，三引号体内的行必须 ≥ 外层缩进
+          #     （本 run: | 块内容基准缩进为 10 空格）。Python 侧随后用 textwrap.dedent
+          #     去掉公共前缀，恢复逻辑缩进再拼回 BUILD.bazel。
+          import textwrap
+          new = textwrap.dedent('''\
+                    cc_library(
+                        name = "cpuinfo_impl",
+                        srcs = select({
+                            # Android split CPUs (stable under --fat_apk_cpu transitions)
+                            ":android_cpu_x86":    COMMON_SRCS + X86_SRCS    + LINUX_SRCS + LINUX_X86_SRCS,
+                            ":android_cpu_x86_64": COMMON_SRCS + X86_SRCS    + LINUX_SRCS + LINUX_X86_SRCS,
+                            ":android_cpu_armv7":  COMMON_SRCS + ARM_SRCS    + LINUX_SRCS + LINUX_ARM32_SRCS + ANDROID_ARM_SRCS,
+                            ":android_cpu_arm64":  COMMON_SRCS + ARM_SRCS    + LINUX_SRCS + LINUX_ARM64_SRCS + ANDROID_ARM_SRCS,
+                            # 其它架构一律不编译架构相关源，default 行为安全且报错定位明确
+                            "//conditions:default": COMMON_SRCS,
+                        }),''')
+          # 把原来 cc_library 的其余属性（copts/linkstatic/textual_hdrs/includes 等）追加回去
+          tail = re.sub(r"cc_library\(\s*name\s*=\s*\"cpuinfo_impl\".*?srcs\s*=\s*select\(\{.*?\}\)\s*,\s*",
+                        "", old, flags=re.DOTALL)
+          # tail 现在从 copts=... 开始，以 ")" 结尾
+          new = new + '\n' + tail
 
-      #     # 在select的最后一个条件后插入default条件
-      #     def add_default(m):
-      #         inner = m.group(1)
-      #         # 在最后一个 "}," 或 "}" 之前插入
-      #         new_inner = inner.rstrip() + ',\n        "//conditions:default": ' + arm64_srcs + '\n    '
-      #         return 'select({' + new_inner + '})'
+          c = c[:m.start()] + new + c[m.end():]
 
-      #     # 匹配整个select块（假设只有一个select用于cpuinfo_impl的srcs）
-      #     content = re.sub(r'(select\(\{.*?\}\))', add_default, content, flags=re.DOTALL)
+          # 2) 在文件末尾追加新的 config_setting（基于 --cpu 值）
+          settings = textwrap.dedent('''
+                    # === cpuinfo 的 --cpu 值匹配（Android split 安全） ===
+                    config_setting(name = "android_cpu_x86",    values = {"cpu": "x86"})
+                    config_setting(name = "android_cpu_x86_64", values = {"cpu": "x86_64"})
+                    config_setting(name = "android_cpu_armv7",  values = {"cpu": "armeabi-v7a"})
+                    config_setting(name = "android_cpu_arm64",  values = {"cpu": "arm64-v8a"})
+                    ''')
+          c = c.rstrip() + "\n" + settings
 
-      #     with open(build_file, "w") as f:
-      #         f.write(content)
-      #     print("✅ Added default condition to cpuinfo_impl select")
-      #     PYEOF
+          open(p, "w").write(c)
+          print("✅ cpuinfo BUILD.bazel rewritten to use --cpu value config_settings")
+          PYEOF
 
-      #     echo "=== Patched cpuinfo BUILD (first 50 lines) ==="
-      #     head -50 "$BUILD_FILE"
+          echo "=== Patched cpuinfo_impl target ==="
+          sed -n '/cc_library(\s*name = "cpuinfo_impl"/,/^)/p' "$CPUINFO_DIR/BUILD.bazel" | head -40
+          echo "=== New config_settings ==="
+          grep -nE "android_cpu_(x86|x86_64|armv7|arm64)" "$CPUINFO_DIR/BUILD.bazel"
 
       # ---------- 至此，所有不涉及 bazel 命令的修改文件步骤已完成，接下来安装 bazel ----------
       - name: Setup Bazel
@@ -1164,11 +1212,10 @@ jobs:
           bazel clean --expunge_async
           echo "✅ Cache purged. All subsequent bazel commands will re-analyze everything."
 
-      # - name: Override cpuinfo with fixed repository
-      #   run: |
-      #     echo "build --override_repository=cpuinfo=/tmp/cpuinfo_fixed" >> .bazelrc
-      #     echo "✅ cpuinfo override added to .bazelrc"
-      # ====================================================================
+      - name: Override cpuinfo with fixed repository
+        run: |
+          echo "build --override_repository=cpuinfo=/tmp/cpuinfo_fixed" >> .bazelrc
+          echo "✅ cpuinfo override added to .bazelrc"
 
       # - name: Verify Android C++ toolchain for all architectures
       #   run: |
