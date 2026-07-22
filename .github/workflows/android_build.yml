@@ -1135,12 +1135,14 @@ jobs:
         run: |
           set -e
           CPUINFO_DIR="/tmp/cpuinfo_fixed"
-          # 上游 TF pin 的 cpuinfo commit（与 org_tensorflow 中一致）
-          CPUINFO_COMMIT="ea6b9f1bb6e1001d8b21574d5bc78ddef62e499d"
-          git clone https://github.com/pytorch/cpuinfo.git "$CPUINFO_DIR"
-          cd "$CPUINFO_DIR"
-          git checkout "$CPUINFO_COMMIT"
-          echo "✅ cpuinfo at $(git rev-parse HEAD)"
+          # 不固定 commit：直接克隆 pytorch/cpuinfo 最新默认分支。
+          # 理由：cpuinfo 的 BUILD.bazel 多年稳定（常量名/源文件路径未变），
+          #       且本步骤会用 regex 整块重写 cpuinfo_impl 的 srcs select，
+          #       不依赖 cpuinfo 上游的 @platforms config_setting。
+          #       若上游将来重构 cpuinfo_impl 目标（如改名/拆分），regex 会断言失败，
+          #       在本 Prepare 步骤即可停下而非误编架构，便于及时察觉。
+          git clone --depth 1 https://github.com/pytorch/cpuinfo.git "$CPUINFO_DIR"
+          echo "✅ cpuinfo cloned at $(git -C "$CPUINFO_DIR" rev-parse HEAD)"
 
           # 用 Python 把 BUILD.bazel 里 cpuinfo_impl 的 srcs/select 改成基于 --cpu 的版本，
           # 并把所有依赖 @platforms//... 的 config_setting 替换成对应的 --cpu 值版本。
