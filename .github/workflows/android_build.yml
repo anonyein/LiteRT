@@ -779,101 +779,17 @@ jobs:
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
           
-      - name: Fix cpuinfo with exact NDK constraints (final)
-        run: |
-          rm -rf /tmp/cpuinfo_fixed
-          git clone --depth 1 https://github.com/pytorch/cpuinfo.git /tmp/cpuinfo_fixed
-          cat > /tmp/patch_cpuinfo.py << 'EOF'
-          import re
+       # ---- cpuinfo ----
+       # 历史上这里曾尝试用 /tmp/cpuinfo_fixed（克隆 pytorch/cpuinfo 最新 master + 自定义 select）
+       # 来覆盖上游 TF pin 的 cpuinfo。但实测：
+       #   1) 用最新 master 拉 aarch64-isa.c 与 TF 的旧版 lit_test patch 不匹配（已单独修）
+       #   2) 自定义 *_exact config_setting 用 @platforms//cpu:aarch64 是错的，上游用的是
+       #      @platforms//cpu:arm64，导致 arm64 构建时 select 落空 → cpuinfo 不编译 →
+       #      libtensorflowlite_jni.so 链接报 “undefined symbol: cpuinfo_initialize” 等。
+       # 因此这里改为完全不覆盖 cpuinfo：让 bazel 用上游 TF pinned 的 commit
+       # (ea6b9f1bb6e1001d8b21574d5bc78ddef62e499d)，其源文件/头文件/select 都是配套的，
+       # 直接 build 即可。对应地 Configure .bazelrc 步骤也不再生成 --override_repository=cpuinfo。
 
-          build_file = "/tmp/cpuinfo_fixed/BUILD.bazel"
-          with open(build_file) as f:
-              content = f.read()
-
-          # 1. 删除所有原有的 android_* config_setting，避免残留干扰
-          content = re.sub(r'config_setting\(\s*name\s*=\s*"android_.*?\)\n?', '', content, flags=re.DOTALL)
-          # 清理可能出现的多余空行
-          content = re.sub(r'\n{3,}', '\n\n', content)
-
-          # 2. 追加精确匹配的 config_setting
-          new_configs = '''
-          config_setting(
-              name = "android_armv7_exact",
-              constraint_values = [
-                  "@platforms//os:android",
-                  "@platforms//cpu:armv7",
-              ],
-              visibility = ["//visibility:public"],
-          )
-
-          config_setting(
-              name = "android_arm64_exact",
-              constraint_values = [
-                  "@platforms//os:android",
-                  "@platforms//cpu:aarch64",
-              ],
-              visibility = ["//visibility:public"],
-          )
-
-          config_setting(
-              name = "android_x86_exact",
-              constraint_values = [
-                  "@platforms//os:android",
-                  "@platforms//cpu:x86_32",
-              ],
-              visibility = ["//visibility:public"],
-          )
-
-          config_setting(
-              name = "android_x86_64_exact",
-              constraint_values = [
-                  "@platforms//os:android",
-                  "@platforms//cpu:x86_64",
-              ],
-              visibility = ["//visibility:public"],
-          )
-          '''
-
-          # 插入到最后一个 config_setting 之后
-          last_setting = re.search(
-              r'(config_setting\(\s*name\s*=\s*"emscripten_asmjs".*?\))',
-              content,
-              flags=re.DOTALL
-          )
-          if last_setting:
-              pos = last_setting.end()
-              content = content[:pos] + new_configs + content[pos:]
-
-          # 3. 完全替换 cpuinfo_impl 的 srcs select 块
-          #    注意：default 分支必须为空列表，否则在 x86_64 等 Android ABI 下会
-          #    落到 default 并编译 aarch64 源文件 (aarch64-isa.c)，导致 clang 用
-          #    x86_64 triple 找不到 arm 头文件中的符号 (struct cpuinfo_arm_isa 等)。
-          #    select 无匹配时 srcs 为空，与原始 cpuinfo BUILD.bazel 行为一致。
-          new_select = (
-              'srcs = select({\n'
-              '        ":android_armv7_exact": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM32_SRCS + ANDROID_ARM_SRCS,\n'
-              '        ":android_arm64_exact": COMMON_SRCS + ARM_SRCS + LINUX_SRCS + LINUX_ARM64_SRCS + ANDROID_ARM_SRCS,\n'
-              '        ":android_x86_exact": COMMON_SRCS + X86_SRCS + LINUX_SRCS + LINUX_X86_SRCS,\n'
-              '        ":android_x86_64_exact": COMMON_SRCS + X86_SRCS + LINUX_SRCS + LINUX_X86_SRCS,\n'
-              '        "//conditions:default": [],\n'
-              '    }),'
-          )
-          content = re.sub(
-              r'srcs\s*=\s*select\(\{.*?\}\),',
-              new_select,
-              content,
-              flags=re.DOTALL
-          )
-
-          with open(build_file, 'w') as f:
-              f.write(content)
-          print("✅ cpuinfo rewritten with exact constraints")
-          EOF
-          python3 /tmp/patch_cpuinfo.py
-
-          # 校验
-          echo "=== Verification ==="
-          grep -n "android_armv7_exact\|android_arm64_exact\|android_x86_exact\|android_x86_64_exact" /tmp/cpuinfo_fixed/BUILD.bazel
           
       # ---------- 修补 XNNPACK BUILD（给 packing/pack_lh 加 common 依赖） ----------
       - name: Patch XNNPACK BUILD – add KleidiAI deps and alwayslink
@@ -1074,7 +990,7 @@ jobs:
           echo "build --override_repository=KleidiAI=/tmp/kleidiai_repo" >> .bazelrc
           echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
-          echo "build --override_repository=cpuinfo=/tmp/cpuinfo_fixed" >> .bazelrc
+          # 注意：不再 override cpuinfo，用上游 TF pinned 的 cpuinfo (commit ea6b9f1b)
           echo "build --define=xnn_enable_kleidiai=true" >> .bazelrc
 
       - name: Disable layering_check globally and for monolithic config
