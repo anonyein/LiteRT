@@ -1250,6 +1250,30 @@ jobs:
       #     done
 
       # ======================= 以下步骤涉及 bazel fetch / info / build，保持原顺序 =======================
+      # 修复上游 XLA pin 的 LLVM 与其 AMDGPU patch 不匹配的问题：
+      # org_tensorflow pin 的 xla 仍在 patch_file 中引用 amdgpu_fix_fp_to_sint_sat_i16.patch，
+      # 但 LLVM 已 bump 到新 commit，patch 上下文对不上（CONTENT_DOES_NOT_MATCH_TARGET），
+      # 导致 llvm-raw fetch 失败、repo mapping 计算崩溃。该 patch 只影响 AMDGPU 后端，
+      # 对 Android ARM 构建无影响，直接从 xla 的 workspace.bzl 中移除其引用。
+      - name: Remove stale AMDGPU LLVM patch reference from XLA
+        run: |
+          # 触发 WORKSPACE 评估以下载 xla 仓库。此命令会在给 llvm-raw 打 patch 时失败，
+          # 但 xla 本身会落盘到 output_base/external/xla。
+          bazel fetch @xla//... 2>/dev/null || true
+          OUTPUT_BASE=$(bazel info output_base 2>/dev/null || echo "$HOME/.bazel")
+          XLA_WS="${OUTPUT_BASE}/external/xla/third_party/llvm/workspace.bzl"
+          if [ -f "$XLA_WS" ]; then
+            echo "Found xla llvm workspace.bzl at $XLA_WS"
+            cp "$XLA_WS" "$XLA_WS.bak"
+            # 删除引用失效 AMDGPU patch 的那一行
+            sed -i '/amdgpu_fix_fp_to_sint_sat_i16\.patch/d' "$XLA_WS"
+            echo "=== Patched xla llvm workspace.bzl ==="
+            cat "$XLA_WS"
+          else
+            echo "xla llvm workspace.bzl not found at $XLA_WS"
+            exit 1
+          fi
+
       # 修复 libwebp：删除其 BUILD 文件中的 -msse4.1 选项
       - name: Fetch libwebp and thoroughly remove SSE41 options (with full file dump)
         run: |
