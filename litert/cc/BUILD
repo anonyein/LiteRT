@@ -715,6 +715,7 @@ cc_test(
         ":litert_environment",
         ":litert_expected",
         ":litert_layout",
+        ":litert_model",
         ":litert_model_types",
         ":litert_options",
         ":litert_ranked_tensor_type",
@@ -835,7 +836,6 @@ cc_test(
     }),
     deps = [
         ":litert_any",
-        ":litert_api_types",
         ":litert_common",
         ":litert_compiled_model",
         ":litert_environment",

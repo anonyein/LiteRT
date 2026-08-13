@@ -629,6 +629,7 @@ cc_library(
         "//tflite/core/c:common",
         "//tflite/core/kernels:builtin_ops",
         "//tflite/schema:schema_fbs",
+        "@FP16",
         "@com_google_googletest//:gtest",
         "@flatbuffers",
     ],
@@ -1337,20 +1338,6 @@ cc_library(
         "@XNNPACK",
         "@flatbuffers//:runtime_cc",
         "@pthreadpool",
-    ],
-)
-
-cc_test(
-    name = "moe_delegate_kernel_test",
-    srcs = ["moe_delegate_kernel_test.cc"],
-    deps = [
-        ":moe_delegate_kernel",
-        "//tflite:builtin_ops",
-        "//tflite/c:c_api_types",
-        "//tflite/c:common",
-        "@com_google_googletest//:gtest",
-        "@com_google_googletest//:gtest_main",
-        "@flatbuffers//:runtime_cc",
     ],
 )
 

@@ -556,6 +556,13 @@ class RuntimeProxy {
                                compiled_model, fully_accelerated);
   }
 
+  LiteRtStatus CompiledModelIsNonCpuFullyAccelerated(
+      LiteRtCompiledModel compiled_model, bool* non_cpu_fully_accelerated) {
+    LITERT_PROXY_METHOD_STATUS(
+        litert_compiled_model_is_non_cpu_fully_accelerated, compiled_model,
+        non_cpu_fully_accelerated);
+  }
+
   LiteRtStatus CompiledModelGetProfiler(LiteRtCompiledModel compiled_model,
                                         LiteRtProfiler* profiler) {
     LITERT_PROXY_METHOD_STATUS(litert_compiled_model_get_profiler,
@@ -1216,6 +1223,26 @@ class RuntimeProxy {
       LiteRtQuantizationBlockWise* block_wise_quantization) {
     LITERT_PROXY_METHOD_STATUS(litert_get_block_wise_quantization, tensor,
                                block_wise_quantization);
+  }
+
+  LiteRtStatus GetNumAccelerators(LiteRtEnvironment environment,
+                                  LiteRtParamIndex* num_accelerators) {
+    LITERT_PROXY_METHOD_STATUS(litert_get_num_accelerators, environment,
+                               num_accelerators);
+  }
+
+  LiteRtStatus GetAccelerator(LiteRtEnvironment environment,
+                              LiteRtParamIndex index,
+                              LiteRtAccelerator* accelerator) {
+    LITERT_PROXY_METHOD_STATUS(litert_get_accelerator, environment, index,
+                               accelerator);
+  }
+
+  LiteRtStatus GetAcceleratorHardwareSupport(
+      LiteRtAcceleratorConst accelerator,
+      LiteRtHwAcceleratorSet* supported_hardware) {
+    LITERT_PROXY_METHOD_STATUS(litert_get_accelerator_hardware_support,
+                               accelerator, supported_hardware);
   }
 
  protected:
