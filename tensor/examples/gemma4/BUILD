@@ -72,34 +72,7 @@ cc_test(
         "//tflite/delegates/xnnpack:weight_cache",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/types:span",
         "@com_google_googletest//:gtest_main",
-    ],
-)
-
-cc_library(
-    name = "perfetto_session",
-    srcs = ["perfetto_session.cc"],
-    hdrs = ["perfetto_session.h"],
-    deps = [
-        "//tensor/utils:macros",
-        "@com_google_absl//absl/log:absl_log",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/strings",
-        "@com_google_absl//absl/strings:string_view",
-        "@perfetto//:libperfetto_client_experimental",
-    ],
-)
-
-cc_test(
-    name = "perfetto_session_test",
-    srcs = ["perfetto_session_test.cc"],
-    deps = [
-        ":perfetto_session",
-        "//tensor/utils:matchers",
-        "@com_google_googletest//:gtest_main",
-        "@perfetto//:libperfetto_client_experimental",
     ],
 )
 
@@ -109,7 +82,6 @@ cc_binary(
     deps = [
         ":gemma4_config",
         ":gemma4_graph",
-        ":perfetto_session",
         ":safetensor_loader",
         "//tensor",
         "//tensor:arithmetic",
@@ -121,6 +93,7 @@ cc_binary(
         "//tensor/examples/gemma4/helpers:rope",
         "//tensor/examples/ops/transformer:transformer_ops_xnnpack",
         "//tensor/examples/utils:initialization",
+        "//tensor/examples/utils:perfetto_session",
         "//tensor/runners/xnnpack:runner",
         "//tensor/utils:macros",
         "//tflite/delegates/xnnpack:weight_cache",
@@ -143,11 +116,11 @@ cc_library(
     srcs = ["safetensor_loader.cc"],
     hdrs = ["safetensor_loader.h"],
     deps = [
-        ":perfetto_session",
         "//tensor",
         "//tensor:buffer",
         "//tensor:datatypes",
         "//tensor/examples/utils:minijson",
+        "//tensor/examples/utils:perfetto_session",
         "//tensor/examples/utils:safetensors",
         "//tensor/utils:macros",
         "@com_google_absl//absl/container:flat_hash_map",
