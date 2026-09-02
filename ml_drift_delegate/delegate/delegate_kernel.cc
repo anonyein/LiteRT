@@ -59,9 +59,11 @@
 // clang-format off
 #include "ml_drift_delegate/delegate/quantization_util.h"
 #include "ml_drift_delegate/delegate/serialization_program_cache/serialization_program_cache.h"
+#include "ml_drift_delegate/delegate/serialization_weight_cache/mmap_handle.h"
 #include "ml_drift_delegate/delegate/serialization_weight_cache/serialization_weight_cache.h"
 // clang-format on
 #include "ml_drift_delegate/delegate/composite/custom_parsers.h"
+#include "ml_drift_delegate/delegate/composite/custom_transformations.h"
 #include "ml_drift_delegate/delegate/composite/ir/custom_parsers.h"
 #include "ml_drift_delegate/delegate/composite/ir/litert_op_selector.h"
 #include "ml_drift_delegate/delegate/composite/litert_op_selector.h"
@@ -268,6 +270,9 @@ absl::Status DelegateKernel::InitializeGraphFloat32(
       context, delegate_params, options, &graph, &quant_conversion_map_,
       shared_tensors_ptr, tensor_to_buffer_id_map,
       tensor_to_external_buffer_id_map, &custom_parser_factory));
+
+  ABSL_RETURN_IF_ERROR(::litert::ml_drift::ApplyCustomTransformations(
+      &graph, *delegate_data_->options));
 
   const TfLiteIntArray* input_tensors = delegate_params->input_tensors;
   const std::vector<::ml_drift::Value*> inputs =
@@ -754,7 +759,7 @@ absl::Status DelegateKernel::InitInferenceContextFromSerializedData(
   std::unique_ptr<tflite::delegates::SerializationEntry> data_key;
   std::unique_ptr<::ml_drift::SerializationProgramCache> program_cache;
   uint64_t fingerprint_key;
-  std::string model_data;
+  ::ml_drift::MMapHandle program_data_handle;
   if (delegate_data_->options->program_cache_fd > 0) {
     // Duplicate the fd since the program cache will take ownership of the fd.
     // The original fd is owned by the delegate options and may be used after
@@ -768,9 +773,9 @@ absl::Status DelegateKernel::InitInferenceContextFromSerializedData(
     fingerprint_key = tflite::delegates::Serialization::GetFingerprint(
         delegate_data_->model_token, options_fingerprint, context,
         delegate_params);
-    auto program_data = program_cache->LookUp(fingerprint_key);
+    auto program_data = program_cache->LookUpHandle(fingerprint_key);
     if (program_data.ok()) {
-      model_data = program_data.value();
+      program_data_handle = std::move(program_data.value());
     }
   } else {
     program_cache = std::make_unique<::ml_drift::SerializationProgramCache>(
@@ -778,16 +783,16 @@ absl::Status DelegateKernel::InitInferenceContextFromSerializedData(
     fingerprint_key = tflite::delegates::Serialization::GetFingerprint(
         delegate_data_->model_token, options_fingerprint, context,
         delegate_params);
-    auto program_data = program_cache->LookUp(fingerprint_key);
+    auto program_data = program_cache->LookUpHandle(fingerprint_key);
     if (program_data.ok()) {
-      model_data = program_data.value();
+      program_data_handle = std::move(program_data.value());
     }
   }
 
-  if (!model_data.empty()) {
+  if (program_data_handle.IsMapped()) {
     // Restore InferenceContext from serialized data.
     absl::Span<const uint8_t> model_span = absl::Span<const uint8_t>{
-        reinterpret_cast<const uint8_t*>(model_data.data()), model_data.size()};
+        program_data_handle.data(), program_data_handle.size()};
 
     // If convert_weights_on_gpu is enabled (prepare weights on GPU),
     // trigger weights preparation and register the prepared weights into
@@ -852,6 +857,10 @@ absl::Status DelegateKernel::GraphToGpuModelWithGpuConverters(
         upload_info.input_id,
         absl::MakeConstSpan(reinterpret_cast<const uint8_t*>(upload_info.data),
                             upload_info.size)));
+    if (delegate_data_->options->madvise_original_shared_tensors) {
+      ::ml_drift::MadviseData(const_cast<void*>(upload_info.data),
+                              upload_info.size);
+    }
   }
 
   // this can be called later(but before ctx_ enqueue calls) and without
@@ -1079,42 +1088,34 @@ absl::Status DelegateKernel::InitializeIrModel(
     return absl::InternalError("Failed to build IrModel.");
   }
 
-  std::vector<uint32_t> non_const_input_refs;
-  non_const_input_refs.reserve(input_tensors->size);
-  for (int i = 0; i < input_tensors->size; ++i) {
-    int t_ref = input_tensors->data[i];
-    if (!tflite::IsConstantTensor(context->tensors + t_ref)) {
-      non_const_input_refs.push_back(t_ref);
-    }
-  }
-  const auto& ir_inputs = ir_model->inputs();
-  for (size_t i = 0; i < ir_inputs.size(); ++i) {
-    auto tensor_id = ir_inputs[i];
+  ABSL_RETURN_IF_ERROR(::litert::ml_drift::ApplyCustomTransformations(
+      ir_model.get(), *delegate_data_->options));
+
+  input_indices_.reserve(input_tensors->size);
+  for (auto tensor_id : ir_model->inputs()) {
     auto producer = ir_model->FindProducer(tensor_id);
     auto consumers = ir_model->FindConsumers(tensor_id);
-    if (producer != nullptr || !consumers.empty()) {
-      input_ids_.push_back(tensor_id);
-      input_indices_.push_back(non_const_input_refs[i]);
+    if (producer == nullptr && consumers.empty()) continue;
+    const auto* t = ir_model->tensor(tensor_id);
+    if (t != nullptr && t->buffer_source.tflite_tensor_id >= 0) {
+      const TfLiteTensor* tensor =
+          context->tensors + t->buffer_source.tflite_tensor_id;
+      if (!tflite::IsConstantTensor(tensor)) {
+        input_ids_.push_back(tensor_id);
+        input_indices_.push_back(t->buffer_source.tflite_tensor_id);
+      }
     }
   }
 
-  std::vector<uint32_t> output_tensors_refs;
-  output_tensors_refs.reserve(output_tensors->size);
-  for (int i = 0; i < output_tensors->size; ++i) {
-    output_tensors_refs.push_back(output_tensors->data[i]);
-  }
-  const auto& ir_outputs = ir_model->outputs();
-  const size_t output_size =
-      std::min(ir_outputs.size(), output_tensors_refs.size());
-  output_indices_.reserve(output_size);
-  output_ids_.reserve(output_size);
-  for (size_t i = 0; i < output_size; ++i) {
-    auto tensor_id = ir_outputs[i];
+  output_indices_.reserve(output_tensors->size);
+  for (auto tensor_id : ir_model->outputs()) {
     auto producer = ir_model->FindProducer(tensor_id);
     auto consumers = ir_model->FindConsumers(tensor_id);
-    if (producer != nullptr || !consumers.empty()) {
+    if (producer == nullptr && consumers.empty()) continue;
+    const auto* t = ir_model->tensor(tensor_id);
+    if (t != nullptr && t->buffer_source.tflite_tensor_id >= 0) {
       output_ids_.push_back(tensor_id);
-      output_indices_.push_back(output_tensors_refs[i]);
+      output_indices_.push_back(t->buffer_source.tflite_tensor_id);
     }
   }
 
@@ -1232,6 +1233,10 @@ absl::Status DelegateKernel::IrModelToGpuModelWithGpuConverters(
         upload_info.input_id,
         absl::MakeConstSpan(reinterpret_cast<const uint8_t*>(upload_info.data),
                             upload_info.size)));
+    if (delegate_data_->options->madvise_original_shared_tensors) {
+      ::ml_drift::MadviseData(const_cast<void*>(upload_info.data),
+                              upload_info.size);
+    }
   }
 
   // this can be called later(but before ctx_ enqueue calls) and without
@@ -1273,7 +1278,7 @@ absl::Status DelegateKernel::InitInferenceContextFromSerializedData(
   std::unique_ptr<tflite::delegates::SerializationEntry> data_key;
   std::unique_ptr<::ml_drift::SerializationProgramCache> program_cache;
   uint64_t fingerprint_key;
-  std::string model_data;
+  ::ml_drift::MMapHandle program_data_handle;
   if (delegate_data_->options->program_cache_fd > 0) {
     // Duplicate the fd since the program cache will take ownership of the fd.
     // The original fd is owned by the delegate options and may be used after
@@ -1287,9 +1292,9 @@ absl::Status DelegateKernel::InitInferenceContextFromSerializedData(
     fingerprint_key = tflite::delegates::Serialization::GetFingerprint(
         delegate_data_->model_token, options_fingerprint, context,
         delegate_params);
-    auto program_data = program_cache->LookUp(fingerprint_key);
+    auto program_data = program_cache->LookUpHandle(fingerprint_key);
     if (program_data.ok()) {
-      model_data = program_data.value();
+      program_data_handle = std::move(program_data.value());
     }
   } else {
     program_cache = std::make_unique<::ml_drift::SerializationProgramCache>(
@@ -1297,16 +1302,16 @@ absl::Status DelegateKernel::InitInferenceContextFromSerializedData(
     fingerprint_key = tflite::delegates::Serialization::GetFingerprint(
         delegate_data_->model_token, options_fingerprint, context,
         delegate_params);
-    auto program_data = program_cache->LookUp(fingerprint_key);
+    auto program_data = program_cache->LookUpHandle(fingerprint_key);
     if (program_data.ok()) {
-      model_data = program_data.value();
+      program_data_handle = std::move(program_data.value());
     }
   }
 
-  if (!model_data.empty()) {
+  if (program_data_handle.IsMapped()) {
     // Restore InferenceContext from serialized data.
     absl::Span<const uint8_t> model_span = absl::Span<const uint8_t>{
-        reinterpret_cast<const uint8_t*>(model_data.data()), model_data.size()};
+        program_data_handle.data(), program_data_handle.size()};
 
     // If convert_weights_on_gpu is enabled (prepare weights on GPU),
     // trigger weights preparation and register the prepared weights into
