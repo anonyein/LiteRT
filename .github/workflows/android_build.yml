@@ -317,6 +317,42 @@ jobs:
           echo "✅ TensorFlow cloned to /tmp/tensorflow"
       # ====================================================================
 
+      # ==================== 覆盖 rules_cc / rules_ml_toolchain 到 Bazel 7.7 兼容版本 ====================
+      # 根因：TF master（每日 --depth 1 前进）已把 rules_cc 升到 0.2.20、rules_ml_toolchain
+      # 升到 73cb731f。rules_cc 0.2.20 的 cc_library.bzl 现在做
+      #   load("@cc_compatibility_proxy//:proxy.bzl", ...)
+      # 而 cc_compatibility_proxy 只能通过 bzlmod 的 compatibility_proxy 扩展创建（并要求 Bazel 8+）。
+      # 本仓库用 WORKSPACE 模式（--noenable_bzlmod）+ Bazel 7.7.0，导致 bazel fetch 报
+      #   "Cycle in the workspace file ... @@cc_compatibility_proxy"。
+      # 修复：只把这两个工具链仓 override 回与 WORKSPACE pin（a6146d14c）一致的 Bazel 7.7 兼容版本
+      # （rules_ml_toolchain=2eddbc595，.bazelversion 为 7.7.0；rules_cc=0.2.0，其 cc_library.bzl
+      # 走 native 而非 proxy），TF 本体仍克隆最新。这与仓库既有 XNNPACK/KleidiAI/hwloc override 同款做法。
+      - name: Prepare rules_cc and rules_ml_toolchain overrides
+        run: |
+          set -e
+
+          # --- rules_cc 0.2.0 ---
+          RULES_CC_URL="https://github.com/bazelbuild/rules_cc/releases/download/0.2.0/rules_cc-0.2.0.tar.gz"
+          RULES_CC_SHA="ae244f400218f4a12ee81658ff246c0be5cb02c5ca2de5519ed505a6795431e9"
+          wget -q "$RULES_CC_URL" -O /tmp/rules_cc.tar.gz
+          echo "$RULES_CC_SHA  /tmp/rules_cc.tar.gz" | sha256sum -c --status || { echo "rules_cc sha mismatch"; exit 1; }
+          mkdir -p /tmp/rules_cc
+          tar -xzf /tmp/rules_cc.tar.gz -C /tmp/rules_cc --strip-components=1
+          # 确保作为独立外部仓库可用（WORKSPACE 模式需要 WORKSPACE 文件）
+          touch /tmp/rules_cc/WORKSPACE
+          echo "✅ rules_cc 0.2.0 prepared at /tmp/rules_cc"
+
+          # --- rules_ml_toolchain 2eddbc595 ---
+          RMT_URL="https://github.com/google-ml-infra/rules_ml_toolchain/archive/2eddbc595cc0bbe650c2640204f66b14f015f1a8.tar.gz"
+          RMT_SHA="3b05687842427041c65d1bc2f4aeda3a3079557120f5be8c34690087a88c5de5"
+          wget -q "$RMT_URL" -O /tmp/rules_ml_toolchain.tar.gz
+          echo "$RMT_SHA  /tmp/rules_ml_toolchain.tar.gz" | sha256sum -c --status || { echo "rules_ml_toolchain sha mismatch"; exit 1; }
+          mkdir -p /tmp/rules_ml_toolchain
+          tar -xzf /tmp/rules_ml_toolchain.tar.gz -C /tmp/rules_ml_toolchain --strip-components=1
+          touch /tmp/rules_ml_toolchain/WORKSPACE
+          echo "✅ rules_ml_toolchain 2eddbc595 prepared at /tmp/rules_ml_toolchain"
+      # ========================================================================================
+
       # ================== 修复 XLA lit_test.patch 与新版 LLVM 不匹配 ==================
       # TF upstream commit 730dd99d478d (2026-07-21) 集成了 LLVM 963e226d9a6b，
       # 新版 lit_test.bzl 内容已不再匹配 xla/third_party/llvm/lit_test.patch，
@@ -996,6 +1032,10 @@ jobs:
           echo "build --override_repository=KleidiAI=/tmp/kleidiai_repo" >> .bazelrc
           echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
+          # 覆盖 rules_cc / rules_ml_toolchain 回 Bazel 7.7 兼容版本，
+          # 避免 TF master 引入的 rules_cc 0.2.20 触发 cc_compatibility_proxy cycle。
+          echo "build --override_repository=rules_cc=/tmp/rules_cc" >> .bazelrc
+          echo "build --override_repository=rules_ml_toolchain=/tmp/rules_ml_toolchain" >> .bazelrc
           # 注意：cpuinfo 的 override 放到后续 "Override cpuinfo with fixed repository" 步骤里，
           # 因为 /tmp/cpuinfo_fixed 需要先由 "Prepare fixed cpuinfo repository" 步骤克隆+重写 BUILD。
           # 这里不写 --override_repository=cpuinfo=... 以免该步骤尚未生成 /tmp/cpuinfo_fixed 时
