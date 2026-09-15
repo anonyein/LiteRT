@@ -1005,6 +1005,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # 默认 packages 里已从 Google 仓库下架的 tools 包会报
+          # "Failed to find package 'tools'"，只装仍存在的 platform-tools。
+          packages: platform-tools
 
       - name: Install Android NDK r27
         run: |
