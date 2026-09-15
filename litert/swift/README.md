@@ -1,7 +1,7 @@
 # LiteRT Swift API
 
 The LiteRT Swift API provides a clean, type-safe Swifty wrapper layer over the
-core LiteRT C API (`litert/c`).
+core LiteRT C API (`third_party/odml/litert/litert/c`).
 
 It allows iOS, macOS, and cross-platform Swift applications to load, compile,
 and execute TensorFlow Lite models with hardware acceleration (CPU, GPU, NPU)
@@ -13,7 +13,7 @@ The package is organized into `Sources/` and `Tests/` directories to match
 standard Swift project conventions:
 
 - `BUILD`: Target compilation and testing rules.
-- **`Sources/`**: Production API source wrappers and headers.
+- **`Sources/LiteRT/`**: Production API source wrappers and headers.
 -   `LiteRtC.h`: Bridging C-API umbrella header.
 -   `Environment.swift`: LiteRT Environment configuration.
 -   `CompiledModel.swift`: Model loader and graph compilation/executor.
@@ -22,7 +22,7 @@ standard Swift project conventions:
 -   `TensorBuffer.swift`: Arithmetic heap read/write memory (supporting Host and Metal backing).
 -   `TensorType.swift`: Elements and dimensions structures.
 -   `LiteRtError.swift`: Swifty runtime status boundaries.
-- **`Tests/`**: Component-focused unit tests.
+- **`Tests/LiteRT/`**: Component-focused unit tests.
 -   `EnvironmentTests.swift`: Environment configuration tests.
 -   `TensorBufferTests.swift`: Host/Metal buffer and locking tests.
 -   `OptionsTests.swift`: Accelerator and kernel configuration tests.
@@ -111,7 +111,7 @@ swift_library(
     name = "my_target",
     srcs = ["MyFile.swift"],
     deps = [
-        "//litert/swift:litert_swift",
+        "//third_party/odml/litert/litert/swift:litert_swift",
     ],
 )
 ```
