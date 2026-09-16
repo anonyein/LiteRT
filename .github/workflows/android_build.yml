@@ -395,6 +395,46 @@ jobs:
           fi
       # ===============================================================================
 
+      # ================== 修复 XLA vendored LLVM tarball sha256 过期 ==================
+      # 根因（2026-09-16 run 35088786531）：TF master（--depth 1 每日克隆，其 vendor 的
+      # third_party/xla 即 external/xla 来源）把 LLVM bump 到 7024b9e1 后，vendored
+      # workspace.bzl 记录的 LLVM_SHA256=539f119d... 与 GitHub 实际生成的 tarball 校验和
+      # （c7f42402...，XLA main 已同步修正）不一致，导致 llvm-raw fetch 校验失败、
+      # repo mapping 计算崩溃（"Checksum was ... but wanted ..."）。
+      # 修复：计算该 commit tarball 的实际 sha256，与记录值不一致时改写为实际值，
+      # 对未来 LLVM bump 同样自愈。
+      - name: Fix LLVM tarball sha256 in vendored XLA workspace.bzl
+        run: |
+          set -e
+          WS_BZL="/tmp/tensorflow/third_party/xla/third_party/llvm/workspace.bzl"
+          if [ ! -f "$WS_BZL" ]; then
+            echo "⚠️ $WS_BZL not found, skipping"
+            exit 0
+          fi
+          COMMIT=$(grep -oP 'LLVM_COMMIT = "\K[0-9a-f]+' "$WS_BZL")
+          WANTED=$(grep -oP 'LLVM_SHA256 = "\K[0-9a-f]+' "$WS_BZL")
+          echo "=== Before: $WS_BZL ==="
+          grep -nE 'LLVM_COMMIT|LLVM_SHA256' "$WS_BZL"
+          if [ -z "$COMMIT" ] || [ -z "$WANTED" ]; then
+            echo "❌ Failed to extract LLVM_COMMIT/LLVM_SHA256 from $WS_BZL"
+            exit 1
+          fi
+          URL="https://github.com/llvm/llvm-project/archive/${COMMIT}.tar.gz"
+          echo "Computing actual sha256 of $URL"
+          ACTUAL=$(curl -fsSL "$URL" | sha256sum | awk '{print $1}')
+          echo "Recorded sha256: $WANTED"
+          echo "Actual   sha256: $ACTUAL"
+          if [ "$WANTED" != "$ACTUAL" ]; then
+            cp "$WS_BZL" "$WS_BZL.bak"
+            sed -i "s/${WANTED}/${ACTUAL}/" "$WS_BZL"
+            echo "=== After: patched LLVM_SHA256 ==="
+            grep -nE 'LLVM_SHA256' "$WS_BZL"
+            echo "✅ Patched LLVM_SHA256 in $WS_BZL"
+          else
+            echo "✅ Recorded sha256 already matches actual tarball, no patch needed"
+          fi
+      # ===============================================================================
+
 
       # 彻底删除 org_tensorflow 中所有文件里的 -msse3 / -msse4.1 / -msse4.2 / -DWEBP_HAVE_SSE41，并精确对比修改前后相同行（含上下文）
       - name: Remove all SSE options from org_tensorflow with before/after context
