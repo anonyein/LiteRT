@@ -212,6 +212,11 @@ jobs:
               },
               {
                   'file': 'tensor/runners/BUILD',
+                  'target': 'model_chain',
+                  'after_dep': None,  # model_chain 库本体经 model_chain.h -> litert_compiled_model.h 传递包含 litert_profiler.h
+              },
+              {
+                  'file': 'tensor/runners/BUILD',
                   'target': 'model_chain_test',
                   'after_dep': None,  # 上游 sync 新增的 model_chain_test 同样缺 litert_profiler 依赖
               },
