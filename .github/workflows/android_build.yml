@@ -210,6 +210,11 @@ jobs:
                   'target': 'lambda_model_runner_test',
                   'after_dep': None,  # None 表示插入到 deps 列表末尾（最后一个元素之前）
               },
+              {
+                  'file': 'tensor/runners/BUILD',
+                  'target': 'model_chain_test',
+                  'after_dep': None,  # 上游 sync 新增的 model_chain_test 同样缺 litert_profiler 依赖
+              },
           ]
       
           deps_to_add = [
