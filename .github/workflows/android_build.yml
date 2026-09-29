@@ -736,6 +736,15 @@ jobs:
         run: |
           rm -rf /tmp/kleidiai_repo
           cp -r /tmp/kleidiai /tmp/kleidiai_repo
+
+          # 新版 KleidiAI（c1c9e876+）自带原生 Bazel 文件（src/kai/**/BUILD.bazel + kai_defs.bzl）。
+          # 其 kai_defs.bzl 依赖 @platforms/@rules_cc 约束（在 TF WORKSPACE 环境下解析不到），
+          # 且 src/kai/** 下的 BUILD 会让这些目录形成 package 边界，
+          # 导致根 BUILD 中 common 的 glob(["src/kai/**/*.h", ...]) 静默排除这些头文件。
+          # 因此统一删除 src/kai 下的原生 Bazel 文件，全部改用本工作流自定义的 BUILD。
+          find /tmp/kleidiai_repo/src/kai -name 'BUILD*' -delete
+          find /tmp/kleidiai_repo/src/kai -name '*.bzl' -delete
+
           # 将源文件复制到 kai/ukernels/matmul 包内，使其能被 filegroup 匹配
           mkdir -p /tmp/kleidiai_repo/kai/ukernels/matmul
           cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/*.c /tmp/kleidiai_repo/kai/ukernels/matmul/ 2>/dev/null || true
@@ -884,6 +893,12 @@ jobs:
               copts = select({
                   "//:is_android_arm64": [
                       "-march=armv8.2-a+dotprod+i8mm+fp16+bf16+sme2+sve2",
+                      # 对齐 KleidiAI 原生构建：SME 源文件不用 SME 编译 flags（.inst 原始编码），
+                      # 禁止自动向量化往非 streaming 代码里发射 SVE 指令，并抑制超长符号名告警
+                      "-fno-tree-vectorize",
+                      "-fno-tree-slp-vectorize",
+                      "-Wno-error=overlength-strings",
+                      "-Wno-overlength-strings",
                   ],
                   "//conditions:default": [],
               }),
@@ -932,6 +947,25 @@ jobs:
           deps_needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
           targets_with_alwayslink = ['XNNPACK', 'packing', 'pack_lh']
 
+          # 新版 XNNPACK（neonsme2/dwconv 集成后，PR #11046）的 build_params.bzl 已按 arch
+          # 提供 KleidiAI deps，其中 neonsme2 extra_deps 含 root 形式 "@KleidiAI//:common"，
+          # 与往 MICROKERNEL_DEPS 注入的字符串完全相同 → 同一 deps 列表出现重复 label，
+          # Bazel 报 "Label ... is duplicated" 分析错误。检测到新版时跳过 MICROKERNEL_DEPS
+          # 注入（各 arch 的 gated extra_deps 已覆盖，且比无条件注入更干净）。
+          # 旧版 build_params 只有包形式 @KleidiAI//kai/ukernels/matmul，无 root 形式，仍走注入。
+          import os
+          if os.path.exists('build_params.bzl'):
+              with open('build_params.bzl', 'r') as f:
+                  build_params_content = f.read()
+          else:
+              build_params_content = ''
+          inject_microkernel_deps = '"@KleidiAI//:common"' not in build_params_content
+          if inject_microkernel_deps:
+              print("ℹ️ Old XNNPACK layout: injecting KleidiAI deps into MICROKERNEL_DEPS")
+          else:
+              print("ℹ️ New XNNPACK layout (per-arch KleidiAI deps in build_params.bzl): "
+                    "skipping MICROKERNEL_DEPS injection to avoid duplicate labels")
+
           # 1. 更新 MICROKERNEL_DEPS
           def update_microkernel_deps(m):
               inner = m.group(1)
@@ -944,12 +978,13 @@ jobs:
                       inner += dep
               return 'MICROKERNEL_DEPS = [' + inner + ']'
 
-          content = re.sub(
-              r'MICROKERNEL_DEPS\s*=\s*\[(.*?)\]',
-              update_microkernel_deps,
-              content,
-              flags=re.DOTALL,
-          )
+          if inject_microkernel_deps:
+              content = re.sub(
+                  r'MICROKERNEL_DEPS\s*=\s*\[(.*?)\]',
+                  update_microkernel_deps,
+                  content,
+                  flags=re.DOTALL,
+              )
 
           # 2. 更新所有 xnnpack_if_kleidiai_enabled 列表
           def update_kleidiai_list(m):
