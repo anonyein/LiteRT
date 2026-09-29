@@ -658,12 +658,12 @@ jobs:
           pattern = r'(name\s*=\s*"libtensorflowlite_jni\.so".*?\btflite_deps\s*=\s*\[)([^\]]*?)(\])'
           def add_deps(m):
               inner = m.group(2).strip()
-              needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"']
+              needed = ['"@KleidiAI//:common"', '"@KleidiAI//:matmul"', '"@KleidiAI//kai/ukernels/dwconv:dwconv"']
               if all(d in inner for d in needed):
                   return m.group(0)
               if inner and not inner.endswith(','):
                   inner += ','
-              inner += '\n        "@KleidiAI//:common",\n        "@KleidiAI//:matmul",'
+              inner += '\n        "@KleidiAI//:common",\n        "@KleidiAI//:matmul",\n        "@KleidiAI//kai/ukernels/dwconv:dwconv",'
               return m.group(1) + inner + m.group(3)
           new_content, count = re.subn(pattern, add_deps, content, flags=re.DOTALL)
           if count == 0:
@@ -758,6 +758,19 @@ jobs:
             cp /tmp/kleidiai_repo/src/kai/ukernels/matmul/$subname/*.h "/tmp/kleidiai_repo/kai/ukernels/matmul/$subname/" 2>/dev/null || true
           done
 
+          # 复制 dwconv 包源文件（XNNPACK master 新增 neonsme2 arch，引用 @KleidiAI//kai/ukernels/dwconv:dwconv/:interface）
+          if [ -d /tmp/kleidiai_repo/src/kai/ukernels/dwconv ]; then
+            mkdir -p /tmp/kleidiai_repo/kai/ukernels/dwconv
+            cp -r /tmp/kleidiai_repo/src/kai/ukernels/dwconv/. /tmp/kleidiai_repo/kai/ukernels/dwconv/
+            # KleidiAI 自带 BUILD 依赖其 kai_defs.bzl（@platforms 约束在本环境不解析），删除后用自定义 BUILD 覆盖
+            find /tmp/kleidiai_repo/kai/ukernels/dwconv -name 'BUILD*' -delete
+            find /tmp/kleidiai_repo/kai/ukernels/dwconv -name '*.bzl' -delete
+            echo "=== Copied dwconv sources ==="
+            find /tmp/kleidiai_repo/kai/ukernels/dwconv -type f | sort
+          else
+            echo "⚠️ No dwconv package in this KleidiAI commit"
+          fi
+
           echo "=== KleidiAI repo tree after copy ==="
           find /tmp/kleidiai_repo -type f \( -name '*.h' -o -name '*.c' -o -name '*.S' -o -name 'BUILD*' \) | sort
 
@@ -842,10 +855,51 @@ jobs:
           alias(name = "matmul", actual = "//:matmul")
           EOF
       
+          # dwconv 包：XNNPACK neonsme2 arch 需要 @KleidiAI//kai/ukernels/dwconv:dwconv 和 :interface
+          cat > $REPO/kai/ukernels/dwconv/BUILD.bazel << 'EOF'
+          package(default_visibility = ["//visibility:public"])
+      
+          filegroup(name = "dwconv_srcs", srcs = glob(["**/*.c", "**/*.S"], exclude = ["BUILD.bazel"]))
+          filegroup(name = "dwconv_hdrs", srcs = glob(["**/*.h"], exclude = ["**/*_interface.h"]))
+      
+          # 接口头文件（XNNPACK neonsme2 微内核以 textual include 方式使用）
+          cc_library(
+              name = "interface",
+              textual_hdrs = glob(["**/*_interface.h"]),
+          )
+      
+          cc_library(
+              name = "dwconv",
+              srcs = select({
+                  "//:is_android_arm64": [":dwconv_srcs"],
+                  "//conditions:default": [],
+              }),
+              hdrs = select({
+                  "//:is_android_arm64": [":dwconv_hdrs"],
+                  "//conditions:default": [],
+              }),
+              textual_hdrs = glob(["**/*_interface.h"]),
+              includes = ["."],
+              alwayslink = 1,
+              copts = select({
+                  "//:is_android_arm64": [
+                      "-march=armv8.2-a+dotprod+i8mm+fp16+bf16+sme2+sve2",
+                  ],
+                  "//conditions:default": [],
+              }),
+              deps = [
+                  ":interface",
+                  "//:common",
+              ],
+          )
+          EOF
+      
           echo "=== @KleidiAI root BUILD ==="
           cat $REPO/BUILD.bazel
           echo "=== @KleidiAI matmul BUILD ==="
           cat $REPO/kai/ukernels/matmul/BUILD.bazel
+          echo "=== @KleidiAI dwconv BUILD ==="
+          cat $REPO/kai/ukernels/dwconv/BUILD.bazel
           
        # ---- cpuinfo ----
        # 历史上这里曾尝试用 /tmp/cpuinfo_fixed（克隆 pytorch/cpuinfo 最新 master + 自定义 select）
@@ -1657,6 +1711,40 @@ jobs:
               exit 1
             fi
             echo "✅ All required symbols found in libmatmul"
+          fi
+
+          echo "=== Building KleidiAI dwconv to verify symbols ==="
+          bazel build \
+            --override_repository=XNNPACK=/tmp/xnnpack \
+            --override_repository=KleidiAI=/tmp/kleidiai_repo \
+            --noexperimental_cc_shared_library \
+            --noincompatible_remove_legacy_whole_archive \
+            -c opt \
+            --config=android_arm64 \
+            @KleidiAI//kai/ukernels/dwconv:dwconv
+          DWCONV_LIB=$(find bazel-out/ -name "libdwconv.a" -path "*/arm64-v8a*" | head -1)
+          if [ -z "$DWCONV_LIB" ]; then
+            echo "⚠️  Could not find libdwconv.a, skipping symbol check"
+          else
+            echo "Checking symbols in $DWCONV_LIB"
+            REQUIRED_DWCONV_SYMBOLS=(
+              "kai_run_rhs_dwconv_pack_x16p1vlx1b_x16_x16_sme"
+              "kai_run_rhs_dwconv_pack_x32p1vlx1b_x32_x32_sme"
+              "kai_run_dwconv_clamp_f16_f16_f16p1vlx1b_3x3_s1_4x4_sme2_mla"
+              "kai_run_dwconv_clamp_f32_f32_f32p1vlx1b_3x3_s1_4xc_sme2_mla"
+            )
+            MISSING_DWCONV=()
+            for symbol in "${REQUIRED_DWCONV_SYMBOLS[@]}"; do
+              if ! nm "$DWCONV_LIB" 2>/dev/null | grep -q "$symbol"; then
+                MISSING_DWCONV+=("$symbol")
+              fi
+            done
+            if [ ${#MISSING_DWCONV[@]} -ne 0 ]; then
+              echo "❌ The following required symbols are missing from libdwconv:"
+              printf '   %s\n' "${MISSING_DWCONV[@]}"
+              exit 1
+            fi
+            echo "✅ All required symbols found in libdwconv"
           fi
 
           # 其余架构预热（关闭 cc_shared_library 以匹配）
