@@ -23,6 +23,12 @@ jobs:
       ANDROID_API_LEVEL: "36"
       NDK_VERSION: "r27"
       KLEIDIAI_COMMIT: "51f7190558e51b7415d9ba24994fb477d7371446"
+      # 上游 2026-10 合并（160ceb582）后 WORKSPACE 默认改用 TF/XLA/LLVM shim：
+      # @xla 变成只含少量 TSL 头文件的桩仓库（无 third_party/llvm/workspace.bzl），
+      # 导致 amdgpu patch 等步骤找不到真实 xla 而失败，且 select-tf-ops AAR
+      # 需要真实 TF 源码。本工作流依赖 org_tensorflow=/tmp/tensorflow 覆盖 +
+      # 真实 xla/llvm 修补链，因此显式切回真实 TF 模式（等价于 --config=with_tensorflow）。
+      LITERT_WITH_TENSORFLOW: "1"
 
     steps:
       - name: Checkout repository
@@ -1435,8 +1441,12 @@ jobs:
             echo "=== Patched xla llvm workspace.bzl ==="
             cat "$XLA_WS"
           else
-            echo "xla llvm workspace.bzl not found at $XLA_WS"
-            exit 1
+            # 正常情况下 LITERT_WITH_TENSORFLOW=1 会保证这里拿到真实 xla。
+            # 若上游再次改变布局（如回到 shim），只告警不阻断，
+            # 让后续 XNNPACK 预检/主构建暴露真实错误，而不是在本步骤直接失败。
+            echo "WARNING: xla llvm workspace.bzl not found at $XLA_WS"
+            ls -la "${OUTPUT_BASE}/external/xla" 2>/dev/null || echo "(external/xla missing entirely)"
+            echo "WARNING: skipping amdgpu patch removal"
           fi
 
       # 修复 libwebp：删除其 BUILD 文件中的 -msse4.1 选项
@@ -1633,8 +1643,10 @@ jobs:
               done < /tmp/hwloc_lines_before.txt
               echo "✅ hwloc BUILD template patched (alternate)."
             else
-              echo "❌ Critical: hwloc BUILD template not found anywhere. Build may fail."
-              exit 1
+              # 不再硬性 exit 1：xla 可能是 shim 桩仓库或布局变化。
+              # 实际构建用的 hwloc 来自 --override_repository=hwloc=/tmp/hwloc，
+              # 此处模板缺失时让后续步骤暴露真实错误即可。
+              echo "WARNING: hwloc BUILD template not found anywhere (xla may be the TF shim stub); skipping."
             fi
           fi
 
