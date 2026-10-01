@@ -96,7 +96,25 @@ jobs:
       
           # 5. 在文件末尾追加 SDK 块
           cat /tmp/sdk_block.txt >> WORKSPACE
-      
+
+          # 6. 删除上游 160ceb582 新增的 android_configure/android_workspace 块。
+          #    本工作流经 org_tensorflow=/tmp/tensorflow 覆盖使用 TF master，
+          #    其 tf_workspace1() 已声明 @local_config_android，tf_workspace0() 已
+          #    调用 android_workspace() 完成 androidsdk（native 首次定义）与
+          #    androidndk（starlark 覆盖）的定义。WORKSPACE 里这段重复的
+          #    android_workspace() 会对 androidsdk 二次调用 native
+          #    android_sdk_repository，触发 "Cannot redefine repository after any
+          #    load statement (for repository 'androidsdk')"，使所有 bazel 命令
+          #    （fetch/build）在 WORKSPACE 评估阶段崩溃，必须删除。
+          if grep -q '^# Android SDK and NDK repositories from the ANDROID_\* environment variables\.' WORKSPACE && grep -q '^android_workspace()$' WORKSPACE; then
+            sed -i '/^# Android SDK and NDK repositories from the ANDROID_\* environment variables\./,/^android_workspace()$/d' WORKSPACE
+            echo "✅ Removed duplicate LiteRT android_configure block (TF master side declares local_config_android and defines androidsdk/androidndk)"
+          elif grep -q 'android_configure(name = "local_config_android")' WORKSPACE; then
+            echo "⚠️ WARNING: android block pattern not fully matched; androidsdk redefine error may occur"
+          else
+            echo "✅ android_configure block already absent"
+          fi
+
           echo "=== Fixed WORKSPACE (full content) ==="
           cat WORKSPACE
 
