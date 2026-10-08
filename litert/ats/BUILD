@@ -39,6 +39,7 @@ XNNPACK_DONT_REGISTER = [
     "Transformer",  # XNNPACK does not support TransformerLayer flex/custom ops
     "SdpaTransposed",  # XNNPACK does not support SdpaTransposed composite op
     "QkvNormRope",  # XNNPACK does not support QkvNormRope composite op
+    "RmsNorm",  # XNNPACK does not support RmsNorm composite op
     "Swiglu",  # XNNPACK does not support SwiGLU op
     "SelectV2",  # XNNPACK does not support SelectV2
     "tfl\\.floor_div",  # XNNPACK does not support FloorDiv
@@ -149,21 +150,9 @@ litert_define_ats(
     name = "qualcomm_ats",
     backend = "qualcomm",
     compile_only_suffix = "_aot",
-    do_register = [
-        "SingleOp",
-        "hf_all_minilm_l6_v2",
-        "hf_mobilevit_small",
-        "qai_hub_midas",
-        "qai_hub_real_esrgan_x4plus",
-        "torchvision_mobilenet_v2",
-        "u2net_lite",
-        "torchvision_resnet18",
-        "torchvision_squeezenet1_1",
-        "whisper_tiny_encoder",
-        "yamnet",
-        "yolo11n",
-    ],
     dont_register = [
+        "CompositeOp",
+        "Transformer",
         "hf_all_minilm_l6_v2",
         "whisper_tiny_decoder",
         "5d",  # Qualcomm QNN HTP only supports up to 4D/6D tensor layouts
@@ -202,21 +191,9 @@ litert_define_ats(
 #     name = "google_tensor_ats",
 #     backend = "google_tensor",
 #     compile_only_suffix = "_aot",
-#     do_register = [
-#         "SingleOp",
-#         "hf_all_minilm_l6_v2",
-#         "hf_mobilevit_small",
-#         "qai_hub_midas",
-#         "qai_hub_real_esrgan_x4plus",
-#         "torchvision_mobilenet_v2",
-#         "u2net_lite",
-#         "torchvision_resnet18",
-#         "torchvision_squeezenet1_1",
-#         "whisper_tiny_encoder",
-#         "yamnet",
-#         "yolo11n",
-#     ],
 #     dont_register = [
+#         "CompositeOp",
+#         "Transformer",
 #         "hf_all_minilm_l6_v2",
 #         "whisper_tiny_decoder",
 #         "5d",
@@ -231,18 +208,9 @@ litert_define_ats(
     name = "mediatek_ats",
     backend = "mediatek",
     compile_only_suffix = "_aot",
-    do_register = [
-        "SingleOp",
-        "hf_mobilevit_small",
-        "qai_hub_midas",
-        "torchvision_mobilenet_v2",
-        "u2net_lite",
-        "torchvision_resnet18",
-        "torchvision_squeezenet1_1",
-        "yamnet",
-        "yolo11n",
-    ],
     dont_register = [
+        "CompositeOp",
+        "Transformer",
         "5d",
         "6d",
         "whisper_tiny_decoder",
@@ -264,18 +232,9 @@ litert_define_ats(
     name = "gpu_ats",
     backend = "gpu",
     compile_only_suffix = "_aot",
-    do_register = [
-        "SingleOp",
-        "SdpaTransposed",
-        "hf_mobilevit_small",
-        "qai_hub_midas",
-        "torchvision_mobilenet_v2",
-        "u2net_lite",
-        "torchvision_squeezenet1_1",
-        "yamnet",
-        "yolo11n",
-    ],
     dont_register = [
+        "Transformer",
+        "scaled_dot_product_attention",
         "Binary.*i32",  # OpenCL delegate does not support int32 binary arithmetic
         "OneHot",  # OpenCL delegate does not support OneHot
         "LogSoftmax",  # OpenCL delegate does not support LogSoftmax
@@ -302,6 +261,12 @@ litert_define_ats(
         "QkvNormRope.*4d_f(16|32)<(?!1x)",  # GPU accelerator does not support QkvNormRope with batch > 1
         "SelectV2",  # OpenCL SelectV2 rejects multidimensional if/else broadcasting and uses kExact on FP16-rounded f32
         "Slice",  # OpenCL Slice uses kExact byte comparison on FP16-rounded f32 buffers
+        "simple_add_dynamic_shape",
+        "hf_all_minilm_l6_v2",
+        "whisper_tiny_decoder",
+        "torchvision_resnet18",
+        "whisper_tiny_encoder",
+        "qai_hub_real_esrgan_x4plus",
     ],
     extra_flags = [
         "--data_seed=42",
@@ -313,20 +278,9 @@ litert_define_ats(
     name = "intel_openvino_ats",
     backend = "intel_openvino",
     compile_only_suffix = None,
-    do_register = [
-        "SingleOp",
-        "hf_mobilevit_small",
-        "qai_hub_midas",
-        "qai_hub_real_esrgan_x4plus",
-        "torchvision_mobilenet_v2",
-        "u2net_lite",
-        "torchvision_resnet18",
-        "torchvision_squeezenet1_1",
-        "whisper_tiny_encoder",
-        "yamnet",
-        "yolo11n",
-    ],
     dont_register = [
+        "CompositeOp",
+        "Transformer",
         "6d",
         "hf_all_minilm_l6_v2",
         "whisper_tiny_decoder",
@@ -369,6 +323,7 @@ litert_define_ats(
         "Transformer",  # XNNPACK does not support TransformerLayer flex/custom ops
         "SdpaTransposed",  # XNNPACK does not support SdpaTransposed composite op
         "QkvNormRope",  # XNNPACK does not support QkvNormRope composite op
+        "RmsNorm",  # XNNPACK does not support RmsNorm composite op
         "Swiglu",  # XNNPACK does not support SwiGLU op
         "SelectV2",  # XNNPACK does not support SelectV2
         "tfl\\.floor_div",  # XNNPACK does not support FloorDiv
@@ -639,6 +594,7 @@ cc_library(
         ":configure",
         ":inference_fixture",
         ":register_qkv_norm_rope",
+        ":register_rms_norm",
         ":register_sdpa",
         ":register_sdpa_transposed",
         ":register_swiglu",
@@ -903,6 +859,23 @@ cc_library(
         ":register",
         "//litert/cc/internal:litert_detail",
         "//litert/test/generators:qkv_norm_rope",
+        "//tflite/types:half",
+    ],
+)
+
+cc_library(
+    name = "register_rms_norm",
+    testonly = True,
+    srcs = ["register_rms_norm.cc"],
+    hdrs = ["register_rms_norm.h"],
+    copts = commandline_flag_copts(),
+    deps = [
+        ":compile_fixture",
+        ":configure",
+        ":inference_fixture",
+        ":register",
+        "//litert/cc/internal:litert_detail",
+        "//litert/test/generators:rms_norm",
         "//tflite/types:half",
     ],
 )
