@@ -102,6 +102,7 @@ XNNPACK_DONT_REGISTER = [
     "Comparison",  # XNNPACK does not support Comparison ops
     "OneHot",  # XNNPACK does not support OneHot
     "Transformer",  # XNNPACK does not support TransformerLayer flex/custom ops
+    "GroupNorm",  # XNNPACK does not support GroupNorm composite op
     "SdpaTransposed",  # XNNPACK does not support SdpaTransposed composite op
     "QkvNormRope",  # XNNPACK does not support QkvNormRope composite op
     "RmsNorm",  # XNNPACK does not support RmsNorm composite op
@@ -521,6 +522,7 @@ litert_define_ats(
         "Transformer",
         "scaled_dot_product_attention",
         "Binary.*i32",  # OpenCL delegate does not support int32 binary arithmetic
+        "Comparison.*f32",  # OpenCL executes f32 graphs in FP16 precision, rounding close f32 inputs to equal under kExact
         "OneHot",  # OpenCL delegate does not support OneHot
         "LogSoftmax",  # OpenCL delegate does not support LogSoftmax
         "tfl[.]prelu",  # OpenCL delegate requires PRelu alpha to be statically allocated
@@ -612,6 +614,7 @@ litert_define_ats(
         "Comparison",  # XNNPACK does not support Comparison ops
         "OneHot",  # XNNPACK does not support OneHot
         "Transformer",  # XNNPACK does not support TransformerLayer flex/custom ops
+        "GroupNorm",  # XNNPACK does not support GroupNorm composite op
         "SdpaTransposed",  # XNNPACK does not support SdpaTransposed composite op
         "QkvNormRope",  # XNNPACK does not support QkvNormRope composite op
         "RmsNorm",  # XNNPACK does not support RmsNorm composite op
@@ -667,6 +670,7 @@ litert_define_ats(
     compile_only_suffix = None,
     dont_register = [
         "Binary.*i32",
+        "Comparison.*f32",  # Metal executes f32 graphs in FP16 precision, rounding close f32 inputs to equal under kExact
         "OneHot",
         "LogSoftmax",
         "Transpose.*[(]1d_",
@@ -704,6 +708,7 @@ litert_define_ats(
     compile_only_suffix = None,
     dont_register = [
         "Binary.*i32",
+        "Comparison.*f32",  # WebGPU executes f32 graphs in FP16 precision, rounding close f32 inputs to equal under kExact
         "OneHot",
         "LogSoftmax",
         "Transpose.*[(]1d_",
@@ -957,6 +962,7 @@ cc_library(
         ":compile_fixture",
         ":configure",
         ":inference_fixture",
+        ":register_group_norm",
         ":register_qkv_norm_rope",
         ":register_rms_norm",
         ":register_sdpa",
@@ -1226,6 +1232,23 @@ cc_library(
         "//litert/cc/internal:litert_detail",
         "//litert/test/generators:common",
         "//litert/test/generators:reshape",
+    ],
+)
+
+cc_library(
+    name = "register_group_norm",
+    testonly = True,
+    srcs = ["register_group_norm.cc"],
+    hdrs = ["register_group_norm.h"],
+    copts = commandline_flag_copts(),
+    deps = [
+        ":compile_fixture",
+        ":configure",
+        ":inference_fixture",
+        ":register",
+        "//litert/cc/internal:litert_detail",
+        "//litert/test/generators:group_norm",
+        "//tflite/types:half",
     ],
 )
 
