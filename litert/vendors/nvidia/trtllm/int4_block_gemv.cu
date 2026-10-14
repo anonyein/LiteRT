@@ -202,16 +202,25 @@ constexpr int kPairRows = kTileRows;  // routed (row, slot) pairs per chunk
 // The weight tile of expert `expert`'s output rows [o0, o0 + kTileRows) of a
 // projection whose rows interleave the experts.
 __device__ __forceinline__ WeightTile ExpertTile(const uint8_t* weights,
-                                                 const __half* scales,
-                                                 int experts, int expert,
-                                                 int o0, int out_rows,
+                                                 const void* scales,
+                                                 const void* scale_max,
+                                                 int compact, int experts,
+                                                 int expert, int o0,
+                                                 int out_rows,
                                                  int input_size) {
   const size_t row_bytes = static_cast<size_t>(input_size) / 2;
   const size_t blocks = static_cast<size_t>(input_size) / kBlock;
   const size_t first = static_cast<size_t>(o0) * experts + expert;
-  return WeightTile{weights + first * row_bytes, row_bytes * experts,
-                    scales + first * blocks, blocks * experts,
-                    min(kTileRows, out_rows - o0)};
+  WeightTile tile{weights + first * row_bytes, row_bytes * experts, nullptr,
+                  blocks * experts, min(kTileRows, out_rows - o0)};
+  if (compact != 0) {
+    tile.fractions = static_cast<const uint8_t*>(scales) + first * blocks;
+    tile.scale_max = static_cast<const __half*>(scale_max) + first;
+    tile.max_stride = experts;
+  } else {
+    tile.scales = static_cast<const __half*>(scales) + first * blocks;
+  }
+  return tile;
 }
 
 // Routing from the router's logits (BF16 [rows, experts], one launch of the
@@ -220,23 +229,22 @@ __device__ __forceinline__ WeightTile ExpertTile(const uint8_t* weights,
 // index) and, with `renormalize`, divides their probabilities by their sum.
 constexpr int kMaxRouteDim = 4096;
 
-// kPerLane: logits per lane, 4 for up to 128 experts (the per-lane scans of
-// the top-k rounds are the kernel's serial work).
+// A row's routing from its logits (BF16 [experts]), by one warp: softmax,
+// then the top_k largest by repeated argmax (ties to the lower index). Slot
+// `slot`'s expert is returned after slot + 1 rounds; with `write` all top_k
+// rounds run and the row's indices and weights (divided by their sum with
+// `renormalize`) go to `indices` / `weights`. kPerLane logits per lane, 4
+// for up to 128 experts (the per-lane scans are the serial work).
 template <int kPerLane>
-__global__ void MoeRouteKernel(const __nv_bfloat16* __restrict__ logits,
-                               int rows, int experts, int top_k,
-                               int renormalize,
-                               int32_t* __restrict__ top_indices,
-                               float* __restrict__ top_weights) {
-  constexpr int kMaxPerLane = kPerLane;
-  const int row = blockIdx.x * (blockDim.x / kWarpSize) + threadIdx.x / kWarpSize;
-  const int lane = threadIdx.x % kWarpSize;
-  if (row >= rows) return;
-  const __nv_bfloat16* src = logits + static_cast<size_t>(row) * experts;
-  float values[kMaxPerLane];
+__device__ __forceinline__ int RouteRow(const __nv_bfloat16* __restrict__ src,
+                                        int experts, int top_k, int slot,
+                                        int renormalize, bool write, int lane,
+                                        int32_t* __restrict__ indices,
+                                        float* __restrict__ weights) {
+  float values[kPerLane];
   float largest = -INFINITY;
 #pragma unroll
-  for (int i = 0; i < kMaxPerLane; ++i) {
+  for (int i = 0; i < kPerLane; ++i) {
     const int e = lane + i * kWarpSize;
     values[i] = e < experts ? __bfloat162float(src[e]) : -INFINITY;
     largest = fmaxf(largest, values[i]);
@@ -247,7 +255,7 @@ __global__ void MoeRouteKernel(const __nv_bfloat16* __restrict__ logits,
   }
   float sum = 0.0f;
 #pragma unroll
-  for (int i = 0; i < kMaxPerLane; ++i) {
+  for (int i = 0; i < kPerLane; ++i) {
     values[i] = lane + i * kWarpSize < experts ? expf(values[i] - largest) : 0.0f;
     sum += values[i];
   }
@@ -256,13 +264,16 @@ __global__ void MoeRouteKernel(const __nv_bfloat16* __restrict__ logits,
     sum += __shfl_xor_sync(kFullWarpMask, sum, offset);
   }
   const float inv_sum = 1.0f / sum;
+  int picks[kMaxTopK];
+  float probabilities[kMaxTopK];
   float chosen_sum = 0.0f;
-  for (int j = 0; j < top_k; ++j) {
-    // The lane's best remaining expert, then the warp's (ties: lowest index).
+  int chosen = experts;
+  const int rounds = write ? top_k : slot + 1;
+  for (int j = 0; j < rounds; ++j) {
     float best = -1.0f;
     int best_e = experts;
 #pragma unroll
-    for (int i = 0; i < kMaxPerLane; ++i) {
+    for (int i = 0; i < kPerLane; ++i) {
       const int e = lane + i * kWarpSize;
       if (e < experts && (values[i] > best || (values[i] == best && e < best_e))) {
         best = values[i];
@@ -280,34 +291,85 @@ __global__ void MoeRouteKernel(const __nv_bfloat16* __restrict__ logits,
     }
     const float probability = best * inv_sum;
     chosen_sum += probability;
-    if (lane == 0) {
-      top_indices[row * top_k + j] = best_e;
-      top_weights[row * top_k + j] = probability;
+    if (j == slot) chosen = best_e;
+    if (j < kMaxTopK) {
+      picks[j] = best_e;
+      probabilities[j] = probability;
     }
-    // Remove it from the lane that holds it.
     if (best_e % kWarpSize == lane) values[best_e / kWarpSize] = -1.0f;
   }
-  if (renormalize && lane == 0) {
-    const float inv = chosen_sum > 0.0f ? 1.0f / chosen_sum : 0.0f;
-    for (int j = 0; j < top_k; ++j) top_weights[row * top_k + j] *= inv;
+  if (write && lane == 0) {
+    const float inv =
+        renormalize ? (chosen_sum > 0.0f ? 1.0f / chosen_sum : 0.0f) : 1.0f;
+    for (int j = 0; j < top_k; ++j) {
+      indices[j] = picks[j];
+      weights[j] = probabilities[j] * inv;
+    }
   }
+  return chosen;
+}
+
+// The routing as its own kernel (prefill: the grouped GEMMs need every
+// row's experts before anything else), one warp per row.
+template <int kPerLane>
+__global__ void MoeRouteKernel(const __nv_bfloat16* __restrict__ logits,
+                               int rows, int experts, int top_k,
+                               int renormalize,
+                               int32_t* __restrict__ top_indices,
+                               float* __restrict__ top_weights) {
+  const int row = blockIdx.x * (blockDim.x / kWarpSize) + threadIdx.x / kWarpSize;
+  const int lane = threadIdx.x % kWarpSize;
+  if (row >= rows) return;
+  RouteRow<kPerLane>(logits + static_cast<size_t>(row) * experts, experts,
+                     top_k, /*slot=*/0, renormalize, /*write=*/true, lane,
+                     top_indices + static_cast<size_t>(row) * top_k,
+                     top_weights + static_cast<size_t>(row) * top_k);
 }
 
 // Decode: grid (hidden_dim / kTileRows, rows * top_k). hidden[pair][o] =
 // gelu(x . gate_e) * (x . up_e) for the pair's row and expert. With
 // `norm_scale` the row is RMS-normalized on the way in (the pre-expert norm).
-template <int Threads>
+template <int Threads, bool kCompact>
 __global__ void __launch_bounds__(Threads)
     MoeHiddenKernel(const __nv_bfloat16* __restrict__ activation,
                     const int32_t* __restrict__ top_indices,
+                    const __nv_bfloat16* __restrict__ logits, int renormalize,
+                    int32_t* __restrict__ route_indices,
+                    float* __restrict__ route_weights,
                     const float* __restrict__ norm_scale, float norm_eps,
                     LiteRtNvidiaMoeArena arena, LiteRtNvidiaMoeShape shape,
                     float* __restrict__ hidden) {
   constexpr int kWarps = Threads / kWarpSize;
   __shared__ float warp_sums[kTileRows * kWarps];
+  __shared__ int routed_expert;
   const int pair = blockIdx.y;
   const int row = pair / shape.top_k;
-  const int expert = top_indices[pair];
+  const int slot = pair - row * shape.top_k;
+  int expert;
+  if (logits != nullptr) {
+    // The routing folded in (decode): warp 0 takes this slot's expert from
+    // the row's logits, and the first block of slot 0 writes the row's whole
+    // top-k for the down kernel; the other warps wait.
+    if (threadIdx.x < kWarpSize) {
+      const bool write = blockIdx.x == 0 && slot == 0;
+      const __nv_bfloat16* src =
+          logits + static_cast<size_t>(row) * shape.experts;
+      int32_t* indices = route_indices + static_cast<size_t>(row) * shape.top_k;
+      float* weights = route_weights + static_cast<size_t>(row) * shape.top_k;
+      const int chosen =
+          shape.experts <= 4 * kWarpSize
+              ? RouteRow<4>(src, shape.experts, shape.top_k, slot, renormalize,
+                            write, threadIdx.x, indices, weights)
+              : RouteRow<kMaxExperts / kWarpSize>(
+                    src, shape.experts, shape.top_k, slot, renormalize, write,
+                    threadIdx.x, indices, weights);
+      if (threadIdx.x == 0) routed_expert = chosen;
+    }
+    __syncthreads();
+    expert = routed_expert;
+  } else {
+    expert = top_indices[pair];
+  }
   const int o0 = blockIdx.x * kTileRows;
   if (expert < 0 || expert >= shape.experts) return;
   const ActivationRows<__nv_bfloat16> act{
@@ -317,15 +379,17 @@ __global__ void __launch_bounds__(Threads)
   float up[1][kTileRows] = {};
   float squares[1] = {};
   float up_squares[1] = {};
-  AccumulateTile<__nv_bfloat16, 1, Threads>(
-      ExpertTile(arena.gate, static_cast<const __half*>(arena.gate_scales),
-                 shape.experts, expert, o0, shape.hidden_dim, shape.model_dim),
+  AccumulateTile<__nv_bfloat16, 1, Threads, kTileRows, kCompact>(
+      ExpertTile(arena.gate, arena.gate_scales, arena.gate_scale_max,
+                 arena.compact_scales, shape.experts, expert, o0,
+                 shape.hidden_dim, shape.model_dim),
       act, shape.model_dim, gate, norm_scale, squares);
   ReduceTile<1, Threads>(gate, warp_sums);
   __syncthreads();
-  AccumulateTile<__nv_bfloat16, 1, Threads>(
-      ExpertTile(arena.up, static_cast<const __half*>(arena.up_scales),
-                 shape.experts, expert, o0, shape.hidden_dim, shape.model_dim),
+  AccumulateTile<__nv_bfloat16, 1, Threads, kTileRows, kCompact>(
+      ExpertTile(arena.up, arena.up_scales, arena.up_scale_max,
+                 arena.compact_scales, shape.experts, expert, o0,
+                 shape.hidden_dim, shape.model_dim),
       act, shape.model_dim, up, norm_scale, up_squares);
   ReduceTile<1, Threads>(up, warp_sums);
   float factor = 1.0f;
@@ -349,7 +413,7 @@ __global__ void __launch_bounds__(Threads)
 // Decode: grid (model_dim / kTileRows, rows * top_k). partial[pair][o] =
 // w_pair * (hidden[pair] . down_e[o]) for the pair's expert e, so every
 // routed expert's tiles run in parallel; MoeCombineKernel sums the pairs.
-template <int Threads>
+template <int Threads, bool kCompact>
 __global__ void __launch_bounds__(Threads)
     MoeDownKernel(const float* __restrict__ hidden,
                   const int32_t* __restrict__ top_indices,
@@ -374,9 +438,10 @@ __global__ void __launch_bounds__(Threads)
       hidden + static_cast<size_t>(pair) * shape.hidden_dim,
       static_cast<size_t>(shape.hidden_dim), nullptr};
   float acc[1][kTileRows] = {};
-  AccumulateTile<float, 1, Threads>(
-      ExpertTile(arena.down, static_cast<const __half*>(arena.down_scales),
-                 shape.experts, expert, o0, shape.model_dim, shape.hidden_dim),
+  AccumulateTile<float, 1, Threads, kTileRows, kCompact>(
+      ExpertTile(arena.down, arena.down_scales, arena.down_scale_max,
+                 arena.compact_scales, shape.experts, expert, o0,
+                 shape.model_dim, shape.hidden_dim),
       act, shape.hidden_dim, acc);
   ReduceTile<1, Threads>(acc, warp_sums);
   if (threadIdx.x == 0) {
@@ -799,7 +864,9 @@ cudaError_t LaunchMoe(const LiteRtNvidiaMoeShape& shape,
                       const float* per_expert_scale, const float* norm_scale,
                       float norm_eps, char* workspace, __nv_bfloat16* output,
                       cudaStream_t stream,
-                      const BlockEpilogue* block = nullptr) {
+                      const BlockEpilogue* block = nullptr,
+                      const __nv_bfloat16* logits = nullptr,
+                      int renormalize = 1) {
   const MoeWorkspace w = LayoutWorkspace(shape);
   float* hidden = reinterpret_cast<float*>(workspace + w.hidden);
   const int hidden_tiles = (shape.hidden_dim + kTileRows - 1) / kTileRows;
@@ -808,16 +875,32 @@ cudaError_t LaunchMoe(const LiteRtNvidiaMoeShape& shape,
   constexpr int kDownThreads = 32;
   if (shape.rows <= kLiteRtNvidiaInt4BlockGemvMaxRows) {
     float* partial = reinterpret_cast<float*>(workspace + w.partial);
-    MoeHiddenKernel<Threads>
-        <<<dim3(hidden_tiles, shape.rows * shape.top_k), Threads, 0, stream>>>(
-            activation, top_indices, norm_scale, norm_eps, arena, shape,
-            hidden);
+    const dim3 hidden_grid(hidden_tiles, shape.rows * shape.top_k);
+    const dim3 down_grid(model_tiles, shape.rows * shape.top_k);
+    auto* route_indices = reinterpret_cast<int32_t*>(workspace + w.top_indices);
+    auto* route_weights = reinterpret_cast<float*>(workspace + w.top_weights);
+    if (arena.compact_scales != 0) {
+      MoeHiddenKernel<Threads, true><<<hidden_grid, Threads, 0, stream>>>(
+          activation, top_indices, logits, renormalize, route_indices,
+          route_weights, norm_scale, norm_eps, arena, shape, hidden);
+    } else {
+      MoeHiddenKernel<Threads, false><<<hidden_grid, Threads, 0, stream>>>(
+          activation, top_indices, logits, renormalize, route_indices,
+          route_weights, norm_scale, norm_eps, arena, shape, hidden);
+    }
     cudaError_t status = cudaPeekAtLastError();
     if (status != cudaSuccess) return status;
-    MoeDownKernel<kDownThreads>
-        <<<dim3(model_tiles, shape.rows * shape.top_k), kDownThreads, 0,
-           stream>>>(hidden, top_indices, top_weights, per_expert_scale, arena,
-                     shape, partial);
+    if (arena.compact_scales != 0) {
+      MoeDownKernel<kDownThreads, true>
+          <<<down_grid, kDownThreads, 0, stream>>>(hidden, top_indices,
+                                                   top_weights, per_expert_scale,
+                                                   arena, shape, partial);
+    } else {
+      MoeDownKernel<kDownThreads, false>
+          <<<down_grid, kDownThreads, 0, stream>>>(hidden, top_indices,
+                                                   top_weights, per_expert_scale,
+                                                   arena, shape, partial);
+    }
     status = cudaPeekAtLastError();
     if (status != cudaSuccess) return status;
     if (block != nullptr) {
@@ -885,7 +968,12 @@ cudaError_t LaunchMoe(const LiteRtNvidiaMoeShape& shape,
       model_scales * shape.experts,
       model_row_bytes,
       model_scales,
-      tile_experts};
+      tile_experts,
+      arena.gate_scale_max,
+      arena.up_scale_max,
+      static_cast<uint64_t>(shape.experts),
+      1,
+      arena.compact_scales};
   const LiteRtNvidiaGemmShape gate_shape = {padded, shape.model_dim,
                                             shape.hidden_dim, shape.gate, 32};
   status = LiteRtNvidiaLaunchBf16Int4GroupedGemm(
@@ -907,7 +995,12 @@ cudaError_t LaunchMoe(const LiteRtNvidiaMoeShape& shape,
       hidden_scales * shape.experts,
       hidden_row_bytes,
       hidden_scales,
-      tile_experts};
+      tile_experts,
+      arena.down_scale_max,
+      nullptr,
+      static_cast<uint64_t>(shape.experts),
+      1,
+      arena.compact_scales};
   const LiteRtNvidiaGemmShape down_shape = {
       padded, shape.hidden_dim, shape.model_dim, kLiteRtNvidiaGemmGateNone, 32};
   status = LiteRtNvidiaLaunchBf16Int4GroupedGemm(
@@ -930,6 +1023,28 @@ cudaError_t LaunchMoe(const LiteRtNvidiaMoeShape& shape,
 
 }  // namespace
 }  // namespace litert::nvidia::int4_block
+
+extern "C" void LiteRtNvidiaCompactScaleRow(const float* scales,
+                                            int32_t blocks,
+                                            uint8_t* fractions,
+                                            uint16_t* max_half) {
+  float largest = 0.0f;
+  for (int32_t b = 0; b < blocks; ++b) {
+    largest = fmaxf(largest, scales[b]);
+  }
+  // The maximum as stored (FP16), so the fractions are of the value the
+  // kernels multiply by.
+  const __half half = __float2half_rn(largest);
+  const __half_raw raw = half;
+  *max_half = raw.x;
+  const float stored = __half2float(half);
+  for (int32_t b = 0; b < blocks; ++b) {
+    const float fraction =
+        stored > 0.0f ? scales[b] / stored * 255.0f + 0.5f : 0.0f;
+    const int value = static_cast<int>(fraction);
+    fractions[b] = static_cast<uint8_t>(value < 0 ? 0 : value > 255 ? 255 : value);
+  }
+}
 
 extern "C" bool LiteRtNvidiaMoeSupports(const LiteRtNvidiaMoeShape* shape) {
   using namespace litert::nvidia::int4_block;
@@ -999,7 +1114,9 @@ cudaError_t LaunchMoeChecked(const LiteRtNvidiaMoeShape* shape,
                              void* workspace, void* output,
                              cudaStream_t stream,
                              const litert::nvidia::int4_block::BlockEpilogue*
-                                 block = nullptr) {
+                                 block = nullptr,
+                             const __nv_bfloat16* logits = nullptr,
+                             int renormalize = 1) {
   using namespace litert::nvidia::int4_block;
   if (!LiteRtNvidiaMoeSupports(shape) || arena == nullptr ||
       arena->gate == nullptr || arena->up == nullptr ||
@@ -1017,12 +1134,12 @@ cudaError_t LaunchMoeChecked(const LiteRtNvidiaMoeShape* shape,
     return LaunchMoe<32>(*shape, *arena, typed_activation, top_indices,
                          top_weights, per_expert_scale, norm_scale, norm_eps,
                          static_cast<char*>(workspace), typed_output, stream,
-                         block);
+                         block, logits, renormalize);
   }
   return LaunchMoe<128>(*shape, *arena, typed_activation, top_indices,
                         top_weights, per_expert_scale, norm_scale, norm_eps,
                         static_cast<char*>(workspace), typed_output, stream,
-                        block);
+                        block, logits, renormalize);
 }
 
 }  // namespace
@@ -1040,7 +1157,8 @@ extern "C" cudaError_t LiteRtNvidiaLaunchMoeInt4Block(
 namespace {
 
 // The routing of the fused launches: the router's logits into the
-// workspace, then top_indices/top_weights at its front.
+// workspace, then (prefill) top_indices/top_weights at its front; in decode
+// the hidden kernel routes from the logits and writes them itself.
 cudaError_t LaunchFusedRouting(const LiteRtNvidiaMoeShape* shape,
                                const LiteRtNvidiaMoeArena* arena,
                                const void* activation,
@@ -1075,6 +1193,10 @@ cudaError_t LaunchFusedRouting(const LiteRtNvidiaMoeShape* shape,
         stream);
   }
   if (status != cudaSuccess) return status;
+  if (shape->rows <= kLiteRtNvidiaInt4BlockGemvMaxRows) {
+    // Decode: the hidden kernel routes from the logits itself.
+    return cudaSuccess;
+  }
   constexpr int kRouteWarps = 4;
   const int route_blocks = (shape->rows + kRouteWarps - 1) / kRouteWarps;
   if (shape->experts <= 4 * kWarpSize) {
@@ -1089,6 +1211,14 @@ cudaError_t LaunchFusedRouting(const LiteRtNvidiaMoeShape* shape,
   }
   status = cudaPeekAtLastError();
   return cudaPeekAtLastError();
+}
+
+// The logits the hidden kernel routes from in decode; prefill routed already.
+const __nv_bfloat16* DecodeRoutingLogits(const LiteRtNvidiaMoeShape& shape,
+                                         const char* logits) {
+  return shape.rows <= kLiteRtNvidiaInt4BlockGemvMaxRows
+             ? reinterpret_cast<const __nv_bfloat16*>(logits)
+             : nullptr;
 }
 
 bool FusedArgumentsValid(const LiteRtNvidiaMoeShape* shape,
@@ -1129,7 +1259,9 @@ extern "C" cudaError_t LiteRtNvidiaLaunchMoeInt4BlockFused(
       shape, arena, activation,
       reinterpret_cast<const int32_t*>(bytes + w.top_indices),
       reinterpret_cast<const float*>(bytes + w.top_weights), per_expert_scale,
-      expert_norm_scale, norm_eps, workspace, output, stream);
+      expert_norm_scale, norm_eps, workspace, output, stream,
+      /*block=*/nullptr, DecodeRoutingLogits(*shape, bytes + w.logits),
+      renormalize);
 }
 
 extern "C" cudaError_t LiteRtNvidiaLaunchMoeLayerBlock(
@@ -1208,7 +1340,8 @@ extern "C" cudaError_t LiteRtNvidiaLaunchMoeLayerBlock(
       shape, arena, activation,
       reinterpret_cast<const int32_t*>(bytes + w.top_indices),
       reinterpret_cast<const float*>(bytes + w.top_weights), per_expert_scale,
-      expert_norm_scale, norm_eps, workspace, output, stream, &epilogue);
+      expert_norm_scale, norm_eps, workspace, output, stream, &epilogue,
+      DecodeRoutingLogits(*shape, bytes + w.logits), renormalize);
 }
 
 extern "C" cudaError_t LiteRtNvidiaLaunchBf16Int4BlockGemvRows(
