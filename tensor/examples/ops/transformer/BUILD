@@ -35,6 +35,7 @@ cc_library(
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:source_location",
+        "@com_google_absl//absl/types:span",
     ],
 )
 
@@ -60,6 +61,26 @@ cc_library(
 #         "@com_google_absl//absl/strings:string_view",
 #         "@com_google_absl//absl/types:span",
 #         "//tensor/internal:graph",
+#         "//tensor/utils:macros",
+#     ],
+# )
+#
+# cc_library(
+#     name = "transformer_ops_execution_plan",
+#     srcs = ["transformer_ops_execution_plan.cc"],
+#     hdrs = ["transformer_ops_execution_plan.h"],
+#     deps = [
+#         ":transformer_ops_graph",
+#         "@com_google_absl//absl/status",
+#         "@com_google_absl//absl/strings",
+#         "@com_google_absl//absl/strings:string_view",
+#         "//tensor",
+#         "//tensor:arithmetic_graph",
+#         "//tensor/backends/execution_plan:arithmetic_execution_plan",
+#         "//tensor/backends/execution_plan:execution_plan_conversion",
+#         "//tensor/internal:graph",
+#         "//tensor/internal:graph_traversal",
+#         "//tensor/internal:mixin",
 #         "//tensor/utils:macros",
 #     ],
 # )
@@ -175,6 +196,7 @@ cc_library(
 #     srcs = ["transformer_ops_test.cc"],
 #     deps = [
 #         ":transformer_ops",
+#         ":transformer_ops_xnnpack",
 #         "@com_google_googletest//:gtest_main",
 #         "@com_google_absl//absl/status",
 #         "@com_google_absl//absl/status:status_matchers",
