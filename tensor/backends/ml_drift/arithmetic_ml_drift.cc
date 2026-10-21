@@ -301,48 +301,129 @@ absl::StatusOr<ScaleZpInfo> CreateScaleAndZeroPointToFCTensor(
                                       ")is not quantized.");
   }
 
-  ml_drift::Tensor<ml_drift::OHWI, ml_drift::DataType::kFloat32> scale_values;
-  ml_drift::Tensor<ml_drift::OHWI, ml_drift::DataType::kFloat32> zp_values;
+  ml_drift::OHWI scale_zp_shape;
+  const PerChannelAffineQuantization* pcq_ptr = nullptr;
+  const BlockwiseQuantization* bwq_ptr = nullptr;
   if (auto pcq =
           out_info.quantization->As<const PerChannelAffineQuantization>();
       pcq.ok()) {
-    scale_values.data = pcq->scales;
-    scale_values.shape = ml_drift::OHWI(pcq->scales.size(), 1, 1, 1);
-    if (pcq->zero_points.empty()) {
-      zp_values.data.assign(pcq->scales.size(), 0);
-      zp_values.shape = ml_drift::OHWI(pcq->scales.size(), 1, 1, 1);
-    } else {
-      zp_values.data.assign(pcq->zero_points.begin(), pcq->zero_points.end());
-      zp_values.shape = ml_drift::OHWI(pcq->zero_points.size(), 1, 1, 1);
-    }
+    pcq_ptr = &(*pcq);
+    scale_zp_shape = ml_drift::OHWI(pcq_ptr->scales.size(), 1, 1, 1);
   } else if (auto bwq =
                  out_info.quantization->As<const BlockwiseQuantization>();
              bwq.ok()) {
+    bwq_ptr = &(*bwq);
     LRT_TENSOR_ASSIGN_OR_RETURN(auto ohwi, ShapeToOHWI(out_info.shape));
-    int num_blocks = ohwi.i / bwq->block_size;
-    scale_values.data = bwq->scales;
-    scale_values.shape = ml_drift::OHWI(ohwi.o, 1, 1, num_blocks);
-    if (bwq->zero_points.empty()) {
-      zp_values.data.assign(bwq->scales.size(), 0);
-      zp_values.shape = ml_drift::OHWI(ohwi.o, 1, 1, num_blocks);
-    } else {
-      zp_values.data.assign(bwq->zero_points.begin(), bwq->zero_points.end());
-      zp_values.shape = ml_drift::OHWI(ohwi.o, 1, 1, num_blocks);
-    }
+    int num_blocks = ohwi.i / bwq_ptr->block_size;
+    scale_zp_shape = ml_drift::OHWI(ohwi.o, 1, 1, num_blocks);
   } else {
     return absl::InvalidArgumentError("Unsupported quantization type");
   }
 
+  std::string scale_key;
+  std::string zp_key;
+  if (!out_info.name.empty()) {
+    scale_key =
+        absl::StrCat(out_info.name, ":scale:", static_cast<int>(float_type));
+    zp_key = absl::StrCat(out_info.name, ":zp:", static_cast<int>(float_type));
+    auto scale_it = ctx.weight_name_to_handle.find(scale_key);
+    auto zp_it = ctx.weight_name_to_handle.find(zp_key);
+    if (scale_it != ctx.weight_name_to_handle.end() &&
+        zp_it != ctx.weight_name_to_handle.end()) {
+      return ScaleZpInfo{scale_it->second, zp_it->second, scale_zp_shape};
+    }
+    if (ctx.shared_weight_descriptors != nullptr) {
+      auto shared_scale_it = ctx.shared_weight_descriptors->find(scale_key);
+      auto shared_zp_it = ctx.shared_weight_descriptors->find(zp_key);
+      if (shared_scale_it != ctx.shared_weight_descriptors->end() &&
+          shared_zp_it != ctx.shared_weight_descriptors->end()) {
+        auto scale_handle = ctx.gpu_model_builder->AddConstantTensor(
+            CopyDescriptorWithoutData(shared_scale_it->second));
+        auto zero_point_handle = ctx.gpu_model_builder->AddConstantTensor(
+            CopyDescriptorWithoutData(shared_zp_it->second));
+        ctx.weight_name_to_handle.insert({scale_key, scale_handle});
+        ctx.weight_name_to_handle.insert({zp_key, zero_point_handle});
+        return ScaleZpInfo{scale_handle, zero_point_handle, scale_zp_shape};
+      }
+    }
+  }
+
+  ml_drift::Tensor<ml_drift::OHWI, ml_drift::DataType::kFloat32> scale_values;
+  ml_drift::Tensor<ml_drift::OHWI, ml_drift::DataType::kFloat32> zp_values;
+  scale_values.shape = scale_zp_shape;
+  // The kernels read one zero point per scale. No zero point means 0, and a
+  // single one is shared by all the scales.
+  auto set_zero_points =
+      [&](const std::vector<float>& scales,
+          const std::vector<int64_t>& zero_points) -> absl::Status {
+    if (zero_points.empty()) {
+      zp_values.data.assign(scales.size(), 0);
+    } else if (zero_points.size() == 1) {
+      zp_values.data.assign(scales.size(), zero_points[0]);
+    } else if (zero_points.size() == scales.size()) {
+      zp_values.data.assign(zero_points.begin(), zero_points.end());
+    } else {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Weights tensor (", out_info.name, ") has ", zero_points.size(),
+          " zero points for ", scales.size(), " scales."));
+    }
+    zp_values.shape = scale_values.shape;
+    return absl::OkStatus();
+  };
+  if (pcq_ptr != nullptr) {
+    scale_values.data = pcq_ptr->scales;
+    LRT_TENSOR_RETURN_IF_ERROR(
+        set_zero_points(pcq_ptr->scales, pcq_ptr->zero_points));
+  } else {
+    scale_values.data = bwq_ptr->scales;
+    LRT_TENSOR_RETURN_IF_ERROR(
+        set_zero_points(bwq_ptr->scales, bwq_ptr->zero_points));
+  }
+
   auto scale_desc = ScaleOrZeroPointToTensorDesc(
       ctx.gpu_model_builder->gpu_info(), scale_values, float_type);
-
-  auto scale_handle =
-      ctx.gpu_model_builder->AddConstantTensor(std::move(scale_desc));
   auto zero_point_desc = ScaleOrZeroPointToTensorDesc(
       ctx.gpu_model_builder->gpu_info(), zp_values, float_type);
-  auto zero_point_handle =
-      ctx.gpu_model_builder->AddConstantTensor(std::move(zero_point_desc));
-  return ScaleZpInfo{scale_handle, zero_point_handle, scale_values.shape};
+  ml_drift::GpuModelBuilder::TensorHandle scale_handle;
+  ml_drift::GpuModelBuilder::TensorHandle zero_point_handle;
+  if (!out_info.name.empty() && ctx.shared_weight_descriptors != nullptr) {
+    auto [shared_scale_it, _] = ctx.shared_weight_descriptors->try_emplace(
+        scale_key, std::move(scale_desc));
+    scale_handle = ctx.gpu_model_builder->AddConstantTensor(
+        CopyDescriptorWithoutData(shared_scale_it->second));
+    auto [shared_zp_it, __] = ctx.shared_weight_descriptors->try_emplace(
+        zp_key, std::move(zero_point_desc));
+    zero_point_handle = ctx.gpu_model_builder->AddConstantTensor(
+        CopyDescriptorWithoutData(shared_zp_it->second));
+  } else {
+    scale_handle =
+        ctx.gpu_model_builder->AddConstantTensor(std::move(scale_desc));
+    zero_point_handle =
+        ctx.gpu_model_builder->AddConstantTensor(std::move(zero_point_desc));
+  }
+  if (!out_info.name.empty()) {
+    ctx.weight_name_to_handle.insert({scale_key, scale_handle});
+    ctx.weight_name_to_handle.insert({zp_key, zero_point_handle});
+  }
+  return ScaleZpInfo{scale_handle, zero_point_handle, scale_zp_shape};
+}
+
+// Returns an error if `tensor` is a quantized constant, e.g. quantized weights,
+// or has a sub-byte type. Lowerings that don't dequantize their inputs upload
+// the integers of quantized constants as their values, and the generic ML
+// Drift kernels can't read sub-byte types.
+absl::Status CheckIsNotQuantizedConstant(const graph::Tensor& tensor,
+                                         absl::string_view op_name) {
+  LRT_TENSOR_ASSIGN_OR_RETURN(const auto& info, graph::GetInfo(tensor));
+  const bool sub_byte = BitSize(info.type) < 8;
+  const bool quantized_constant =
+      info.buffer != nullptr && info.quantization != nullptr;
+  if (quantized_constant || sub_byte) {
+    return absl::UnimplementedError(absl::StrCat(
+        op_name,
+        " doesn't support quantized constant or sub-byte inputs in ML Drift."));
+  }
+  return absl::OkStatus();
 }
 
 }  // namespace
@@ -764,8 +845,12 @@ absl::Status OpMixin<DepthwiseConv2DOperation, MlDriftMixinTag>::ToMlDrift(
   attr.groups = float_weights.shape.o / data.depth_multiplier;
 
   ml_drift::GpuModelBuilder::TensorHandle out;
+  const bool share_const_filter =
+      !filter_info.name.empty() && !has_bias && filter_info.shape.size() == 4 &&
+      filter_info.shape[0] == 1 && ctx.shared_weight_descriptors != nullptr &&
+      !ctx.external_weight_names.contains(filter_info.name);
   if (filter_info.buffer != nullptr &&
-      (!has_bias || bias_info.buffer != nullptr)) {
+      (!has_bias || bias_info.buffer != nullptr) && !share_const_filter) {
     // Both weights and bias are constants, so use static DepthwiseConv2D
     auto locked_weights = filter_info.buffer->Lock();
     const float* weights_ptr =
@@ -996,6 +1081,10 @@ absl::Status OpMixin<SoftmaxOperation, MlDriftMixinTag>::ToMlDrift(
 absl::Status OpMixin<BatchMatMulOperation, MlDriftMixinTag>::ToMlDrift(
     const graph::Operation& op, MlDriftBuildContext& ctx) const {
   LRT_TENSOR_ASSIGN_OR_RETURN(auto outputs, graph::GetOutputs(op));
+  for (const graph::Tensor& input : op.inputs) {
+    LRT_TENSOR_RETURN_IF_ERROR(
+        CheckIsNotQuantizedConstant(input, op.GetName()));
+  }
   LRT_TENSOR_ASSIGN_OR_RETURN(auto lhs, GetTensorHandle(ctx, op.inputs[0]));
   LRT_TENSOR_ASSIGN_OR_RETURN(auto rhs, GetTensorHandle(ctx, op.inputs[1]));
   LRT_TENSOR_ASSIGN_OR_RETURN(const auto& lhs_info,
@@ -1003,24 +1092,24 @@ absl::Status OpMixin<BatchMatMulOperation, MlDriftMixinTag>::ToMlDrift(
   // lhs cannot be constant tensor.
   if (lhs_info.buffer != nullptr) {
     return absl::UnimplementedError(
-        "BatchMatMul with constant lhs is not supported.");
+        absl::StrCat(op.GetName(), " with constant lhs is not supported."));
   }
   // lhs cannot have rank < 2.
   if (lhs_info.shape.size() < 2) {
     return absl::UnimplementedError(
-        "BatchMatMul with rank < 2 lhs is not supported.");
+        absl::StrCat(op.GetName(), " with rank < 2 lhs is not supported."));
   }
   LRT_TENSOR_ASSIGN_OR_RETURN(const auto& rhs_info,
                               graph::GetInfo(op.inputs[1]));
   // if rhs is constant, it has to be 2D.
   if (rhs_info.buffer != nullptr && rhs_info.shape.size() != 2) {
-    return absl::UnimplementedError(
-        "BatchMatMul with constant rhs is only supported for 2D tensors.");
+    return absl::UnimplementedError(absl::StrCat(
+        op.GetName(), " with constant rhs is only supported for 2D tensors."));
   }
   // rhs cannot have rank < 2.
   if (rhs_info.shape.size() < 2) {
     return absl::UnimplementedError(
-        "BatchMatMul with rank < 2 rhs is not supported.");
+        absl::StrCat(op.GetName(), " with rank < 2 rhs is not supported."));
   }
   // ML Drift's BatchedMatMul indexes the rhs by the lhs batch position and
   // does not broadcast leading dimensions: batches beyond the rhs extent are
@@ -1051,6 +1140,26 @@ absl::Status OpMixin<BatchMatMulOperation, MlDriftMixinTag>::ToMlDrift(
   }
   LRT_TENSOR_ASSIGN_OR_RETURN(const BatchMatMulOperation& data,
                               op.As<BatchMatMulOperation>());
+  // `ShapeToBHWC` maps [R, C] to (R, 1, 1, C), but batched matmuls multiply
+  // the (W, C) matrices of their operands, and don't broadcast their batch
+  // dimensions. So a rank 2 right-hand side is reshaped to (1, 1, R, C), and
+  // the left-hand side to a single (1, 1, rows, cols) matrix.
+  const bool rank2_rhs = rhs_info.shape.size() == 2;
+  if (rank2_rhs) {
+    if (data.adj_x && lhs_info.shape.size() > 2) {
+      return absl::UnimplementedError(
+          "BatchMatMul with a transposed lhs of rank > 2 and a rank 2 rhs is "
+          "not supported.");
+    }
+    int lhs_rows = 1;
+    for (size_t i = 0; i + 1 < lhs_info.shape.size(); ++i) {
+      lhs_rows *= lhs_info.shape[i];
+    }
+    lhs = ctx.gpu_model_builder->Reshape(
+        lhs, ml_drift::BHWC(1, 1, lhs_rows, lhs_info.shape.back()));
+    rhs = ctx.gpu_model_builder->Reshape(
+        rhs, ml_drift::BHWC(1, 1, rhs_info.shape[0], rhs_info.shape[1]));
+  }
   ml_drift::BatchedMatMulAttributes attr;
   attr.transpose_left = data.adj_x;
   attr.transpose_right = data.adj_y;
@@ -1065,6 +1174,13 @@ absl::Status OpMixin<BatchMatMulOperation, MlDriftMixinTag>::ToMlDrift(
   }
   LRT_TENSOR_ASSIGN_OR_RETURN(
       auto out, ctx.gpu_model_builder->BatchedMatMul(lhs, rhs, attr));
+  if (rank2_rhs) {
+    // The result is a single (1, 1, rows, N) matrix.
+    LRT_TENSOR_ASSIGN_OR_RETURN(const auto& out_info,
+                                graph::GetInfo(outputs[0]));
+    LRT_TENSOR_ASSIGN_OR_RETURN(auto out_shape, ShapeToBHWC(out_info.shape));
+    out = ctx.gpu_model_builder->Reshape(out, out_shape);
+  }
   ctx.graph_tensor_to_handle.insert({outputs[0], out});
   return CheckGpuOpOk(ctx, op);
 }
@@ -1072,6 +1188,8 @@ absl::Status OpMixin<BatchMatMulOperation, MlDriftMixinTag>::ToMlDrift(
 absl::Status OpMixin<TransposeOperation, MlDriftMixinTag>::ToMlDrift(
     const graph::Operation& op, MlDriftBuildContext& ctx) const {
   LRT_TENSOR_ASSIGN_OR_RETURN(auto outputs, graph::GetOutputs(op));
+  LRT_TENSOR_RETURN_IF_ERROR(
+      CheckIsNotQuantizedConstant(op.inputs[0], op.GetName()));
   LRT_TENSOR_ASSIGN_OR_RETURN(auto input, GetTensorHandle(ctx, op.inputs[0]));
   LRT_TENSOR_ASSIGN_OR_RETURN(const auto& perm_info,
                               graph::GetInfo(op.inputs[1]));
