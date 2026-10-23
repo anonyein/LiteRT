@@ -1710,32 +1710,55 @@ jobs:
             echo "hwloc directory not found, skipping"
           fi
 
-      # 修复 ruy 2af8886（上游 77b61f8dd2 升级引入）：新 ruy 的 AVX copts select
-      # 改用基于 @platforms 约束的 x86_64_and_not_msvc 条件，在本工作流的
-      # WORKSPACE 模式 Android ARM64 构建中被误命中，-mavx512f/-mavx512vl/
-      # -mavx512cd/-mavx512bw/-mavx512dq 被传给 aarch64 NDK clang
-      # （run 39816473976: have_built_path_for_avx512.cc 报
+      # 修复 ruy 2af8886（上游 77b61f8dd2 升级引入）：新 ruy 的 AVX copts select 改用
+      # 基于 @platforms 约束的 x86_64_and_not_msvc。//tflite/java 的 AAR 以
+      # --fat_apk_cpu=x86,x86_64,arm64-v8a,armeabi-v7a 多 ABI 构建，android 规则的
+      # 配置 transition 下该 config_setting 以 host 平台（x86_64-linux）求值而被误命中，
+      # -mavx512f/-mavx512vl/-mavx512cd/-mavx512bw/-mavx512dq 被传给 aarch64 NDK clang
+      # （run 39816473976/39924860229：have_built_path_for_avx512.cc 报
       # "unsupported option '-mavx512f' for target 'aarch64-linux-android31'"）。
-      # ruy 的所有 x86 专用 .cc 都有 #if RUY_PLATFORM_X86 保护，清空 AVX 标志后
-      # 只是空翻译单元，ARM 路径不受影响；同时对旧版 ruy（k8/haswell key）也有效。
-      - name: Patch ruy AVX copts out for Android ARM64 build
+      # //tensor/... 无此 transition 故能过；旧 ruy 用 cpu 值 select（k8/haswell）免疫；
+      # 上游 google-ai-edge 的 Android CI 不构建 //tflite/java 旧 AAR 故不受影响。
+      # 注意：直接 sed external/ruy 的文件无效——bazel 会因 --define 变化丢弃 analysis
+      # cache 并重新物化 ruy，补丁被还原（run 39924860229 实测）。故改用本工作流已验证的
+      # --override_repository 方案（同 XNNPACK/cpuinfo/hwloc）：按 litert_workspace.bzl
+      # 当前 pin 下载，等价复刻 tf_http_archive 行为（应用 ruy.patch、链接根 BUILD.bazel），
+      # 再清空 x86_64 分支的 AVX 标志列表。ruy 的 x86 专用 .cc 都有 #if RUY_PLATFORM_X86
+      # 保护，清空后仅空翻译单元；这与旧 ruy 在本构建中从未启用 AVX 路径的行为一致。
+      - name: Override ruy repo with AVX-neutralized local copy
         run: |
-          # 确保 @ruy 已物化（下载 + 应用 third_party/ruy/ruy.patch）
-          bazel fetch @ruy//... || true
-          OUTPUT_BASE=$(bazel info output_base)
-          RUY_DEFS="${OUTPUT_BASE}/external/ruy/ruy/build_defs.bzl"
-          if [ ! -f "$RUY_DEFS" ]; then
-            echo "ruy not yet materialized, fetching @ruy//ruy:ruy only"
-            bazel fetch @ruy//ruy:ruy || true
+          # 1. 从 litert_workspace.bzl 动态读取 ruy pin（上游升版自动跟随）
+          RUY_BLOCK=$(sed -n '/name = "ruy"/,/^[[:space:]]*)/p' litert_workspace.bzl)
+          echo "=== ruy block in litert_workspace.bzl ==="
+          echo "${RUY_BLOCK}"
+          RUY_URL=$(echo "${RUY_BLOCK}" | grep -o 'https://github.com/google/ruy/archive/[0-9a-f]*\.zip' | head -1)
+          RUY_SHA=$(echo "${RUY_BLOCK}" | grep -o 'sha256 = "[0-9a-f]*"' | head -1 | grep -o '[0-9a-f]\{64\}')
+          RUY_PREFIX=$(echo "${RUY_BLOCK}" | grep -o 'strip_prefix = "ruy-[0-9a-f]*"' | head -1 | sed 's/strip_prefix = "//; s/"$//')
+          if [ -z "${RUY_URL}" ] || [ -z "${RUY_SHA}" ] || [ -z "${RUY_PREFIX}" ]; then
+            echo "ERROR: could not parse ruy pin from litert_workspace.bzl"
+            exit 1
           fi
-          if [ -f "$RUY_DEFS" ]; then
-            echo "Found ruy build_defs.bzl at $RUY_DEFS"
-            export RUY_DEFS
-            cp "$RUY_DEFS" "$RUY_DEFS.bak"
-            echo "=== BEFORE: x86_64 select lines in build_defs.bzl ==="
-            grep -n 'x86_64' "$RUY_DEFS" || echo "(none)"
-            # 清空所有 x86_64 条件分支的 AVX 标志列表（MSVC /arch 分支不影响 NDK 构建）
-            python3 << 'PYEOF'
+          echo "ruy url: ${RUY_URL}"
+          echo "ruy sha256: ${RUY_SHA}"
+          echo "ruy strip_prefix: ${RUY_PREFIX}"
+          # 2. 下载并校验 sha256
+          rm -rf /tmp/ruy_fixed /tmp/ruy_extract /tmp/ruy.zip
+          curl -fsSL -o /tmp/ruy.zip "${RUY_URL}"
+          echo "${RUY_SHA}  /tmp/ruy.zip" | sha256sum -c -
+          mkdir -p /tmp/ruy_extract
+          unzip -q /tmp/ruy.zip -d /tmp/ruy_extract
+          mv "/tmp/ruy_extract/${RUY_PREFIX}" /tmp/ruy_fixed
+          # 3. 应用 fork 的 ruy.patch（等价 tf_http_archive 的 ctx.patch(strip=1)）。
+          #    若上游改 pin 导致 patch 不再适用，仅告警，让后续构建暴露真实错误。
+          patch -d /tmp/ruy_fixed -p1 --forward < third_party/ruy/ruy.patch \
+            || echo "WARNING: ruy.patch did not apply (ruy pin may have changed upstream)"
+          # 4. 根 BUILD.bazel：与 build_file 行为一致（BUILD.bazel 优先于 BUILD）
+          ln -sf "${GITHUB_WORKSPACE}/third_party/ruy/ruy.BUILD" /tmp/ruy_fixed/BUILD.bazel
+          # 5. 清空所有 x86_64 条件分支的 AVX 标志列表（MSVC /arch 分支不影响 NDK 构建）
+          export RUY_DEFS=/tmp/ruy_fixed/ruy/build_defs.bzl
+          echo "=== BEFORE: x86_64 select lines in build_defs.bzl ==="
+          grep -n 'x86_64' "${RUY_DEFS}" || echo "(none)"
+          python3 << 'PYEOF'
           import os, re
           defs = os.environ["RUY_DEFS"]
           with open(defs) as f:
@@ -1746,17 +1769,22 @@ jobs:
               f.write(content)
           print("Patched: x86_64 select flag lists cleared")
           PYEOF
-            echo "=== AFTER: x86_64 select lines in build_defs.bzl ==="
-            grep -n 'x86_64' "$RUY_DEFS" || echo "(none)"
-            if grep -Eq '"[^"]*x86_64[^"]*":\s*\[[^]]*-m(avx|sse)' "$RUY_DEFS"; then
-              echo "ERROR: AVX/SSE flags still present on x86_64 select branch in ruy build_defs.bzl"
-              exit 1
-            fi
-            echo "OK: ruy AVX copts neutralized for Android ARM64 build"
-          else
-            echo "ERROR: ruy build_defs.bzl not found at $RUY_DEFS after fetch"
+          echo "=== AFTER: x86_64 select lines in build_defs.bzl ==="
+          grep -n 'x86_64' "${RUY_DEFS}" || echo "(none)"
+          if grep -Eq '"[^"]*x86_64[^"]*":\s*\[[^]]*-m(avx|sse)' "${RUY_DEFS}"; then
+            echo "ERROR: AVX/SSE flags still present on x86_64 select branch in ruy build_defs.bzl"
             exit 1
           fi
+          # 6. 注册 override：后续所有 bazel 调用一律使用本地副本，杜绝重新物化还原
+          if grep -q 'override_repository=ruy=' .bazelrc; then
+            sed -i 's#--override_repository=ruy=[^ ]*#--override_repository=ruy=/tmp/ruy_fixed#' .bazelrc
+          else
+            echo "build --override_repository=ruy=/tmp/ruy_fixed" >> .bazelrc
+          fi
+          echo "=== override_repository lines in .bazelrc ==="
+          grep -n 'override_repository' .bazelrc
+          echo "OK: ruy overridden with AVX-neutralized local copy at /tmp/ruy_fixed"
+
 
       # ======================= 预热 XNNPACK（完全匹配最终打包参数） =======================
       - name: Pre-build XNNPACK for arm64 (compile check)
