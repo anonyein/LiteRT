@@ -127,6 +127,7 @@
 
 #if defined(LITERT_NO_BUILTIN_OPS)
 #include "litert/runtime/stub_op_resolver.h"
+#include "litert/tflite_support/op_resolver/selected_ops_registry.h"
 #endif  // LITERT_NO_BUILTIN_OPS
 
 using litert::Error;
@@ -355,18 +356,30 @@ Expected<void> LiteRtCompiledModelT::InitializeRuntime(
     resolver = resolver_storage.get();
   } else {
 #ifdef LITERT_NO_BUILTIN_OPS
-    if ((hardware_accelerators & kLiteRtHwAcceleratorCpu) &&
-        use_builtin_or_reference_cpu_backend) {
-      return Unexpected(kLiteRtStatusErrorInvalidArgument,
-                        "Builtin and reference CPU kernel modes require "
-                        "builtin kernels.");
+    if (litert::tflite_support::HasSelectedOpsCallback()) {
+      if ((hardware_accelerators & kLiteRtHwAcceleratorCpu) &&
+          use_reference_cpu_kernels) {
+        return Unexpected(kLiteRtStatusErrorInvalidArgument,
+                          "Reference CPU kernel mode requires reference "
+                          "kernels.");
+      }
+      resolver_storage = std::make_unique<tflite::MutableOpResolver>();
+      litert::tflite_support::ApplySelectedOpsCallbacks(resolver_storage.get());
+      resolver = resolver_storage.get();
+    } else {
+      if ((hardware_accelerators & kLiteRtHwAcceleratorCpu) &&
+          use_builtin_or_reference_cpu_backend) {
+        return Unexpected(kLiteRtStatusErrorInvalidArgument,
+                          "Builtin and reference CPU kernel modes require "
+                          "builtin kernels.");
+      }
+      // Use StubOpResolver which provides minimal stub implementations for all
+      // builtin ops. These stubs allow the model to pass validation, but the
+      // actual operations will be handled by LiteRT's accelerator system
+      // (NPU > GPU > CPU) through their respective delegates.
+      resolver_storage = std::make_unique<litert::internal::StubOpResolver>();
+      resolver = resolver_storage.get();
     }
-    // Use StubOpResolver which provides minimal stub implementations for all
-    // builtin ops. These stubs allow the model to pass validation, but the
-    // actual operations will be handled by LiteRT's accelerator system
-    // (NPU > GPU > CPU) through their respective delegates.
-    resolver_storage = std::make_unique<litert::internal::StubOpResolver>();
-    resolver = resolver_storage.get();
 #else
     if ((hardware_accelerators & kLiteRtHwAcceleratorCpu) &&
         use_reference_cpu_kernels) {
@@ -1971,6 +1984,7 @@ Expected<void> LiteRtCompiledModelT::RegisterBuffer(
   }
 
   bool buffer_requires_cpu_sync = false;
+  bool registered_in_buffer_context = false;
 
   Expected<LiteRtTensorBufferRequirementsConst> requirements =
       buffer_context_->GetBufferRequirements(tensor);
@@ -1988,15 +2002,16 @@ Expected<void> LiteRtCompiledModelT::RegisterBuffer(
           return Unexpected(kLiteRtStatusErrorRuntimeFailure,
                             "Failed to register tensor buffer");
         }
+        registered_in_buffer_context = true;
+        LITERT_ASSIGN_OR_RETURN(const auto tensor_id,
+                                GetTensorIdentifier(*interp_, tensor));
+        user_registered_buffers_.insert(tensor_id);
 
         // A host buffer shared with CPU nodes needs a CPU allocation even
         // when it is also registered with an accelerator backend.
-        if (buffer->buffer_type() == kLiteRtTensorBufferTypeHostMemory) {
-          LITERT_ASSIGN_OR_RETURN(const auto tensor_id,
-                                  GetTensorIdentifier(*interp_, tensor));
-          if (cpu_tensors_.contains(tensor_id)) {
-            break;
-          }
+        if (buffer->buffer_type() == kLiteRtTensorBufferTypeHostMemory &&
+            cpu_tensors_.contains(tensor_id)) {
+          break;
         }
 
         // Mark the tensor as non-CPU to avoid TFLite from allocating it.
@@ -2017,6 +2032,16 @@ Expected<void> LiteRtCompiledModelT::RegisterBuffer(
   }
 
   if (buffer_requires_cpu_sync) {
+    // A host buffer shared with CPU nodes is registered with the backend above
+    // and still needs CPU sync, so only unregister a stale buffer that was
+    // registered by an earlier RegisterBuffer() call for this tensor.
+    if (!registered_in_buffer_context) {
+      LITERT_ASSIGN_OR_RETURN(const auto tensor_id,
+                              GetTensorIdentifier(*interp_, tensor));
+      if (user_registered_buffers_.erase(tensor_id) > 0) {
+        buffer_context_->UnregisterTensorBuffer(tensor);
+      }
+    }
     // When backend requires CPU buffer.
     bool buffer_is_cpu_compatible =
         buffer->buffer_type() == kLiteRtTensorBufferTypeHostMemory ||

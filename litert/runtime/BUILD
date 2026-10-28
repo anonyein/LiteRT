@@ -113,10 +113,38 @@ cc_library(
         ":ahwb_wrapper",
         ":event",
         "//litert/c:litert_common",
+        "//litert/c:litert_event_type",
         "//litert/c/internal:litert_logging",
         "//litert/cc:litert_expected",
         "//litert/cc:litert_macros",
     ],
+)
+
+cc_test(
+    name = "ahwb_buffer_test",
+    srcs = ["ahwb_buffer_test.cc"],
+    linkopts = litert_android_linkopts(),
+    tags = [
+        "noios",
+        "nomacos",
+        "nowindows",
+    ],
+    target_compatible_with = select({
+        "//litert:windows": ["@platforms//:incompatible"],
+        "//conditions:default": [],
+    }),
+    deps = [
+        ":ahwb_buffer",
+        ":event",
+        "//litert/c:litert_common",
+        "//litert/c:litert_event_type",
+    ] + gtest_main_no_heapcheck_deps(),
+)
+
+litert_device_exec(
+    name = "ahwb_buffer_device_test",
+    data = [],
+    target = ":ahwb_buffer_test",
 )
 
 cc_library(
@@ -806,6 +834,7 @@ cc_library(
             # Omit default TFLite builtin/reference kernels (e.g.
             # litert_builtin_ops=false or cpu_backend=selective). XNNPACK or a
             # selective op resolver is used instead.
+            "//litert/tflite_support/op_resolver:selected_ops_registry",
             "//tflite/c:c_api_opaque_without_op_resolver_without_alwayslink",
             "//tflite/c:c_api_without_op_resolver_without_alwayslink",
         ],
