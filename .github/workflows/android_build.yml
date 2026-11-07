@@ -1131,6 +1131,51 @@ jobs:
               print(block)
           PYEOF
 
+      # ---------- 让 xnn_enable_arm_sme* define 真正生效（NDK r27 无 arm_sme.h） ----------
+      # 上游 master 的 BUILD.bazel 把 arm_sme/arm_sme2/arm_sme_acle 三个 alias 的
+      # explicit_false 分支也映射到 explicit_true（即 --define=...=false 仍强制启用）。
+      # 这些 SME ACLE 微内核 #include <arm_sme.h>，该头文件 clang 19+ 才有，
+      # NDK r27（clang 18）必挂。这里把 explicit_false 分支改指
+      # //build_config:always_false，让 .bazelrc 的 --define=xnn_enable_arm_sme*=false
+      # 生效：neonsme/neonsme2 微内核目标被 target_compatible_with 排除，
+      # 同时 XNN_ENABLE_ARM_SME*=0 让生成的 config 派发表不再引用这些符号
+      # （否则编译期排除后链接期会缺符号）。KleidiAI matmul 路径只受
+      # XNN_ENABLE_KLEIDIAI 控制，不受影响。
+      - name: Honor xnn_enable_arm_sme defines (NDK r27 lacks arm_sme.h)
+        run: |
+          cd /tmp/xnnpack
+          python3 << 'PYEOF'
+          path = 'BUILD.bazel'
+          with open(path, 'r') as f:
+              content = f.read()
+
+          names = ['arm_sme', 'arm_sme2', 'arm_sme_acle']
+          failures = []
+          for name in names:
+              new = f'":xnn_enable_{name}_explicit_false": "//build_config:always_false"'
+              old = f'":xnn_enable_{name}_explicit_false": ":xnn_enable_{name}_explicit_true"'
+              if new in content:
+                  print(f"ℹ️ {name}: explicit_false already maps to always_false")
+                  continue
+              if old not in content:
+                  print(f"⚠️ {name}: expected alias branch not found "
+                        f"(upstream BUILD.bazel may have changed)")
+                  failures.append(name)
+                  continue
+              content = content.replace(old, new, 1)
+              print(f"✅ {name}: explicit_false -> //build_config:always_false")
+
+          with open(path, 'w') as f:
+              f.write(content)
+
+          if failures:
+              print(f"❌ Failed to patch: {failures}")
+              raise SystemExit(1)
+          PYEOF
+          echo "=== verify arm_sme2 alias after patch ==="
+          grep -A 7 'name = "arm_sme2_enabled"' BUILD.bazel | head -10
+          echo "✅ XNNPACK SME/SME2 can now be disabled via defines"
+
       # ---------- Inject overrides into build script ----------  ← 【修改 3】同时注入 --noexperimental_cc_shared_library
       - name: Inject overrides into build script
         run: |
@@ -1213,6 +1258,13 @@ jobs:
           echo "build:android_arm   --define=xnn_enable_kleidiai=false"  >> .bazelrc
           echo "build:android_x86   --define=xnn_enable_kleidiai=false"  >> .bazelrc
           echo "build:android_x86_64 --define=xnn_enable_kleidiai=false" >> .bazelrc
+
+          # NDK r27（clang 18）没有 <arm_sme.h>：关闭 XNNPACK 的 SME/SME2/SME-ACLE
+          # 微内核（与上面修补 BUILD.bazel 的步骤配合才生效）。
+          # KleidiAI matmul 仍按 XNN_ENABLE_KLEIDIAI=1 启用，不受影响。
+          echo "build:android_arm64 --define=xnn_enable_arm_sme=false"      >> .bazelrc
+          echo "build:android_arm64 --define=xnn_enable_arm_sme2=false"     >> .bazelrc
+          echo "build:android_arm64 --define=xnn_enable_arm_sme_acle=false" >> .bazelrc
       
           # 修复 hwloc 的 pthread affinity 编译错误（所有 Android 架构）
           echo "build:android_arm64 --copt=-DHAVE_DECL_PTHREAD_SETAFFINITY_NP=0" >> .bazelrc
