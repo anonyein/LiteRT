@@ -108,6 +108,7 @@ XNNPACK_DONT_REGISTER = [
     "SdpaTransposed",  # XNNPACK does not support SdpaTransposed composite op
     "QkvNormRope",  # XNNPACK does not support QkvNormRope composite op
     "RmsNorm",  # XNNPACK does not support RmsNorm composite op
+    "Rope",  # XNNPACK does not support Rope composite op
     "RuntimeBmm",  # XNNPACK does not support RuntimeBmm composite op
     "Swiglu",  # XNNPACK does not support SwiGLU op
     "SelectV2",  # XNNPACK does not support SelectV2
@@ -191,6 +192,7 @@ YNNPACK_DONT_REGISTER = [
     "tfl\\.tile",  # YNNPACK does not support Tile (used in MQA TransformerLayer)
     "Pad.*<([0-9]+x)*1(x[0-9]+)*>",  # YNNPACK does not support padding on extent-1 dimensions
     "RuntimeBmm.*(f16|i4)",  # YNNPACK does not support mixed fp32_fp16_fp32 dot in f16 RuntimeBmm or int4 Dequantize in decomposition subgraph
+    "Rope.*_i32<[^>]+>_cst",  # YNNPACK Convert (Cast) does not support constant int32 position input in Rope decomposition subgraph
     "SdpaTransposed",  # SdpaTransposed generator does not yet set logit_cap attribute for YNNPACK
     "TflMoe",  # YNNPACK does not support ML Drift GPU custom "moe" op
     "FullyConnected.*(i4|u8)",  # YNNPACK delegate requires even output dims for INT4 weights and does not support UINT8 FullyConnected
@@ -207,92 +209,31 @@ YNNPACK_FALLBACK_MODELS_DONT_REGISTER = [
     "torchvision_video_resnetmc3_18",  # TODO(b/576864700): Reference Conv3D fallback (~12m) causes target timeout.
 ]
 
-# TODO(b/581864435): Re-enable once YNNPACK/Slinky pipeline compilation no
-# longer overflows the 1 MB default Windows thread stack.
+# TODO(b/583889653): Re-enable once YNNPACK/Slinky pipeline compilation
+# (slinky::deshadow / lift_constants prior to simplify) no longer overflows the
+# 1 MB default Windows thread stack on large graphs.
 YNNPACK_WINDOWS_MODELS_DONT_REGISTER = [
     "hf_hubert_large_ls960_ft",
     "hf_mms_300m",
-    "hf_mobilevit_small_e2e",
-    "hf_vit_base_patch16_224",
-    "hf_wav2vec2_base_960h",
-    "hf_wav2vec2_base_960h_dynamic",
-    "qai_hub_inception_v3",
-    "qai_hub_resnet101",
-    "timm_efficientformer_l1",
-    "timm_efficientnet",
-    "timm_nfnet",
-    "timm_pvt_v2_b1",
     "timm_pvt_v2_b3",
-    "timm_regnety_120",
-    "timm_vit_small_path16_224",
-    "torchaudio_wav2vec2_base",
-    "torchvision_convnext_tiny",
-    "torchvision_densenet121",
-    "torchvision_efficientnet_b0",
-    "torchvision_efficientnet_b1",
-    "torchvision_efficientnet_b2",
-    "torchvision_efficientnet_b3",
-    "torchvision_efficientnet_b4",
     "torchvision_efficientnet_b5",
     "torchvision_efficientnet_b6",
     "torchvision_efficientnet_b7",
-    "torchvision_googlenet",
-    "torchvision_inception_v3",
     "torchvision_maxvit_t",
-    "torchvision_mnasnet0_5",
-    "torchvision_mobilenet_v2",
-    "torchvision_mobilenet_v3_large",
-    "torchvision_mobilenet_v3_small",
-    "torchvision_resnet152",
-    "torchvision_resnet50",
-    "torchvision_shufflenet_v2",
-    "torchvision_vit_base_patch16",
-    "torchvision_wide_resnet101_2",
-    "torchvision_wide_resnet50_2",
 ]
 
-# TODO(b/581864435): Additional partially-delegated models in
-# YNNPACK_MODELS_DONT_REGISTER whose delegated YNNPACK subgraphs also overflow
+# TODO(b/583889653): Additional partially-delegated models in
+# YNNPACK_MODELS_DONT_REGISTER whose delegated YNNPACK subgraphs still overflow
 # the 1 MB default Windows thread stack in fallback mode.
 YNNPACK_FALLBACK_WINDOWS_MODELS_DONT_REGISTER = YNNPACK_WINDOWS_MODELS_DONT_REGISTER + [
     "depth_anything_v2",
-    "hf_all_minilm_l6_v2",
-    "hf_detr_resnet50_dc5",
-    "hf_distil_whisper_small_no_cache",
-    "hf_distil_whisper_small_with_cache_init",
-    "hf_distilbert",
     "hf_dpt_large",
-    "hf_emotion_english_distilroberta_base",
-    "hf_mbart_large_50",
     "hf_mobilebert",
-    "hf_mobilevit_small",
     "hf_pyannote_segmentation_3_0",
-    "hf_segformer_512",
-    "hf_splade_v2_distil",
-    "hf_tinyclip_vit_8m_16_text_3m_yfcc15m",
-    "hf_tinyroberta_squad2",
-    "hf_tinyroberta_squad2_dynamic_batch",
-    "hf_yolos_tiny",
-    "qai_hub_hf_wavlm_base_plus",
     "qai_hub_hf_whisper_base_decoder",
     "qai_hub_hf_whisper_base_encoder",
-    "qai_hub_midas",
-    "qai_hub_openai_clip",
     "qai_hub_real_esrgan_x4plus",
-    "timm_efficientformerv2_s0",
-    "torchvision_deeplabv3_mobilenet_v3_large",
-    "torchvision_deeplabv3_resnet101",
-    "torchvision_deeplabv3_resnet50",
-    "torchvision_fcn_resnet50",
-    "torchvision_lraspp_mobilenet_v3_large",
-    "torchvision_swin_tiny",
-    "torchvision_video_resnet2plus1d_18",
-    "torchvision_video_resnet3d_18",
-    "torchvision_video_resnetmc3_18",
-    "torchvision_video_swin3d_tiny",
-    "whisper_tiny_decoder",
-    "whisper_tiny_encoder",
-    "yolo11n",
+    "torchvision_video_resnet2plus1d_18",  # TODO(b/576864700): Reference Conv3D fallback (>50m) causes target timeout on Windows.
 ]
 
 GPU_MODELS_DONT_REGISTER = [
@@ -720,6 +661,8 @@ litert_define_ats(
         "Slice",  # OpenCL Slice uses kExact byte comparison on FP16-rounded f32 buffers
         "RuntimeBmm.*(i4|i8)",  # GPU odml.runtime_bmm quantized external_weights expects RHS pre-swizzled by odml.cache_update
         "MoeExperts",  # ML Drift GPU delegate expects tfl.custom "moe" with 4D OHWI weights rather than shlo.composite "odml.moe_experts"
+        # TODO(b/583887564): Enable once IrModel constant pos lowering lands.
+        "Rope.*_i32<[^>]+>_cst",
         # TODO(b/576190160): Investigate GroupNorm numerical mismatch and SIGKILL on Qualcomm S26 (Adreno 840).
         "GroupNorm",
         "hf_all_minilm_l6_v2",
@@ -812,6 +755,7 @@ litert_define_ats(
         "SdpaTransposed",  # XNNPACK does not support SdpaTransposed composite op
         "QkvNormRope",  # XNNPACK does not support QkvNormRope composite op
         "RmsNorm",  # XNNPACK does not support RmsNorm composite op
+        "Rope",  # XNNPACK does not support Rope composite op
         "RuntimeBmm",  # XNNPACK does not support RuntimeBmm composite op
         "Swiglu",  # XNNPACK does not support SwiGLU op
         "SelectV2",  # XNNPACK does not support SelectV2
@@ -1264,6 +1208,7 @@ cc_library(
         ":register_moe_experts",
         ":register_qkv_norm_rope",
         ":register_rms_norm",
+        ":register_rope",
         ":register_runtime_bmm",
         ":register_sdpa",
         ":register_sdpa_transposed",
@@ -1636,6 +1581,23 @@ cc_library(
         ":register",
         "//litert/cc/internal:litert_detail",
         "//litert/test/generators:rms_norm",
+        "//tflite/types:half",
+    ],
+)
+
+cc_library(
+    name = "register_rope",
+    testonly = True,
+    srcs = ["register_rope.cc"],
+    hdrs = ["register_rope.h"],
+    copts = commandline_flag_copts(),
+    deps = [
+        ":compile_fixture",
+        ":configure",
+        ":inference_fixture",
+        ":register",
+        "//litert/cc/internal:litert_detail",
+        "//litert/test/generators:rope",
         "//tflite/types:half",
     ],
 )
@@ -2052,10 +2014,13 @@ cc_test(
         "//litert/c:litert_common",
         "//litert/c:litert_model_types",
         "//litert/c:litert_op_code",
+        "//litert/c/options:litert_gpu_options",
         "//litert/cc:litert_expected",
         "//litert/cc:litert_macros",
+        "//litert/cc:litert_options",
         "//litert/cc/internal:litert_detail",
         "//litert/cc/internal:litert_rng",
+        "//litert/cc/options:litert_gpu_options",
         "//litert/core:filesystem",
         "//litert/core/model",
         "//litert/core/model:model_load",
