@@ -351,6 +351,30 @@ jobs:
           echo "✅ TensorFlow cloned to /tmp/tensorflow"
       # ====================================================================
 
+      # Android AAR transitions can match TF's linux_x86_64 condition on ARM.
+      # FPNGE requires SSE4.1; disable both its define and dependency so PNG
+      # encoding uses the existing libpng fallback for all packaged ABIs.
+      - name: Disable x86-only FPNGE PNG encoder for Android
+        run: |
+          python3 <<'PYEOF'
+          from pathlib import Path
+          import re
+
+          build = Path('/tmp/tensorflow/tensorflow/core/lib/png/BUILD')
+          content = build.read_text()
+          if '"@fpnge"' not in content or 'TF_PNG_ENABLE_FPNGE' not in content:
+              raise SystemExit('Unexpected fast_png BUILD layout; review FPNGE configuration')
+          content, count = re.subn(
+              r'("//tensorflow:linux_x86_64"\s*:\s*)\[[^\]]*\]',
+              r'\1[]',
+              content,
+          )
+          if count != 3 or '@fpnge' in content or 'TF_PNG_ENABLE_FPNGE' in content:
+              raise SystemExit('Failed to disable all FPNGE defines and dependencies')
+          build.write_text(content)
+          print('Disabled FPNGE: fast_png and its test use the libpng fallback')
+          PYEOF
+
       # ==================== 覆盖 rules_cc / rules_ml_toolchain 到 Bazel 7.7 兼容版本 ====================
       # 根因：TF master（每日 --depth 1 前进）已把 rules_cc 升到 0.2.20、rules_ml_toolchain
       # 升到 73cb731f。rules_cc 0.2.20 的 cc_library.bzl 现在做
