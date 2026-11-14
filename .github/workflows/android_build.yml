@@ -736,6 +736,53 @@ jobs:
             exit 1
           fi
           echo "XNNPACK cloned to /tmp/xnnpack"
+          git -C /tmp/xnnpack rev-parse HEAD
+
+      - name: Prepare Slinky matching XNNPACK
+        run: |
+          # A WORKSPACE override does not load XNNPACK's MODULE.bazel dependencies.
+          python3 <<'PYEOF'
+          import ast
+          import hashlib
+          import io
+          from pathlib import Path
+          import re
+          import urllib.request
+          import zipfile
+
+          tree = ast.parse(Path('/tmp/xnnpack/MODULE.bazel').read_text())
+          archives = []
+          for stmt in tree.body:
+              if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
+                  continue
+              call = stmt.value
+              if not isinstance(call.func, ast.Name) or call.func.id != 'http_archive':
+                  continue
+              fields = {kw.arg: kw.value for kw in call.keywords}
+              name = fields.get('name')
+              if isinstance(name, ast.Constant) and name.value == 'slinky':
+                  if call.args or set(fields) != {'name', 'urls', 'sha256', 'strip_prefix'}:
+                      raise SystemExit('Slinky archive attributes changed; review required')
+                  archives.append({key: ast.literal_eval(value) for key, value in fields.items()})
+          if len(archives) != 1:
+              raise SystemExit('Expected exactly one Slinky http_archive in XNNPACK')
+          meta = archives[0]
+          if not re.fullmatch(r'slinky-[0-9a-f]{40}', meta['strip_prefix']):
+              raise SystemExit('Invalid Slinky archive prefix')
+          commit = meta['strip_prefix'].removeprefix('slinky-')
+          url = f'https://github.com/dsharlet/slinky/archive/{commit}.zip'
+          if meta['urls'] != [url] or not re.fullmatch(r'[0-9a-f]{64}', meta['sha256']):
+              raise SystemExit('Invalid Slinky archive URL or SHA256')
+          print(f'Using Slinky {commit}, SHA256 {meta["sha256"]}', flush=True)
+          with urllib.request.urlopen(url, timeout=120) as response:
+              archive = response.read()
+          if hashlib.sha256(archive).hexdigest() != meta['sha256']:
+              raise SystemExit('Slinky archive SHA256 mismatch')
+          with zipfile.ZipFile(io.BytesIO(archive)) as source:
+              source.extractall('/tmp')
+          Path('/tmp', meta['strip_prefix']).rename('/tmp/slinky')
+          Path('/tmp/slinky/WORKSPACE').touch()
+          PYEOF
 
       # ---------- 从 DownloadKleidiAI.cmake 获取 KleidiAI commit ----------
       - name: Extract KleidiAI commit from XNNPACK
@@ -1247,6 +1294,7 @@ jobs:
           echo "build --action_env=ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> .bazelrc
           # 将覆盖仓库写入 .bazelrc，确保所有构建自动应用
           echo "build --override_repository=XNNPACK=/tmp/xnnpack" >> .bazelrc
+          echo "build --override_repository=slinky=/tmp/slinky" >> .bazelrc
           echo "build --override_repository=KleidiAI=/tmp/kleidiai_repo" >> .bazelrc
           echo "build --override_repository=org_tensorflow=/tmp/tensorflow" >> .bazelrc
           echo "build --override_repository=hwloc=/tmp/hwloc" >> .bazelrc
@@ -1877,6 +1925,7 @@ jobs:
             --config=android_arm64 \
             --fat_apk_cpu=x86,x86_64,arm64-v8a,armeabi-v7a \
             @XNNPACK//:XNNPACK \
+            @XNNPACK//ynnpack:ynnpack \
             || { echo "❌ XNNPACK build failed"; exit 1; }
       
           echo "✅ XNNPACK (arm64) compiled successfully with KleidiAI enabled."
