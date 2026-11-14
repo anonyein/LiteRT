@@ -1247,6 +1247,22 @@ jobs:
           grep -A 7 'name = "arm_sme2_enabled"' BUILD.bazel | head -10
           echo "✅ XNNPACK SME/SME2 can now be disabled via defines"
 
+      - name: Honor YNNPACK SME disable flags for NDK r27
+        run: |
+          python3 <<'PYEOF'
+          from pathlib import Path
+
+          path = Path('/tmp/xnnpack/ynnpack/build_defs.bzl')
+          content = path.read_text()
+          old = 'explicit_false: ":" + explicit_true,'
+          new = 'explicit_false: "//build_config:always_false",'
+          if content.count(old) == 1:
+              path.write_text(content.replace(old, new, 1))
+          elif content.count(new) != 1:
+              raise SystemExit('Unexpected YNNPACK explicit_false mapping; review required')
+          print('YNNPACK explicit false flags now select always_false')
+          PYEOF
+
       # ---------- Inject overrides into build script ----------  ← 【修改 3】同时注入 --noexperimental_cc_shared_library
       - name: Inject overrides into build script
         run: |
@@ -1337,6 +1353,9 @@ jobs:
           echo "build:android_arm64 --define=xnn_enable_arm_sme=false"      >> .bazelrc
           echo "build:android_arm64 --define=xnn_enable_arm_sme2=false"     >> .bazelrc
           echo "build:android_arm64 --define=xnn_enable_arm_sme_acle=false" >> .bazelrc
+          # YNNPACK has separate flags and also requires arm_sme.h for SME kernels.
+          echo "build --define=ynn_enable_arm64_sme=false" >> .bazelrc
+          echo "build --define=ynn_enable_arm64_sme2=false" >> .bazelrc
       
           # 修复 hwloc 的 pthread affinity 编译错误（所有 Android 架构）
           echo "build:android_arm64 --copt=-DHAVE_DECL_PTHREAD_SETAFFINITY_NP=0" >> .bazelrc
