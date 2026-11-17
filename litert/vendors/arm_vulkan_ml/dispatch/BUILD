@@ -5,6 +5,7 @@
 
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("//litert/build_common:litert_build_defs.bzl", "litert_dynamic_lib")
 load("//litert/build_common:special_rule.bzl", "litert_android_linkopts")
 
@@ -31,10 +32,10 @@ cc_library(
     visibility = ["//litert:__subpackages__"],
     deps = [
         ":tensor_capabilities",
-        ":vulkan_validation",
         "//litert/vendors/arm_vulkan_ml/common:arm_vulkan_ml_jit_executable",
         "@arm_vulkan_ml_dep_vulkan_headers//:vulkan_headers",
         "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
     ],
 )
 
@@ -68,10 +69,23 @@ litert_dynamic_lib(
         "//litert/c:litert_tensor_buffer_types",
         "//litert/c/internal:litert_runtime_context",
         "//litert/c/internal:litert_scheduling_info",
+        "//litert/c/options:litert_arm_vulkan_ml_options",
         "//litert/vendors/arm_vulkan_ml/common:arm_vulkan_ml_jit_executable",
         "//litert/vendors/c:litert_dispatch_c_api",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/synchronization",
+    ],
+)
+
+sh_test(
+    name = "arm_vulkan_ml_dispatch_so_symbol_test",
+    srcs = ["//litert/test:litert_c_api_dependency_test.sh"],
+    args = [
+        "LiteRtDispatchQueryInterface",
+        "$(rootpath :dispatch_api_so)",
+    ],
+    data = [
+        ":dispatch_api_so",
     ],
 )
 
@@ -189,6 +203,7 @@ cc_library(
         "//litert/c:litert_tensor_buffer_types",
         "//litert/c/internal:litert_runtime_context",
         "//litert/c/internal:litert_scheduling_info",
+        "//litert/c/options:litert_arm_vulkan_ml_options",
         "//litert/vendors/arm_vulkan_ml/common:arm_vulkan_ml_jit_executable",
         "//litert/vendors/c:litert_dispatch_c_api",
         "@com_google_absl//absl/container:flat_hash_map",

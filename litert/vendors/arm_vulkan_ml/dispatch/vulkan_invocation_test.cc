@@ -1067,6 +1067,7 @@ std::shared_ptr<const CompiledPartition> Compile(LiteRtModel model) {
   EXPECT_TRUE(arm);
   if (!arm) return nullptr;
   EXPECT_TRUE(arm->SetEnableJustInTime(true));
+  EXPECT_TRUE(arm->SetFloatFallback(true));
   auto env = Environment::Create({});
   EXPECT_TRUE(env);
   if (!env) return nullptr;
@@ -1160,24 +1161,10 @@ std::shared_ptr<const CompiledPartition> FloatFixture() {
 }
 class InvocationTest : public ::testing::Test {
  protected:
-  void SetUp() override {
-    state = &fake_;
-    const char* previous = std::getenv("LITERT_ARM_VULKAN_ML_VALIDATION");
-    if (previous) {
-      had_validation_ = true;
-      previous_validation_ = previous;
-    }
-    unsetenv("LITERT_ARM_VULKAN_ML_VALIDATION");
-  }
+  void SetUp() override { state = &fake_; }
   void TearDown() override {
     EXPECT_TRUE(fake_.live.empty()) << "leaked Vulkan resource";
     state = nullptr;
-    if (had_validation_) {
-      setenv("LITERT_ARM_VULKAN_ML_VALIDATION", previous_validation_.c_str(),
-             1);
-    } else {
-      unsetenv("LITERT_ARM_VULKAN_ML_VALIDATION");
-    }
   }
   std::unique_ptr<VulkanInvocation> Create(
       std::shared_ptr<const CompiledPartition> a = {}) {
@@ -1190,8 +1177,7 @@ class InvocationTest : public ::testing::Test {
   }
 
   Fake fake_;
-  std::string error_, previous_validation_;
-  bool had_validation_ = false;
+  std::string error_;
 };
 
 std::shared_ptr<const CompiledPartition> TypedFixture(
@@ -1787,6 +1773,37 @@ TEST_F(InvocationTest,
     EXPECT_EQ(fake_.submits, submits);
   }
 }
+TEST_F(InvocationTest,
+       CreateOptionsWithDumpTimingsPopulatesInitStatisticsAndRuns) {
+  VulkanInvocation::CreateOptions options;
+  options.allow_emulation = false;
+  options.dump_timings = true;
+  std::unique_ptr<VulkanInvocation> invocation =
+      VulkanInvocation::CreateWithResolver(FloatFixture(), options, Resolve,
+                                           error_);
+  ASSERT_NE(invocation, nullptr) << error_;
+
+  const VulkanInvocation::InitStatistics stats = invocation->InitStats();
+  EXPECT_GE(stats.dlopen_and_instance_ms, 0.0);
+  EXPECT_GE(stats.query_capabilities_ms, 0.0);
+  EXPECT_GE(stats.create_device_ms, 0.0);
+  EXPECT_GE(stats.device_setup_total_ms, 0.0);
+  EXPECT_GE(stats.create_shader_module_ms, 0.0);
+  EXPECT_GE(stats.descriptors_and_constants_ms, 0.0);
+  EXPECT_GE(stats.create_data_graph_pipeline_ms, 0.0);
+  EXPECT_GE(stats.create_session_ms, 0.0);
+  EXPECT_GE(stats.session_memory_alloc_bind_ms, 0.0);
+  EXPECT_GE(stats.cmd_pool_and_fence_ms, 0.0);
+  EXPECT_GE(stats.build_total_ms, 0.0);
+  EXPECT_EQ(stats.session_memory_objects, 3u);
+  EXPECT_EQ(stats.session_memory_bytes, 192u);
+
+  VulkanInvocation::BufferRequirements req;
+  ASSERT_TRUE(invocation->Requirements(0, req, error_)) << error_;
+  EXPECT_GT(req.bytes, 0u);
+  ASSERT_TRUE(Run(*invocation)) << error_;
+  ASSERT_TRUE(Run(*invocation)) << error_;
+}
 
 TEST_F(InvocationTest,
        ValidatesExternalBufferRegistrationOverlapAndInvocationErrorPaths) {
@@ -2016,6 +2033,20 @@ TEST_F(InvocationTest, DispatchInterfaceMetadataAndBufferEventSynchronization) {
 
   EXPECT_EQ(api->invoke(context.get()), kLiteRtStatusOk);
   EXPECT_EQ(waited_events, 4);
+
+  // Already-locked HostMemory buffers (e.g. shared with CPU/XNNPACK via
+  // CompiledModel) must still be readable/writable via
+  // get_tensor_buffer_host_memory without relocking or unlocking the caller's
+  // lock.
+  void* locked_host_addr = nullptr;
+  ASSERT_EQ(custom_runtime.lock_tensor_buffer(buffers.front().get(),
+                                              &locked_host_addr,
+                                              kLiteRtTensorBufferLockModeRead),
+            kLiteRtStatusOk);
+  EXPECT_NE(locked_host_addr, nullptr);
+  EXPECT_EQ(api->invoke(context.get()), kLiteRtStatusOk);
+  EXPECT_EQ(custom_runtime.unlock_tensor_buffer(buffers.front().get()),
+            kLiteRtStatusOk);
 
   wait_mode = 2;
   EXPECT_EQ(api->invoke(context.get()), kLiteRtStatusErrorRuntimeFailure);
