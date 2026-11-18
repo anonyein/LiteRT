@@ -57,6 +57,8 @@
 #include "litert/vendors/nvidia/compiler/int8_cache_write_plugin.h"
 #include "litert/vendors/nvidia/compiler/moe_plugin.h"
 #include "litert/vendors/nvidia/compiler/qkv_norm_rope_plugin.h"
+#include "litert/vendors/nvidia/compiler/quant_attention_plugin.h"
+#include "litert/vendors/nvidia/compiler/quant_linear_plugin.h"
 #include "litert/vendors/nvidia/compiler/subbyte_gemv_plugin.h"
 #include "litert/vendors/nvidia/compiler/tensorrt_rtx_plugin_compat.h"
 #include "litert/vendors/nvidia/compiler/weight_store_builder.h"
@@ -70,6 +72,7 @@
 #include "litert/vendors/nvidia/trtllm/int2_gemv.h"
 #include "litert/vendors/nvidia/trtllm/int4_block_gemv.h"
 #include "litert/vendors/nvidia/trtllm/qkv_norm_rope.h"
+#include "litert/vendors/nvidia/trtllm/quant_linear.h"
 #include "litert/vendors/nvidia/trtllm/subbyte_gemm.h"
 #include "litert/vendors/nvidia/trtllm/tiled_attention.h"
 
@@ -1081,9 +1084,18 @@ bool SdpaTransposedTiledCache(int32_t heads, int32_t rows, int32_t mask_rows,
          LiteRtNvidiaTiledAttentionSupports(&shape);
 }
 
-// The gate_size of an odml.swiglu composite (x [.., 2 * N]) -> silu(x[.., :N])
-// * x[.., N:]: Qwen 3.5's feed-forward gate over its fused gate/up projection.
-std::optional<int32_t> SwigluGateSize(const Op& op) {
+// An odml.swiglu composite (x [.., 2 * N]) -> act(x[.., :N]) * x[.., N:], the
+// feed-forward gate over a fused gate/up projection. The composite keeps its
+// name whatever the activation: its `activation` attribute names it, SiLU
+// when absent or "silu" (Qwen 3.5's SwiGLU) and the tanh approximation of
+// GELU for "gelu_tanh" or "gelu_pytorch_tanh" (Gemma 4's GeGLU). Any other
+// activation is left to the composite's decomposition.
+struct SwigluGate {
+  int32_t gate_size = 0;
+  LiteRtNvidiaGemmGate activation = kLiteRtNvidiaGemmGateSilu;
+};
+
+std::optional<SwigluGate> ParseSwiglu(const Op& op) {
   if (op.Inputs().size() != 1 || op.Outputs().size() != 1) {
     return std::nullopt;
   }
@@ -1093,16 +1105,26 @@ std::optional<int32_t> SwigluGateSize(const Op& op) {
       options.attributes_map.value()["gate_size"].IsNull()) {
     return std::nullopt;
   }
-  const int32_t gate_size =
-      options.attributes_map.value()["gate_size"].AsInt32();
+  SwigluGate gate;
+  gate.gate_size = options.attributes_map.value()["gate_size"].AsInt32();
+  const auto activation = options.attributes_map.value()["activation"];
+  if (!activation.IsNull()) {
+    if (!activation.IsString()) return std::nullopt;
+    const std::string name = activation.AsString().str();
+    if (name == "gelu_tanh" || name == "gelu_pytorch_tanh") {
+      gate.activation = kLiteRtNvidiaGemmGateGeluTanh;
+    } else if (name != "silu") {
+      return std::nullopt;
+    }
+  }
   auto in_type = op.Inputs()[0].RankedTensorType();
-  if (!in_type || in_type->Layout().Rank() < 1 || gate_size <= 0 ||
-      in_type->Layout().Dimensions().back() != 2 * gate_size ||
+  if (!in_type || in_type->Layout().Rank() < 1 || gate.gate_size <= 0 ||
+      in_type->Layout().Dimensions().back() != 2 * gate.gate_size ||
       !IsFloatLike(op.Inputs()[0].ElementType()) ||
       !IsFloatLike(op.Outputs()[0].ElementType())) {
     return std::nullopt;
   }
-  return gate_size;
+  return gate;
 }
 
 std::optional<int32_t> SdpaTransposedGroup(const Op& op) {
@@ -1153,6 +1175,290 @@ std::optional<int32_t> SdpaTransposedGroup(const Op& op) {
     return std::nullopt;
   }
   return group;
+}
+
+// The composites over quantized KV caches (INT8 queries over the INT8 ring
+// caches of local layers and the INT4 caches of global ones) run on the
+// quantized attention plugin (quant_attention_plugin.h), which reads and
+// writes the caches as the model stores them. The plugin takes the float
+// tensors behind the graph's QUANTIZE ops, so these lowerings need float
+// activations.
+bool QuantAttentionEnabled() {
+  const char* value = std::getenv("LITERT_NVIDIA_TENSORRT_FP16_ACTIVATIONS");
+  return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+// The mask fills of the decompositions: FP16 0xF999 in odml.sdpa_transposed
+// over quantized tensors, -10000 in odml.fused_sdpa_cache_update.
+constexpr float kQuantSdpaFill = -45856.0f;
+constexpr float kQuantFusedSdpaFill = -10000.0f;
+
+// The scale and the bits of an INT8 or INT4 tensor quantized per tensor with
+// a zero point of 0.
+struct QuantTensor {
+  float scale = 0.0f;
+  int32_t bits = 0;
+};
+
+std::optional<QuantTensor> ParseQuantTensor(const Tensor& tensor) {
+  const auto type = tensor.ElementType();
+  if ((type != litert::ElementType::Int8 &&
+       type != litert::ElementType::Int4) ||
+      tensor.QTypeId() != kLiteRtQuantizationPerTensor) {
+    return std::nullopt;
+  }
+  const auto q = tensor.PerTensorQuantization();
+  if (!std::isfinite(q.scale) || q.scale <= 0.0f || q.zero_point != 0) {
+    return std::nullopt;
+  }
+  return QuantTensor{q.scale, type == litert::ElementType::Int8 ? 8 : 4};
+}
+
+bool QuantizedLike(const Tensor& tensor, float scale, int32_t bits) {
+  const auto quant = ParseQuantTensor(tensor);
+  return quant.has_value() && quant->bits == bits && quant->scale == scale;
+}
+
+std::optional<std::array<int32_t, 4>> StaticRank4Dims(const Tensor& tensor) {
+  auto type = tensor.RankedTensorType();
+  if (!type || type->Layout().Rank() != 4 || type->Layout().HasStrides()) {
+    return std::nullopt;
+  }
+  std::array<int32_t, 4> dims;
+  const auto shape = type->Layout().Dimensions();
+  std::copy(shape.begin(), shape.end(), dims.begin());
+  for (int32_t d : dims) {
+    if (d <= 0) return std::nullopt;
+  }
+  return dims;
+}
+
+// A key cache [1, H, S, D] and a value cache [1, H, D, S] of one quantized
+// type.
+struct QuantCaches {
+  int32_t heads = 0;
+  int32_t seq = 0;
+  int32_t depth = 0;
+  int32_t bits = 0;
+  float k_scale = 0.0f;
+  float v_scale = 0.0f;
+};
+
+std::optional<QuantCaches> ParseQuantCaches(const Tensor& k, const Tensor& v) {
+  const auto k_quant = ParseQuantTensor(k);
+  const auto v_quant = ParseQuantTensor(v);
+  const auto kd = StaticRank4Dims(k);
+  const auto vd = StaticRank4Dims(v);
+  if (!k_quant || !v_quant || !kd || !vd || k_quant->bits != v_quant->bits ||
+      (*kd)[0] != 1 || (*vd)[0] != 1 || (*vd)[1] != (*kd)[1] ||
+      (*vd)[2] != (*kd)[3] || (*vd)[3] != (*kd)[2] || (*kd)[3] % 2 != 0) {
+    return std::nullopt;
+  }
+  return QuantCaches{(*kd)[1],      (*kd)[2],       (*kd)[3],
+                     k_quant->bits, k_quant->scale, v_quant->scale};
+}
+
+// The plugin leaves the keys a mask hides out of the softmax, where the
+// decompositions give their scores `fill`. That is the same result for every
+// row that sees a key when the fill is so far below every score that its
+// weight is no fp32 number (exp(-104) is none); a score is at most depth x
+// 128 x the keys' limit x the two scales. A row that sees no key gets zero
+// from the plugin and the average of all values from the decomposition: the
+// graphs replace such a row (the SELECT after odml.sdpa_transposed) or never
+// read it (the padding of a prefill chunk).
+bool QuantFillHidesScores(float fill, const QuantCaches& caches,
+                          float q_scale) {
+  const float max_score = static_cast<float>(caches.depth) * 128.0f *
+                          static_cast<float>(1 << (caches.bits - 1)) * q_scale *
+                          caches.k_scale;
+  return fill + 2.0f * max_score < -150.0f;
+}
+
+// odml.cache_update over quantized tensors, (k [1, H, n, D], v [1, H, n, D],
+// params, k_cache, v_cache, k_start [4], v_start [4]) -> the two caches. The
+// keys, the values and their caches share a quantization, so the
+// decomposition's re-quantization of the rows is the identity and its two
+// DYNAMIC_UPDATE_SLICE ops write them as they are. The caches are inputs of
+// the graph.
+struct QuantCacheUpdate {
+  QuantCaches caches;
+  int32_t tokens = 0;  // n
+};
+
+std::optional<QuantCacheUpdate> ParseQuantCacheUpdate(const Op& op) {
+  if (!QuantAttentionEnabled() || op.Inputs().size() != 7 ||
+      op.Outputs().size() != 2 || !op.Inputs()[3].IsSubgraphInput() ||
+      !op.Inputs()[4].IsSubgraphInput()) {
+    return std::nullopt;
+  }
+  const auto caches = ParseQuantCaches(op.Inputs()[3], op.Inputs()[4]);
+  const auto kd = StaticRank4Dims(op.Inputs()[0]);
+  const auto vd = StaticRank4Dims(op.Inputs()[1]);
+  if (!caches || !kd || !vd || *kd != *vd || (*kd)[0] != 1 ||
+      (*kd)[1] != caches->heads || (*kd)[2] > caches->seq ||
+      (*kd)[3] != caches->depth) {
+    return std::nullopt;
+  }
+  for (int i = 0; i < 2; ++i) {
+    const float scale = i == 0 ? caches->k_scale : caches->v_scale;
+    auto start_type = op.Inputs()[5 + i].RankedTensorType();
+    if (!QuantizedLike(op.Inputs()[i], scale, caches->bits) ||
+        !QuantizedLike(op.Outputs()[i], scale, caches->bits) || !start_type ||
+        StaticRank4Dims(op.Outputs()[i]) !=
+            StaticRank4Dims(op.Inputs()[3 + i]) ||
+        op.Inputs()[5 + i].ElementType() != litert::ElementType::Int32 ||
+        start_type->Layout().Rank() != 1 ||
+        start_type->Layout().Dimensions()[0] != 4) {
+      return std::nullopt;
+    }
+  }
+  return QuantCacheUpdate{*caches, (*kd)[2]};
+}
+
+// odml.sdpa_transposed with an INT8 query, (q [1, Hq, n, D], k_cache,
+// v_cache, mask [1, 1, n, S] bool, params) -> float [1, Hq, n, D]: the
+// Hq / H query heads of a KV head attend over the whole cache under the
+// mask. The caches are the results of an odml.cache_update that
+// ParseQuantCacheUpdate takes, or inputs of the graph. Up to 16 rows per KV
+// head run the plugin's decode kernel, more its tensor-core kernel.
+struct QuantSdpa {
+  QuantCaches caches;
+  float q_scale = 0.0f;
+  int32_t group = 0;   // Hq / H
+  int32_t tokens = 0;  // n
+};
+
+std::optional<QuantSdpa> ParseQuantSdpa(const Op& op) {
+  if (!QuantAttentionEnabled() || op.Inputs().size() != 5 ||
+      op.Outputs().size() != 1) {
+    return std::nullopt;
+  }
+  const auto q_quant = ParseQuantTensor(op.Inputs()[0]);
+  const auto caches = ParseQuantCaches(op.Inputs()[1], op.Inputs()[2]);
+  const auto qd = StaticRank4Dims(op.Inputs()[0]);
+  if (!q_quant || q_quant->bits != 8 || !caches || !qd || (*qd)[0] != 1 ||
+      (*qd)[1] % caches->heads != 0 || (*qd)[3] != caches->depth ||
+      op.Inputs()[3].ElementType() != litert::ElementType::Bool ||
+      !TensorHasShape(op.Inputs()[3], {1, 1, (*qd)[2], caches->seq}) ||
+      !IsFloatLike(op.Outputs()[0].ElementType()) ||
+      !TensorHasShape(op.Outputs()[0],
+                      {(*qd)[0], (*qd)[1], (*qd)[2], (*qd)[3]})) {
+    return std::nullopt;
+  }
+  for (int i : {1, 2}) {
+    if (op.Inputs()[i].IsSubgraphInput()) {
+      continue;
+    }
+    const auto producer = op.Inputs()[i].GetDefiningOp();
+    if (!producer || producer->Code() != kLiteRtOpCodeShloComposite ||
+        CompositeOpName(*producer) != "odml.cache_update" ||
+        !ParseQuantCacheUpdate(*producer).has_value()) {
+      return std::nullopt;
+    }
+  }
+  // The query arrives scaled, and the caches have their sequence on axes 2
+  // and 3.
+  CompositeOptions options;
+  if (options.InitFromOp(op.Get()) == kLiteRtStatusOk &&
+      options.attributes_map.has_value()) {
+    const auto& map = options.attributes_map.value();
+    if ((!map["scale"].IsNull() && map["scale"].AsFloat() != 1.0f) ||
+        (!map["k_ts_idx"].IsNull() && map["k_ts_idx"].AsInt32() != 2) ||
+        (!map["v_ts_idx"].IsNull() && map["v_ts_idx"].AsInt32() != 3)) {
+      return std::nullopt;
+    }
+  }
+  if (!QuantFillHidesScores(kQuantSdpaFill, *caches, q_quant->scale)) {
+    return std::nullopt;
+  }
+  const int32_t group = (*qd)[1] / caches->heads;
+  const int32_t rows = group * (*qd)[2];
+  if (rows <= 16) {
+    if (!LiteRtNvidiaQuantDecodeAttentionSupports(rows, caches->depth,
+                                                  caches->bits)) {
+      return std::nullopt;
+    }
+  } else {
+    const LiteRtNvidiaAttentionShape shape = {
+        caches->heads, rows, (*qd)[2], caches->depth, caches->seq, 0};
+    if (!LiteRtNvidiaTiledQuantAttentionSupports(&shape, caches->bits) ||
+        !LiteRtNvidiaTiledAttentionAvailable()) {
+      return std::nullopt;
+    }
+  }
+  return QuantSdpa{*caches, q_quant->scale, group, (*qd)[2]};
+}
+
+// odml.fused_sdpa_cache_update, (q [1, H, R, D] INT8, k_cache [1, H, S, D],
+// v_cache [1, H, D, S], k [1, H, M, D], v [1, H, D, M], mask [1, 1, M, S + M]
+// bool, params [1, 1, 1, 7]) -> (float [1, H, R, D], the two caches): the
+// attention of R / M query heads per KV head over the INT8 ring caches
+// followed by the chunk's own keys and values, and the chunk written into the
+// ring (unless update_cache is false). The caches are inputs of the graph.
+struct QuantFusedSdpa {
+  QuantCaches caches;
+  float q_scale = 0.0f;
+  int32_t rows = 0;    // R
+  int32_t tokens = 0;  // M
+  bool update_cache = true;
+};
+
+std::optional<QuantFusedSdpa> ParseQuantFusedSdpa(const Op& op) {
+  if (!QuantAttentionEnabled() || op.Inputs().size() != 7 ||
+      op.Outputs().size() != 3 || !op.Inputs()[1].IsSubgraphInput() ||
+      !op.Inputs()[2].IsSubgraphInput()) {
+    return std::nullopt;
+  }
+  const auto q_quant = ParseQuantTensor(op.Inputs()[0]);
+  const auto caches = ParseQuantCaches(op.Inputs()[1], op.Inputs()[2]);
+  const auto qd = StaticRank4Dims(op.Inputs()[0]);
+  const auto kd = StaticRank4Dims(op.Inputs()[3]);
+  if (!q_quant || q_quant->bits != 8 || !caches || caches->bits != 8 || !qd ||
+      !kd) {
+    return std::nullopt;
+  }
+  const int32_t rows = (*qd)[2];
+  const int32_t tokens = (*kd)[2];
+  if ((*qd)[0] != 1 || (*qd)[1] != caches->heads || (*qd)[3] != caches->depth ||
+      rows % tokens != 0 ||
+      !QuantizedLike(op.Inputs()[3], caches->k_scale, 8) ||
+      !TensorHasShape(op.Inputs()[3],
+                      {1, caches->heads, tokens, caches->depth}) ||
+      !QuantizedLike(op.Inputs()[4], caches->v_scale, 8) ||
+      !TensorHasShape(op.Inputs()[4],
+                      {1, caches->heads, caches->depth, tokens}) ||
+      op.Inputs()[5].ElementType() != litert::ElementType::Bool ||
+      !TensorHasShape(op.Inputs()[5], {1, 1, tokens, caches->seq + tokens}) ||
+      op.Inputs()[6].ElementType() != litert::ElementType::Int32 ||
+      !TensorHasShape(op.Inputs()[6], {1, 1, 1, 7}) ||
+      !IsFloatLike(op.Outputs()[0].ElementType()) ||
+      !TensorHasShape(op.Outputs()[0],
+                      {1, caches->heads, rows, caches->depth}) ||
+      !QuantizedLike(op.Outputs()[1], caches->k_scale, 8) ||
+      !TensorHasShape(op.Outputs()[1],
+                      {1, caches->heads, caches->seq, caches->depth}) ||
+      !QuantizedLike(op.Outputs()[2], caches->v_scale, 8) ||
+      !TensorHasShape(op.Outputs()[2],
+                      {1, caches->heads, caches->depth, caches->seq})) {
+    return std::nullopt;
+  }
+  bool update_cache = true;
+  CompositeOptions options;
+  if (options.InitFromOp(op.Get()) == kLiteRtStatusOk &&
+      options.attributes_map.has_value()) {
+    const auto update = options.attributes_map.value()["update_cache"];
+    if (update.IsBool()) {
+      update_cache = update.AsBool();
+    }
+  }
+  const LiteRtNvidiaAttentionShape shape = {caches->heads, rows,        tokens,
+                                            caches->depth, caches->seq, tokens};
+  if (!LiteRtNvidiaTiledQuantAttentionSupports(&shape, 8) ||
+      !LiteRtNvidiaTiledAttentionAvailable() ||
+      !QuantFillHidesScores(kQuantFusedSdpaFill, *caches, q_quant->scale)) {
+    return std::nullopt;
+  }
+  return QuantFusedSdpa{*caches, q_quant->scale, rows, tokens, update_cache};
 }
 
 // The "moe" custom op of Gemma 4 26B-A4B (the XNNPACK delegate's
@@ -1531,6 +1837,376 @@ std::optional<bool> PrefillCacheUpdateRingMode(const Op& op) {
   return ring.AsBool();
 }
 
+bool HasNoFusedActivation(const Op& op);
+
+// Statically quantized products (trtllm/quant_linear.h): INT8 activations times
+// INT4 per-channel or centered INT2 weights give an INT8 result, rounded as
+// LiteRT's CPU kernels round it. They take the quant plugin (FindQuantRegions),
+// which needs the FP16-activation mode around it.
+bool QuantProductsEnabled() {
+  const char* fp16 = std::getenv("LITERT_NVIDIA_TENSORRT_FP16_ACTIVATIONS");
+  return fp16 != nullptr && fp16[0] != '\0' && std::strcmp(fp16, "0") != 0;
+}
+
+bool IsSymmetricInt8(const Tensor& tensor) {
+  if (tensor.ElementType() != litert::ElementType::Int8 ||
+      tensor.QTypeId() != kLiteRtQuantizationPerTensor) {
+    return false;
+  }
+  const auto q = tensor.PerTensorQuantization();
+  return q.scale > 0.0f && q.zero_point == 0;
+}
+
+// The FP32 scales of centered INT2 weights, one per output of the product:
+// INT2 values with blockwise quantization whose scale and zero point tensors
+// have the weights' dims with 1 at `input_axis` (a scale per output, shared
+// by its inputs), every zero point -0.5: a weight is scale * (q + 0.5).
+std::optional<std::vector<float>> CenteredInt2Scales(const Tensor& weights,
+                                                     size_t input_axis) {
+  if (weights.ElementType() != litert::ElementType::Int2 ||
+      weights.QTypeId() != kLiteRtQuantizationBlockWise ||
+      !weights.HasWeights()) {
+    return std::nullopt;
+  }
+  const auto q = weights.BlockWiseQuantization();
+  const auto type = weights.RankedTensorType();
+  if (q.scales == nullptr || q.zero_points == nullptr || !type) {
+    return std::nullopt;
+  }
+  const auto dims = type->Layout().Dimensions();
+  if (input_axis >= dims.size()) {
+    return std::nullopt;
+  }
+  size_t elements = 1;
+  size_t outputs = 1;
+  for (size_t d = 0; d < dims.size(); ++d) {
+    if (dims[d] <= 0) return std::nullopt;
+    elements *= dims[d];
+    if (d != input_axis) outputs *= dims[d];
+  }
+  if (weights.Weights().Bytes().size() != (elements + 3) / 4) {
+    return std::nullopt;
+  }
+  const auto read = [&](LiteRtTensor raw) -> std::optional<std::vector<float>> {
+    const Tensor tensor(weights.Context(), raw);
+    const auto tensor_type = tensor.RankedTensorType();
+    if (!tensor_type || tensor.ElementType() != litert::ElementType::Float32 ||
+        !tensor.HasWeights()) {
+      return std::nullopt;
+    }
+    const auto tensor_dims = tensor_type->Layout().Dimensions();
+    if (tensor_dims.size() != dims.size()) return std::nullopt;
+    for (size_t d = 0; d < dims.size(); ++d) {
+      if (tensor_dims[d] != (d == input_axis ? 1 : dims[d])) {
+        return std::nullopt;
+      }
+    }
+    const auto bytes = tensor.Weights().Bytes();
+    if (bytes.size() != outputs * sizeof(float)) return std::nullopt;
+    std::vector<float> values(outputs);
+    std::memcpy(values.data(), bytes.data(), bytes.size());
+    return values;
+  };
+  const auto zero_points = read(q.zero_points);
+  if (!zero_points) return std::nullopt;
+  for (const float zero_point : *zero_points) {
+    if (zero_point != -0.5f) return std::nullopt;
+  }
+  auto scales = read(q.scales);
+  if (!scales) return std::nullopt;
+  for (const float scale : *scales) {
+    if (!(scale > 0.0f) || !std::isfinite(scale)) return std::nullopt;
+  }
+  return scales;
+}
+
+// INT4 weights [rows, columns] with a symmetric scale per row.
+bool IsPerRowInt4(const Tensor& weights, int32_t rows, int32_t columns) {
+  if (weights.ElementType() != litert::ElementType::Int4 ||
+      weights.QTypeId() != kLiteRtQuantizationPerChannel ||
+      !weights.HasWeights()) {
+    return false;
+  }
+  const auto q = weights.PerChannelQuantization();
+  if (q.quantized_dimension != 0 ||
+      q.num_channels != static_cast<uint64_t>(rows) || q.scales == nullptr ||
+      q.zero_points == nullptr ||
+      weights.Weights().Bytes().size() !=
+          static_cast<size_t>(rows) * columns / 2) {
+    return false;
+  }
+  for (int32_t r = 0; r < rows; ++r) {
+    if (!(q.scales[r] > 0.0f) || q.zero_points[r] != 0) return false;
+  }
+  return true;
+}
+
+// The [rows, columns] of the weights of a FULLY_CONNECTED the quant kernels
+// take (whole CTAs of eight rows, whole 32-bit words per row), without bias
+// and fused activation.
+std::optional<std::pair<int32_t, int32_t>> QuantFullyConnectedShape(
+    const Op& op) {
+  if (!QuantProductsEnabled() || op.Code() != kLiteRtOpCodeTflFullyConnected ||
+      op.Inputs().size() != 2 || op.Outputs().size() != 1 ||
+      op.Inputs()[0].HasWeights() || !HasNoFusedActivation(op)) {
+    return std::nullopt;
+  }
+  uint32_t format = litert::kFullyConnectedOptionsWeightsFormatDefault;
+  const auto type = op.Inputs()[1].RankedTensorType();
+  if (LiteRtGetFullyConnectedWeightsFormatOption(op.Get(), &format) !=
+          kLiteRtStatusOk ||
+      format != litert::kFullyConnectedOptionsWeightsFormatDefault || !type ||
+      type->Layout().Rank() != 2) {
+    return std::nullopt;
+  }
+  const auto dims = type->Layout().Dimensions();
+  if (dims[0] <= 0 || dims[0] % 8 != 0 || dims[1] <= 0 || dims[1] % 16 != 0) {
+    return std::nullopt;
+  }
+  return std::make_pair(dims[0], dims[1]);
+}
+
+// Whether the INT8 tensors of the product `op` are the quantized form of
+// FLOAT16 ones: the QUANTIZE that makes its input (through reshapes and
+// transposes) reads FLOAT16, or the DEQUANTIZE behind its result (through
+// reshapes) makes FLOAT16, and neither has another float type. A statically
+// quantized model's products are; the Gemma 4 E2B and E4B have INT4 products
+// between FLOAT32 tensors, which keep the FP16-activation lowering they run on
+// (the quant kernels round as the CPU path rounds FLOAT16).
+bool IsBetweenFloat16(const Op& op) {
+  bool found = false;
+  Tensor input = op.Inputs()[0];
+  for (int hops = 0; hops < 6; ++hops) {
+    auto producer = input.GetDefiningOp();
+    if (!producer || producer->Inputs().empty()) break;
+    if (producer->Code() == kLiteRtOpCodeTflQuantize) {
+      if (producer->Inputs()[0].ElementType() != litert::ElementType::Float16) {
+        return false;
+      }
+      found = true;
+      break;
+    }
+    if (producer->Code() != kLiteRtOpCodeTflReshape &&
+        producer->Code() != kLiteRtOpCodeTflTranspose) {
+      break;
+    }
+    input = producer->Inputs()[0];
+  }
+  Tensor output = op.Outputs()[0];
+  for (int hops = 0; hops < 3; ++hops) {
+    const auto uses = output.Uses();
+    if (uses.size() != 1 || uses[0].user.Outputs().size() != 1) break;
+    const Op user = uses[0].user;
+    if (user.Code() == kLiteRtOpCodeTflDequantize) {
+      if (user.Outputs()[0].ElementType() != litert::ElementType::Float16) {
+        return false;
+      }
+      found = true;
+      break;
+    }
+    if (user.Code() != kLiteRtOpCodeTflReshape) break;
+    output = user.Outputs()[0];
+  }
+  return found;
+}
+
+// FULLY_CONNECTED of INT8 activations to an INT8 result with centered INT2
+// weights, or with INT4 per-channel weights between FLOAT16 tensors.
+bool IsQuantFullyConnected(const Op& op) {
+  const auto shape = QuantFullyConnectedShape(op);
+  if (!shape || !IsSymmetricInt8(op.Inputs()[0]) ||
+      !IsSymmetricInt8(op.Outputs()[0])) {
+    return false;
+  }
+  return (IsPerRowInt4(op.Inputs()[1], shape->first, shape->second) &&
+          IsBetweenFloat16(op)) ||
+         CenteredInt2Scales(op.Inputs()[1], 1).has_value();
+}
+
+// FULLY_CONNECTED of FLOAT16 activations to FLOAT16 logits with centered
+// INT2 weights (TFLite's dynamic range contract): the vocabulary head.
+bool IsQuantLogitsFullyConnected(const Op& op) {
+  const auto shape = QuantFullyConnectedShape(op);
+  return shape.has_value() &&
+         op.Inputs()[0].ElementType() == litert::ElementType::Float16 &&
+         op.Outputs()[0].ElementType() == litert::ElementType::Float16 &&
+         CenteredInt2Scales(op.Inputs()[1], 1).has_value();
+}
+
+// BATCH_MATMUL of INT8 rows [.., blocks, 1, columns] with constant centered
+// INT2 weights [blocks, columns, outputs] (a leading 1 allowed) to INT8.
+bool IsQuantBatchMatmul(const Op& op) {
+  if (!QuantProductsEnabled() || op.Code() != kLiteRtOpCodeTflBatchMatmul ||
+      op.Inputs().size() != 2 || op.Outputs().size() != 1 ||
+      op.Inputs()[0].HasWeights() || !IsSymmetricInt8(op.Inputs()[0]) ||
+      !IsSymmetricInt8(op.Outputs()[0])) {
+    return false;
+  }
+  bool adj_x = false;
+  bool adj_y = false;
+  const auto lhs_type = op.Inputs()[0].RankedTensorType();
+  const auto rhs_type = op.Inputs()[1].RankedTensorType();
+  if (LiteRtGetBatchMatmulAdjXOption(op.Get(), &adj_x) != kLiteRtStatusOk ||
+      LiteRtGetBatchMatmulAdjYOption(op.Get(), &adj_y) != kLiteRtStatusOk ||
+      adj_x || adj_y || !lhs_type || !rhs_type) {
+    return false;
+  }
+  const auto lhs = lhs_type->Layout().Dimensions();
+  const auto rhs = rhs_type->Layout().Dimensions();
+  const size_t rank = rhs.size();
+  if ((rank != 3 && !(rank == 4 && rhs[0] == 1)) || lhs.size() != 4 ||
+      lhs[1] != rhs[rank - 3] || lhs[2] != 1 || lhs[3] != rhs[rank - 2] ||
+      rhs[rank - 1] % 16 != 0) {
+    return false;
+  }
+  return CenteredInt2Scales(op.Inputs()[1], rank - 2).has_value();
+}
+
+// odml.rope(x FLOAT16 [1, heads, tokens, depth], positions INT32 [1, tokens])
+// as a statically quantized model has it behind its q and k head norms
+// (LiteRtNvidiaLaunchQuantQkvRope).
+struct QuantRope {
+  int32_t heads = 0;
+  int32_t tokens = 0;
+  int32_t depth = 0;
+  float min_timescale = 1.0f;
+  float max_timescale = 10000.0f;
+  float proportion = 1.0f;
+};
+
+std::optional<QuantRope> ParseQuantRope(const Op& op) {
+  if (!QuantProductsEnabled() || op.Code() != kLiteRtOpCodeShloComposite ||
+      CompositeOpName(op) != "odml.rope" || op.Inputs().size() != 2 ||
+      op.Outputs().size() != 1 ||
+      op.Inputs()[0].ElementType() != litert::ElementType::Float16 ||
+      op.Outputs()[0].ElementType() != litert::ElementType::Float16 ||
+      op.Inputs()[0].HasWeights() ||
+      op.Inputs()[1].ElementType() != litert::ElementType::Int32) {
+    return std::nullopt;
+  }
+  const auto type = op.Inputs()[0].RankedTensorType();
+  const auto positions = op.Inputs()[1].RankedTensorType();
+  if (!type || !positions || type->Layout().Rank() != 4) {
+    return std::nullopt;
+  }
+  const auto dims = type->Layout().Dimensions();
+  const auto position_count = NumElements(*positions);
+  QuantRope rope;
+  rope.heads = dims[1];
+  rope.tokens = dims[2];
+  rope.depth = dims[3];
+  if (dims[0] != 1 || rope.heads <= 0 || rope.tokens <= 0 || rope.depth < 2 ||
+      rope.depth > 1024 || rope.depth % 2 != 0 || !position_count ||
+      *position_count != static_cast<size_t>(rope.tokens) ||
+      !TensorHasShape(op.Outputs()[0],
+                      {1, rope.heads, rope.tokens, rope.depth})) {
+    return std::nullopt;
+  }
+  CompositeOptions options;
+  if (options.InitFromOp(op.Get()) != kLiteRtStatusOk ||
+      !options.attributes_map.has_value()) {
+    return std::nullopt;
+  }
+  auto& attributes = options.attributes_map.value();
+  if (!attributes["min_timescale"].IsNull()) {
+    rope.min_timescale = attributes["min_timescale"].AsFloat();
+  }
+  if (!attributes["max_timescale"].IsNull()) {
+    rope.max_timescale = attributes["max_timescale"].AsFloat();
+  }
+  if (!attributes["proportion"].IsNull()) {
+    rope.proportion = attributes["proportion"].AsFloat();
+  }
+  if (!(rope.min_timescale > 0.0f) ||
+      !(rope.max_timescale >= rope.min_timescale) ||
+      !(rope.proportion > 0.0f) || rope.proportion > 1.0f) {
+    return std::nullopt;
+  }
+  return rope;
+}
+
+// Whether the odml.rope `op` rotates the head norm of a quant projection, as
+// MatchQuantQkvRope takes it: (TRANSPOSE | RESHAPE) <- CAST <- odml.rms_norm
+// <- CAST <- DEQUANTIZE <- RESHAPE <- FULLY_CONNECTED. No other odml.rope
+// has a lowering (the Gemma 4 26B's stays on the CPU).
+bool IsRopeOfQuantProjection(const Op& op) {
+  Tensor value = op.Inputs()[0];
+  const auto producer =
+      [&](std::initializer_list<LiteRtOpCode> codes) -> std::optional<Op> {
+    auto defining = value.GetDefiningOp();
+    if (!defining || defining->Inputs().empty() ||
+        std::find(codes.begin(), codes.end(), defining->Code()) ==
+            codes.end()) {
+      return std::nullopt;
+    }
+    value = defining->Inputs()[0];
+    return *defining;
+  };
+  if (!producer({kLiteRtOpCodeTflTranspose, kLiteRtOpCodeTflReshape}) ||
+      !producer({kLiteRtOpCodeTflCast})) {
+    return false;
+  }
+  const auto norm = producer({kLiteRtOpCodeShloComposite});
+  if (!norm || CompositeOpName(*norm) != "odml.rms_norm" ||
+      !producer({kLiteRtOpCodeTflCast}) ||
+      !producer({kLiteRtOpCodeTflDequantize}) ||
+      !producer({kLiteRtOpCodeTflReshape})) {
+    return false;
+  }
+  const auto product = value.GetDefiningOp();
+  return product && IsQuantFullyConnected(*product);
+}
+
+// odml.factorized_mlp(x FLOAT16 [.., 2 C], six centered INT2 weights) -> y
+// FLOAT16: a factorized MLP carved into one composite (tools/carve), whose
+// attributes carry the INT8 scales of x and of the stages' results in order
+// (QuantFactorizedMlp::scales). The weights are up-1 a and b, up-2, down-1 and
+// down-2 a and b.
+struct QuantFactorizedMlpComposite {
+  float scales[6] = {};
+};
+
+std::optional<QuantFactorizedMlpComposite> ParseQuantFactorizedMlpComposite(
+    const Op& op) {
+  if (!QuantProductsEnabled() || op.Code() != kLiteRtOpCodeShloComposite ||
+      CompositeOpName(op) != "odml.factorized_mlp" || op.Inputs().size() != 7 ||
+      op.Outputs().size() != 1 || op.Inputs()[0].HasWeights() ||
+      op.Inputs()[0].ElementType() != litert::ElementType::Float16 ||
+      op.Outputs()[0].ElementType() != litert::ElementType::Float16) {
+    return std::nullopt;
+  }
+  for (int i = 1; i <= 6; ++i) {
+    const auto type = op.Inputs()[i].RankedTensorType();
+    if (!type) return std::nullopt;
+    const size_t rank = type->Layout().Rank();
+    const bool blocks = i == 3 || i == 4;
+    if ((blocks ? rank < 3 : rank != 2) ||
+        !CenteredInt2Scales(op.Inputs()[i], blocks ? rank - 2 : 1)) {
+      return std::nullopt;
+    }
+  }
+  CompositeOptions options;
+  if (options.InitFromOp(op.Get()) != kLiteRtStatusOk ||
+      !options.attributes_map.has_value()) {
+    return std::nullopt;
+  }
+  auto& attributes = options.attributes_map.value();
+  constexpr const char* kScales[6] = {"scale_in",  "scale_up1",   "scale_up2",
+                                      "scale_act", "scale_down1", "scale_out"};
+  QuantFactorizedMlpComposite parsed;
+  for (int i = 0; i < 6; ++i) {
+    if (attributes[kScales[i]].IsNull()) return std::nullopt;
+    parsed.scales[i] = attributes[kScales[i]].AsFloat();
+    if (!(parsed.scales[i] > 0.0f)) return std::nullopt;
+  }
+  // The kernels' table between the middle stages is the SiLU.
+  if (!attributes["activation"].IsNull() &&
+      std::strcmp(attributes["activation"].AsString().c_str(), "silu") != 0) {
+    return std::nullopt;
+  }
+  return parsed;
+}
+
 Expected<bool> IsCompositeSupported(const Op& op) {
   const std::string name = CompositeOpName(op);
   if (name.empty() || !NativeCompositeEnabled(name)) {
@@ -1557,7 +2233,8 @@ Expected<bool> IsCompositeSupported(const Op& op) {
   }
   if (name == "odml.cache_update") {
     if (PrefillCacheUpdateRingMode(op).has_value() ||
-        DecodeCacheUpdateMode(op).has_value()) {
+        DecodeCacheUpdateMode(op).has_value() ||
+        ParseQuantCacheUpdate(op).has_value()) {
       return true;
     }
     // (update_a f32, update_b f32, _, cache_a i8, cache_b i8, start_a i32,
@@ -1596,13 +2273,22 @@ Expected<bool> IsCompositeSupported(const Op& op) {
   if (name == "odml.qkv_norm_rope") {
     return ParseQkvNormRope(op).has_value();
   }
+  if (name == "odml.rope") {
+    return ParseQuantRope(op).has_value() && IsRopeOfQuantProjection(op);
+  }
+  if (name == "odml.factorized_mlp") {
+    return ParseQuantFactorizedMlpComposite(op).has_value();
+  }
   if (name == "odml.short_conv_step") {
     return ParseShortConvStep(op).has_value();
   }
   if (name == "odml.swiglu") {
-    return SwigluGateSize(op).has_value();
+    return ParseSwiglu(op).has_value();
   }
   if (name == "odml.sdpa_transposed") {
+    if (ParseQuantSdpa(op).has_value()) {
+      return true;
+    }
     if (!SdpaTransposedGroup(op).has_value()) {
       return false;
     }
@@ -1621,6 +2307,9 @@ Expected<bool> IsCompositeSupported(const Op& op) {
       }
     }
     return true;
+  }
+  if (name == "odml.fused_sdpa_cache_update") {
+    return ParseQuantFusedSdpa(op).has_value();
   }
   if (name == "odml.runtime_bmm") {
     // (a, cache, positions) -> a @ dequantize(cache)^T over the full
@@ -1720,9 +2409,128 @@ Expected<bool> IsDynamicUpdateSliceSupported(const Op& op) {
   return partial_axes <= 1;
 }
 
+std::optional<float> ReadFloatScalar(const Tensor& tensor);
+
+// ONE_HOT(indices, depth, on = 1, off = 0) along a new last axis whose only
+// user is the left operand of a BATCH_MATMUL with a constant table [depth, C]
+// or [1, depth, C] (FLOAT32, or INT8 with symmetric per-tensor scales or
+// per-channel scales along C): the product is a lookup of the table's rows.
+// The Gemma 4 vision export with an MTP drafter computes its patch position
+// embeddings this way (two [2520, 10240] x [10240, 1152] products per
+// 280-token image, which ran on the CPU; the earlier export used
+// EMBEDDING_LOOKUP). Returns the BATCH_MATMUL.
+std::optional<Op> OneHotTableLookup(const Op& one_hot) {
+  if (one_hot.Code() != kLiteRtOpCodeTflOneHot ||
+      one_hot.Inputs().size() != 4 || one_hot.Outputs().size() != 1) {
+    return std::nullopt;
+  }
+  // Inputs() and Outputs() return copies: keep the tensors, not references.
+  const Tensor indices = one_hot.Inputs()[0];
+  const Tensor selection = one_hot.Outputs()[0];
+  const auto indices_type = indices.RankedTensorType();
+  const auto selection_type = selection.RankedTensorType();
+  const auto depth = ReadInt32Constant(one_hot.Inputs()[1]);
+  int32_t axis = 0;
+  if (indices.HasWeights() ||
+      indices.ElementType() != litert::ElementType::Int32 ||
+      selection.ElementType() != litert::ElementType::Float32 ||
+      !indices_type || !selection_type || !depth || depth->size() != 1 ||
+      (*depth)[0] <= 0 || ReadFloatScalar(one_hot.Inputs()[2]) != 1.0f ||
+      ReadFloatScalar(one_hot.Inputs()[3]) != 0.0f ||
+      LiteRtGetOneHotAxisOption(one_hot.Get(), &axis) != kLiteRtStatusOk) {
+    return std::nullopt;
+  }
+  const auto index_dims = indices_type->Layout().Dimensions();
+  const int rank = static_cast<int>(index_dims.size());
+  if ((axis != -1 && axis != rank) ||
+      selection_type->Layout().Dimensions().size() !=
+          static_cast<size_t>(rank) + 1) {
+    return std::nullopt;
+  }
+  const auto uses = selection.Uses();
+  if (uses.size() != 1 || uses[0].user_arg_ind != 0) {
+    return std::nullopt;
+  }
+  const Op product = uses[0].user;
+  bool adj_x = false;
+  bool adj_y = false;
+  if (product.Code() != kLiteRtOpCodeTflBatchMatmul ||
+      product.Inputs().size() != 2 || product.Outputs().size() != 1 ||
+      LiteRtGetBatchMatmulAdjXOption(product.Get(), &adj_x) !=
+          kLiteRtStatusOk ||
+      LiteRtGetBatchMatmulAdjYOption(product.Get(), &adj_y) !=
+          kLiteRtStatusOk ||
+      adj_x || adj_y) {
+    return std::nullopt;
+  }
+  const Tensor table = product.Inputs()[1];
+  const Tensor rows = product.Outputs()[0];
+  const auto table_type = table.RankedTensorType();
+  const auto rows_type = rows.RankedTensorType();
+  if (!table.HasWeights() || !table_type || !rows_type ||
+      rows.ElementType() != litert::ElementType::Float32) {
+    return std::nullopt;
+  }
+  const auto table_dims = table_type->Layout().Dimensions();
+  const int table_rank = static_cast<int>(table_dims.size());
+  if ((table_rank != 2 && !(table_rank == 3 && table_dims[0] == 1)) ||
+      table_dims[table_rank - 2] != (*depth)[0]) {
+    return std::nullopt;
+  }
+  const int32_t columns = table_dims[table_rank - 1];
+  const auto rows_dims = rows_type->Layout().Dimensions();
+  if (rows_dims.size() != static_cast<size_t>(rank) + 1 ||
+      rows_dims[rank] != columns) {
+    return std::nullopt;
+  }
+  for (int i = 0; i < rank; ++i) {
+    if (index_dims[i] <= 0 || rows_dims[i] != index_dims[i]) {
+      return std::nullopt;
+    }
+  }
+  if (table.ElementType() == litert::ElementType::Float32) {
+    return table.QTypeId() == kLiteRtQuantizationNone
+               ? std::optional<Op>(product)
+               : std::nullopt;
+  }
+  if (table.ElementType() != litert::ElementType::Int8) {
+    return std::nullopt;
+  }
+  auto symmetric =
+      HasSymmetricTensorRtQuantization(table, /*allow_per_channel=*/true);
+  if (!symmetric || !*symmetric) {
+    return std::nullopt;
+  }
+  if (table.QTypeId() == kLiteRtQuantizationPerChannel) {
+    const auto q = table.PerChannelQuantization();
+    if (q.quantized_dimension != table_rank - 1 ||
+        q.num_channels != static_cast<uint64_t>(columns)) {
+      return std::nullopt;
+    }
+  }
+  return product;
+}
+
+// The BATCH_MATMUL of a OneHotTableLookup: `op`'s left operand is the one-hot.
+bool IsOneHotTableLookupProduct(const Op& op) {
+  const auto selector = op.Inputs()[0].GetDefiningOp();
+  if (!selector) {
+    return false;
+  }
+  const auto product = OneHotTableLookup(*selector);
+  return product && product->Get() == op.Get();
+}
+
 Expected<bool> IsBatchMatmulSupported(const Op& op) {
   if (op.Inputs().size() != 2 || op.Outputs().size() != 1) {
     return false;
+  }
+  // INT8 rows times centered INT2 weights: a product of the quant plugin.
+  if (IsQuantBatchMatmul(op)) {
+    return true;
+  }
+  if (IsOneHotTableLookupProduct(op)) {
+    return true;
   }
   for (const auto& tensor : op.Inputs()) {
     LITERT_ASSIGN_OR_RETURN(bool supported, IsStaticFloatTensor(tensor));
@@ -1826,6 +2634,18 @@ Expected<bool> IsFullyConnectedSupported(const Op& op) {
        op.Inputs()[1].ElementType() == litert::ElementType::Int2)) {
     LogFullyConnectedReject(op, "sub-byte weights disabled via env");
     return false;
+  }
+  // Centered INT2 weights run on the quant plugin (FindQuantRegions), from
+  // INT8 activations or, for the vocabulary head, FLOAT16 ones.
+  if (op.Inputs()[1].ElementType() == litert::ElementType::Int2 &&
+      op.Inputs()[1].QTypeId() == kLiteRtQuantizationBlockWise) {
+    const bool quant =
+        IsQuantFullyConnected(op) || IsQuantLogitsFullyConnected(op);
+    if (!quant) {
+      LogFullyConnectedReject(
+          op, "blockwise INT2 weights are not a quant plugin product");
+    }
+    return quant;
   }
   bool weights_quantized = false;
   if (op.Inputs()[1].ElementType() == litert::ElementType::Int8 ||
@@ -2745,6 +3565,12 @@ class TensorRtGraphBuilder {
       TensorRtWeightStoreBuilder* weight_store,
       absl::Span<const std::string> shared_cache_inputs) {
     weight_store_ = weight_store;
+    GraphComputesFloat16() = SubgraphComputesFloat16(subgraph);
+    if (GraphComputesFloat16()) {
+      LITERT_LOG(LITERT_INFO,
+                 "NVIDIA TensorRT-RTX the graph computes in FLOAT16: FP16 "
+                 "activations");
+    }
     LITERT_RETURN_IF_ERROR(
         FindReadOnlyValueCaches(subgraph, read_only_value_cache_inputs));
     LITERT_RETURN_IF_ERROR(
@@ -2843,6 +3669,7 @@ class TensorRtGraphBuilder {
     LITERT_RETURN_IF_ERROR(FindDecodeAttentionBlocks(subgraph));
     LITERT_RETURN_IF_ERROR(FindWindowedCacheReads(subgraph));
     LITERT_RETURN_IF_ERROR(FindInt8CacheAttentionBlocks(subgraph));
+    FindPackedInt4Caches(subgraph);
     LITERT_RETURN_IF_ERROR(AddInputs(subgraph));
     const size_t num_ops_to_lower =
         ops.size() - (trtllm_head.has_value() ? 4 : 0);
@@ -2853,6 +3680,7 @@ class TensorRtGraphBuilder {
     LITERT_RETURN_IF_ERROR(FindCompositeAttentionBlocks(subgraph));
     LITERT_RETURN_IF_ERROR(FindMoeBlocks(subgraph));
     LITERT_RETURN_IF_ERROR(FindGatedDeltaNetBlocks(subgraph));
+    LITERT_RETURN_IF_ERROR(FindQuantRegions(subgraph));
     std::vector<Op> prefill_cache_updates;
     for (size_t i = 0; i < num_ops_to_lower; ++i) {
       if (ops[i].Code() == kLiteRtOpCodeShloComposite &&
@@ -2870,6 +3698,7 @@ class TensorRtGraphBuilder {
     for (const auto& op : prefill_cache_updates) {
       LITERT_RETURN_IF_ERROR(LowerOp(op));
     }
+    LITERT_RETURN_IF_ERROR(AddUnjoinedQuantCacheUpdates());
     LITERT_RETURN_IF_ERROR(MarkOutputs(subgraph, trtllm_head));
     memory_profiler_.Log("graph_lowered");
 
@@ -3008,12 +3837,13 @@ class TensorRtGraphBuilder {
   }
 
   // A decode step that feeds itself (TensorRtStepFeed): one token's
-  // embeddings in, the logits out, the vocabulary head an INT4 per-channel
-  // fully connected op whose weights the weight store maps (Gemma ties them
-  // to the embedder's table; the embedder's multiplier is sqrt(dim), and the
-  // dispatch verifies every embedding the host feeds against what it ran, so
-  // an untied table only costs the speculation). Nothing when the signature
-  // is not that shape. LITERT_NVIDIA_TENSORRT_STEP_FEED=0 records none.
+  // embeddings in, the logits out, the vocabulary head a fully connected op
+  // with INT4 per-channel or centered INT2 weights that the weight store maps
+  // (the models tie them to the embedder's table; the embedder's multiplier
+  // is sqrt(dim), and the dispatch verifies every embedding the host feeds
+  // against what it ran, so an untied table only costs the speculation).
+  // Nothing when the signature is not that shape.
+  // LITERT_NVIDIA_TENSORRT_STEP_FEED=0 records none.
   Expected<std::optional<TensorRtStepFeedBuildData>> MatchStepFeed(
       const Subgraph& subgraph) {
     const auto none = [] { return std::optional<TensorRtStepFeedBuildData>(); };
@@ -3149,9 +3979,10 @@ class TensorRtGraphBuilder {
     }
     if (!logits.has_value()) return refuse(__LINE__);
     // The token table: the head's weights when they are an INT4 per-channel
-    // [vocab, dim] view of the model file (the embedder's table is tied to
-    // them, with the multiplier sqrt(dim)); otherwise the runtime registers
-    // the embedder's own table (an external head, a blockwise embedder).
+    // or a centered INT2 [vocab, dim] view of the model file (the embedder's
+    // table is tied to them, with the multiplier sqrt(dim)); otherwise the
+    // runtime registers the embedder's own table (an external head, a
+    // blockwise embedder).
     feed.table_offset = kTensorRtStepFeedNoTable;
     feed.multiplier =
         static_cast<float>(std::sqrt(static_cast<double>(feed.dim)));
@@ -3168,7 +3999,8 @@ class TensorRtGraphBuilder {
     const std::string table_text =
         feed.table_offset == kTensorRtStepFeedNoTable
             ? "from the runtime"
-            : "at " + std::to_string(feed.table_offset);
+            : "INT" + std::to_string(feed.table_bits) + " at " +
+                  std::to_string(feed.table_offset);
     const std::string per_layer_text =
         feed.per_layer_port == kTensorRtStepFeedNoPort
             ? "-"
@@ -3228,19 +4060,46 @@ class TensorRtGraphBuilder {
   }
 
   // The head's weights as the feed's table when they are the tied
-  // embedder's: INT4 per-channel [vocab, dim] in the model file.
+  // embedder's: [vocab, dim] in the model file, INT4 per-channel, or
+  // centered INT2 with a scale per row (CenteredInt2Scales: a weight is
+  // scale * (q + 0.5), which the embedder's blockwise lookup computes too).
   void MatchTiedHeadTable(const Tensor& logits,
                           TensorRtStepFeedBuildData& feed) {
     auto head = FindHeadBehind(logits);
     if (!head.has_value() || head->Inputs().size() < 2) return;
     const Tensor weights = head->Inputs()[1];
     auto weights_type = weights.RankedTensorType();
-    if (!weights_type || weights.ElementType() != litert::ElementType::Int4 ||
-        !weights.HasWeights() || weights_type->Layout().Rank() != 2 ||
+    if (!weights_type || !weights.HasWeights() ||
+        weights_type->Layout().Rank() != 2 ||
         weights_type->Layout().Dimensions()[0] !=
             static_cast<int32_t>(feed.vocab) ||
         weights_type->Layout().Dimensions()[1] !=
-            static_cast<int32_t>(feed.dim) ||
+            static_cast<int32_t>(feed.dim)) {
+      return;
+    }
+    if (weights.ElementType() == litert::ElementType::Int2) {
+      const auto scales = CenteredInt2Scales(weights, /*input_axis=*/1);
+      if (!scales.has_value() || scales->size() != feed.vocab ||
+          feed.dim % 4 != 0 || weight_store_ == nullptr) {
+        return;
+      }
+      auto offset = weight_store_->SourceOffset(weights.Weights().Bytes());
+      if (!offset) {
+        LITERT_LOG(LITERT_INFO,
+                   "NVIDIA TensorRT-RTX step feed: the head's weights are not "
+                   "a view of the model file (%s)",
+                   offset.Error().Message().c_str());
+        return;
+      }
+      feed.table_offset = *offset;
+      feed.table_bits = 2;
+      feed.table_zero_point = -0.5f;
+      feed.row_scales.resize(scales->size() * sizeof(float));
+      std::memcpy(feed.row_scales.data(), scales->data(),
+                  feed.row_scales.size());
+      return;
+    }
+    if (weights.ElementType() != litert::ElementType::Int4 ||
         weights.QTypeId() != kLiteRtQuantizationPerChannel) {
       return;
     }
@@ -3326,14 +4185,40 @@ class TensorRtGraphBuilder {
     return PredequantMode::kFloat;
   }
 
-  // bf16 keeps fp32's exponent range, sidestepping overflow in reductions
-  // and exp-heavy regions at slightly coarser mantissa.
+  // bf16 keeps fp32's exponent range, sidestepping overflow in reductions and
+  // exp-heavy regions at slightly coarser mantissa. That is a choice of the
+  // pool for the Gemma 4 graphs, which compute in FLOAT32 (with FLOAT16 casts
+  // around some norms). A graph whose quantized products sit between FLOAT16
+  // tensors (a residual stream, attention results and head in FLOAT16, every
+  // product INT8) has chosen its type: the values between its quant layers are
+  // FP16, and BF16 would drop three bits of every one of them (the first token
+  // of a reply changed with it).
   static nvinfer1::DataType ModeFloatType() {
     const char* value = std::getenv("LITERT_NVIDIA_TENSORRT_FP16_ACTIVATIONS");
-    if (value != nullptr && std::strcmp(value, "bf16") == 0) {
+    if (value != nullptr && std::strcmp(value, "bf16") == 0 &&
+        !GraphComputesFloat16()) {
       return nvinfer1::DataType::kBF16;
     }
     return nvinfer1::DataType::kHALF;
+  }
+
+  // Whether the subgraph being built computes in FLOAT16: set by Build.
+  static bool& GraphComputesFloat16() {
+    thread_local bool value = false;
+    return value;
+  }
+
+  // A statically quantized product between FLOAT16 tensors (the ops of
+  // FindQuantRegions), in the graph's own ops or carved into a composite.
+  static bool SubgraphComputesFloat16(const Subgraph& subgraph) {
+    for (const auto& op : subgraph.Ops()) {
+      if (IsQuantFullyConnected(op) || IsQuantLogitsFullyConnected(op) ||
+          IsQuantBatchMatmul(op) ||
+          ParseQuantFactorizedMlpComposite(op).has_value()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   const char* KeepName(std::string name) {
@@ -3405,6 +4290,13 @@ class TensorRtGraphBuilder {
       LITERT_ASSIGN_OR_RETURN(auto data_type,
                               ConvertDataType(type.ElementType()));
       std::string name = TensorName("input", input, i);
+      // An INT4 cache of the composites over quantized caches is declared as
+      // the INT8 bytes that hold it (FindPackedInt4Caches).
+      if (const auto packed = packed_int4_caches_.find(input.Get());
+          packed != packed_int4_caches_.end()) {
+        data_type = nvinfer1::DataType::kINT8;
+        dims.d[packed->second ? 2 : 3] /= 2;
+      }
       // A value cache stored as [B, H, D, S] and updated in place is either
       // held as [B, H, S, D] (see TransposedValueCacheEnabled) or declared
       // through its free [B, H*D, S, 1] view so the native cache update can
@@ -3515,6 +4407,9 @@ class TensorRtGraphBuilder {
             type.ElementType() == litert::ElementType::Float32 &&
             Fp16CacheStorageEnabled()) {
           boundary_type = nvinfer1::DataType::kHALF;
+        }
+        if (packed_int4_caches_.count(output.Get()) != 0) {
+          boundary_type = nvinfer1::DataType::kINT8;
         }
         if (out->getType() != boundary_type) {
           LITERT_ASSIGN_OR_RETURN(
@@ -4524,7 +5419,7 @@ class TensorRtGraphBuilder {
         holder->second = layer->getOutput(0);
         weight_holders_.push_back({std::move(name), reader.segment, bytes});
       }
-      reader.layer->setInput(1, *holder->second);
+      reader.layer->setInput(reader.input, *holder->second);
       if (reader.scales_too) {
         reader.layer->setInput(2, *holder->second);
       }
@@ -4621,10 +5516,11 @@ class TensorRtGraphBuilder {
     return found;
   }
 
-  // Qwen 3.5's feed-forward: one INT4 fully connected op over the gate and up
-  // projections stacked [2 * N, K] whose single user is odml.swiglu (gate_size
-  // N). The gated CUDA GEMM/GEMV computes silu(gate) * up in its SiLU mode in
-  // one launch, without the [.., 2 * N] intermediate.
+  // Qwen 3.5's feed-forward, and Gemma 4's when it is exported fused: one INT4
+  // fully connected op over the gate and up projections stacked [2 * N, K]
+  // whose single user is odml.swiglu (gate_size N). The gated CUDA GEMM/GEMV
+  // computes act(gate) * up in the composite's gate mode in one launch,
+  // without the [.., 2 * N] intermediate.
   // LITERT_NVIDIA_TENSORRT_FUSE_SWIGLU=0 lowers them separately.
   std::optional<Op> FindFusedSwiglu(const Op& op) {
     if (!EnvEnabled("LITERT_NVIDIA_TENSORRT_FUSE_SWIGLU",
@@ -4643,8 +5539,8 @@ class TensorRtGraphBuilder {
         graph_outputs_.count(op.Outputs()[0].Get()) != 0) {
       return std::nullopt;
     }
-    const auto gate_size = SwigluGateSize(*user);
-    if (!gate_size.has_value() || 2 * *gate_size != info->rows) {
+    const auto gate = ParseSwiglu(*user);
+    if (!gate.has_value() || 2 * gate->gate_size != info->rows) {
       return std::nullopt;
     }
     return user;
@@ -4656,6 +5552,11 @@ class TensorRtGraphBuilder {
                                 const NormFusion* norm = nullptr) {
     LITERT_ASSIGN_OR_RETURN(auto info,
                             InspectSubbyteGemvWeights(op.Inputs()[1]));
+    const auto gate = ParseSwiglu(swiglu);
+    if (!gate.has_value()) {
+      return Error(kLiteRtStatusErrorUnsupported,
+                   "Unsupported swiglu composite");
+    }
     LITERT_RETURN_IF_ERROR(
         ValidateSubbyteGemvActivation(activation, compute_type, info.columns,
                                       info.bit_width, info.scale_block));
@@ -4671,7 +5572,7 @@ class TensorRtGraphBuilder {
         auto* gated,
         AddSubbyteGemvPlugin(
             activation, info, members, absl::MakeConstSpan(scales), suffix,
-            "cuda_subbyte_swiglu_gemm" + suffix, kLiteRtNvidiaGemmGateSilu,
+            "cuda_subbyte_swiglu_gemm" + suffix, gate->activation,
             absl::MakeConstSpan(block_scales), norm));
     LITERT_ASSIGN_OR_RETURN(auto out_type,
                             swiglu.Outputs()[0].RankedTensorType());
@@ -4680,8 +5581,10 @@ class TensorRtGraphBuilder {
     unlowered_ops_.insert(swiglu.Get());
     LITERT_LOG(LITERT_INFO,
                "NVIDIA TensorRT-RTX fused CUDA SwiGLU GEMM: N=%d K=%d "
-               "tensor=%s",
-               info.rows / 2, info.columns, suffix.c_str() + 1);
+               "tensor=%s gate=%s",
+               info.rows / 2, info.columns, suffix.c_str() + 1,
+               gate->activation == kLiteRtNvidiaGemmGateGeluTanh ? "gelu_tanh"
+                                                                 : "silu");
     return SetOutputTensor(swiglu.Outputs()[0], gated);
   }
 
@@ -5232,6 +6135,13 @@ class TensorRtGraphBuilder {
   Expected<nvinfer1::ITensor*> GetTensor(const Tensor& tensor) {
     if (auto it = tensor_map_.find(tensor.Get()); it != tensor_map_.end()) {
       return it->second;
+    }
+    if (auto value = quant_values_.find(tensor.Get());
+        value != quant_values_.end()) {
+      // An op outside the quant regions reads a quant layer's INT8 result.
+      LITERT_ASSIGN_OR_RETURN(auto* view, QuantRealView(tensor, value->second));
+      tensor_map_[tensor.Get()] = view;
+      return view;
     }
     if (!tensor.HasWeights()) {
       return Error(kLiteRtStatusErrorCompilation,
@@ -8303,7 +9213,176 @@ class TensorRtGraphBuilder {
     return SetOutputTensor(op.Outputs()[0], out);
   }
 
+  // The one-hot of a OneHotTableLookup needs no layer of its own when its
+  // product is lowered here: the product gathers the selected rows.
+  Expected<void> LowerOneHot(const Op& op) {
+    const auto product = OneHotTableLookup(op);
+    if (product && op_order_.count(product->Get()) != 0) {
+      return {};
+    }
+    LITERT_ASSIGN_OR_RETURN(auto* indices, GetTensor(op.Inputs()[0]));
+    LITERT_ASSIGN_OR_RETURN(auto depth, ReadInt32Constant(op.Inputs()[1]));
+    const float off_on[2] = {0.0f, 1.0f};
+    LITERT_ASSIGN_OR_RETURN(
+        auto* values,
+        AddFloatConstant(off_on, nvinfer1::Dims{1, {2}}, "one_hot_values"));
+    LITERT_ASSIGN_OR_RETURN(
+        auto* depth_tensor,
+        AddInt32Constant(depth, nvinfer1::Dims{0, {}}, "one_hot_depth"));
+    auto* layer = network_->addOneHot(*indices, *values, *depth_tensor, -1);
+    if (layer == nullptr || layer->getOutput(0) == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to add TensorRT one-hot layer");
+    }
+    return SetOutputTensor(op.Outputs()[0], layer->getOutput(0));
+  }
+
+  // The product of a OneHotTableLookup: the rows its one-hot selects, by a
+  // gather. Each sum of the product has one term that is not a zero, the
+  // row's value, so the gather is exact. INT8 tables are kept as FP16 integers
+  // (exact) and scaled after the gather in FP32, as a dequantization does. An
+  // index outside [0, depth) selects no row (zeros), as in the one-hot.
+  Expected<void> LowerOneHotTableLookup(const Op& selector, const Op& op) {
+    const Tensor table = op.Inputs()[1];
+    LITERT_ASSIGN_OR_RETURN(auto table_type, table.RankedTensorType());
+    const auto table_dims = table_type.Layout().Dimensions();
+    const int32_t depth = table_dims[table_dims.size() - 2];
+    const int32_t columns = table_dims[table_dims.size() - 1];
+    const bool quantized = table.ElementType() == litert::ElementType::Int8;
+    std::vector<float> values(static_cast<size_t>(depth) * columns);
+    const auto bytes = table.Weights().Bytes();
+    if (bytes.size() != values.size() * (quantized ? 1 : sizeof(float))) {
+      return Error(kLiteRtStatusErrorInvalidArgument,
+                   "Unexpected one-hot lookup table size");
+    }
+    if (quantized) {
+      for (size_t i = 0; i < values.size(); ++i) {
+        values[i] = static_cast<float>(static_cast<int8_t>(bytes[i]));
+      }
+    } else {
+      std::memcpy(values.data(), bytes.data(), bytes.size());
+    }
+    // The table stays in the plan, not among the refit constants
+    // (AddFloatConstant): refitting the vision export's two tables (47 MB)
+    // added seconds to every load of its engines.
+    const nvinfer1::DataType table_type_trt =
+        quantized ? nvinfer1::DataType::kHALF : nvinfer1::DataType::kFLOAT;
+    owned_weights_.emplace_back(values.size() *
+                                (quantized ? sizeof(uint16_t) : sizeof(float)));
+    if (quantized) {
+      auto* half_data =
+          reinterpret_cast<uint16_t*>(owned_weights_.back().data());
+      for (size_t i = 0; i < values.size(); ++i) {
+        half_data[i] = Fp32ToFp16Bits(values[i]);
+      }
+    } else {
+      std::memcpy(owned_weights_.back().data(), values.data(),
+                  owned_weights_.back().size());
+    }
+    auto* table_layer = network_->addConstant(
+        nvinfer1::Dims{2, {depth, columns}},
+        nvinfer1::Weights{table_type_trt, owned_weights_.back().data(),
+                          static_cast<int64_t>(values.size())});
+    if (table_layer == nullptr || table_layer->getOutput(0) == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to add the one-hot lookup's table");
+    }
+    nvinfer1::ITensor* table_tensor = table_layer->getOutput(0);
+    LITERT_ASSIGN_OR_RETURN(auto* indices, GetTensor(selector.Inputs()[0]));
+    const nvinfer1::Dims index_dims = indices->getDimensions();
+    nvinfer1::Dims ones{};
+    ones.nbDims = index_dims.nbDims;
+    for (int i = 0; i < ones.nbDims; ++i) {
+      ones.d[i] = 1;
+    }
+    const int32_t zero = 0;
+    const int32_t last = depth - 1;
+    LITERT_ASSIGN_OR_RETURN(
+        auto* zero_tensor,
+        AddInt32Constant(absl::MakeConstSpan(&zero, 1), ones, "lookup_zero"));
+    LITERT_ASSIGN_OR_RETURN(
+        auto* last_tensor,
+        AddInt32Constant(absl::MakeConstSpan(&last, 1), ones, "lookup_last"));
+    auto* below = network_->addElementWise(
+        *indices, *last_tensor, nvinfer1::ElementWiseOperation::kMIN);
+    auto* clamped =
+        below == nullptr
+            ? nullptr
+            : network_->addElementWise(*below->getOutput(0), *zero_tensor,
+                                       nvinfer1::ElementWiseOperation::kMAX);
+    auto* in_range =
+        clamped == nullptr
+            ? nullptr
+            : network_->addElementWise(*clamped->getOutput(0), *indices,
+                                       nvinfer1::ElementWiseOperation::kEQUAL);
+    auto* gather =
+        clamped == nullptr
+            ? nullptr
+            : network_->addGather(*table_tensor, *clamped->getOutput(0), 0);
+    if (in_range == nullptr || gather == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to add TensorRT one-hot lookup layers");
+    }
+    nvinfer1::ITensor* rows = gather->getOutput(0);
+    nvinfer1::Dims row_dims = ones;
+    row_dims.nbDims = index_dims.nbDims + 1;
+    row_dims.d[index_dims.nbDims] = columns;
+    if (quantized) {
+      LITERT_ASSIGN_OR_RETURN(rows,
+                              AddCastTensor(rows, nvinfer1::DataType::kFLOAT));
+      std::vector<float> scales(columns);
+      if (table.QTypeId() == kLiteRtQuantizationPerChannel) {
+        const auto q = table.PerChannelQuantization();
+        std::copy(q.scales, q.scales + columns, scales.begin());
+      } else {
+        std::fill(scales.begin(), scales.end(),
+                  table.PerTensorQuantization().scale);
+      }
+      LITERT_ASSIGN_OR_RETURN(
+          auto* scale_tensor,
+          AddFloatConstant(
+              scales, row_dims,
+              "one_hot_lookup_scales_" + std::to_string(table.TensorIndex())));
+      auto* scaled = network_->addElementWise(
+          *rows, *scale_tensor, nvinfer1::ElementWiseOperation::kPROD);
+      if (scaled == nullptr || scaled->getOutput(0) == nullptr) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "Failed to scale the one-hot lookup's rows");
+      }
+      rows = scaled->getOutput(0);
+    }
+    auto* condition = network_->addShuffle(*in_range->getOutput(0));
+    if (condition == nullptr || condition->getOutput(0) == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to shape the one-hot lookup's index check");
+    }
+    nvinfer1::Dims condition_dims = index_dims;
+    condition_dims.nbDims = index_dims.nbDims + 1;
+    condition_dims.d[index_dims.nbDims] = 1;
+    condition->setReshapeDimensions(condition_dims);
+    const float zero_value = 0.0f;
+    nvinfer1::Dims zero_dims = ones;
+    zero_dims.nbDims = index_dims.nbDims + 1;
+    zero_dims.d[index_dims.nbDims] = 1;
+    LITERT_ASSIGN_OR_RETURN(
+        auto* zero_rows,
+        AddFloatConstant(absl::MakeConstSpan(&zero_value, 1), zero_dims,
+                         "lookup_zero_rows", rows->getType()));
+    auto* select =
+        network_->addSelect(*condition->getOutput(0), *rows, *zero_rows);
+    if (select == nullptr || select->getOutput(0) == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to add the one-hot lookup's select");
+    }
+    return SetOutputTensor(op.Outputs()[0], select->getOutput(0));
+  }
+
   Expected<void> LowerBatchMatmul(const Op& op) {
+    if (const auto selector = op.Inputs()[0].GetDefiningOp();
+        selector && op_order_.count(selector->Get()) != 0 &&
+        IsOneHotTableLookupProduct(op)) {
+      return LowerOneHotTableLookup(*selector, op);
+    }
     LITERT_ASSIGN_OR_RETURN(auto* lhs, GetTensor(op.Inputs()[0]));
     LITERT_ASSIGN_OR_RETURN(auto* rhs, GetTensor(op.Inputs()[1]));
     bool adj_x = false;
@@ -8315,8 +9394,11 @@ class TensorRtGraphBuilder {
       adj_y = false;  // The value cache is already [B, H, S, D].
     }
     // Operands may arrive in different float precisions (e.g. BF16
-    // probabilities from a runtime_bmm chain against FP16 chunk values).
-    LITERT_RETURN_IF_ERROR(MatchElementwiseFloatTypes(lhs, rhs));
+    // probabilities from a runtime_bmm chain against FP16 chunk values) and in
+    // different ranks, the lower one broadcasting over the other's leading
+    // dimensions (the Gemma 4 vision pooler multiplies [1, P, T] weights with
+    // [P, C] patches); TensorRT's matrix multiply wants equal ranks.
+    LITERT_RETURN_IF_ERROR(MatchElementwiseRanks(lhs, rhs));
     auto* layer = network_->addMatrixMultiply(
         *lhs,
         adj_x ? nvinfer1::MatrixOperation::kTRANSPOSE
@@ -8618,6 +9700,11 @@ class TensorRtGraphBuilder {
   }
 
   Expected<void> LowerSelectV2(const Op& op) {
+    if (const auto attention = QuantAttentionBehindMaskSelect(op);
+        attention.has_value()) {
+      LITERT_ASSIGN_OR_RETURN(auto* value, GetTensor(*attention));
+      return SetOutputTensor(op.Outputs()[0], value);
+    }
     nvinfer1::ITensor* condition = nullptr;
     if (const auto select = windowed_by_select_.find(op.Get());
         select != windowed_by_select_.end()) {
@@ -9358,6 +10445,519 @@ class TensorRtGraphBuilder {
     return SetQuantizedScatterOutput(op.Outputs()[1], out_b);
   }
 
+  // The INT4 caches of the composites over quantized caches. TensorRT has no
+  // INT4 tensors at an engine's boundary, so such a cache crosses it as the
+  // INT8 bytes LiteRT packs it into, two values per byte: the same buffer,
+  // declared [1, H, S, D / 2] for a key cache and [1, H, D / 2, S] for a
+  // value cache. Only the quantized attention plugin reads or writes it.
+  void FindPackedInt4Caches(const Subgraph& subgraph) {
+    for (const auto& op : subgraph.Ops()) {
+      if (op.Code() != kLiteRtOpCodeShloComposite) {
+        continue;
+      }
+      const std::string name = CompositeOpName(op);
+      const bool update =
+          name == "odml.cache_update" && ParseQuantCacheUpdate(op).has_value();
+      if (!update &&
+          !(name == "odml.sdpa_transposed" && ParseQuantSdpa(op).has_value())) {
+        continue;
+      }
+      for (int i = 0; i < 2; ++i) {
+        const Tensor cache = op.Inputs()[(update ? 3 : 1) + i];
+        if (cache.ElementType() != litert::ElementType::Int4) {
+          continue;
+        }
+        packed_int4_caches_[cache.Get()] = i == 1;
+        if (update) {
+          packed_int4_caches_[op.Outputs()[i].Get()] = i == 1;
+        }
+      }
+    }
+  }
+
+  // The op that produces `tensor`, if it has this code.
+  static std::optional<Op> ProducerWithCode(const Tensor& tensor,
+                                            LiteRtOpCode code) {
+    if (tensor.IsSubgraphInput() || tensor.HasWeights()) {
+      return std::nullopt;
+    }
+    const auto producer = tensor.GetDefiningOp();
+    if (!producer || producer->Code() != code) {
+      return std::nullopt;
+    }
+    return *producer;
+  }
+
+  // The float tensor behind a quantized input of a composite over quantized
+  // caches: the input of the QUANTIZE that produces `tensor`, also through
+  // one RESHAPE or TRANSPOSE of the quantized tensor (*shape_op). The plugin
+  // rounds that float as the QUANTIZE does. Null without such a QUANTIZE.
+  Expected<nvinfer1::ITensor*> FloatBeforeQuantize(
+      const Tensor& tensor, std::optional<Op>* shape_op) {
+    auto quantize = ProducerWithCode(tensor, kLiteRtOpCodeTflQuantize);
+    if (!quantize.has_value()) {
+      *shape_op = ProducerWithCode(tensor, kLiteRtOpCodeTflReshape);
+      if (!shape_op->has_value()) {
+        *shape_op = ProducerWithCode(tensor, kLiteRtOpCodeTflTranspose);
+      }
+      if (shape_op->has_value()) {
+        quantize = ProducerWithCode((*shape_op)->Inputs()[0],
+                                    kLiteRtOpCodeTflQuantize);
+      }
+    }
+    if (!quantize.has_value() ||
+        !IsFloatLike(quantize->Inputs()[0].ElementType())) {
+      return nullptr;
+    }
+    return GetTensor(quantize->Inputs()[0]);
+  }
+
+  // `value` as a tensor of the activations' float type with `dims`.
+  Expected<nvinfer1::ITensor*> AsQuantPluginFloat(nvinfer1::ITensor* value,
+                                                  const nvinfer1::Dims& dims) {
+    if (value->getType() == nvinfer1::DataType::kFLOAT) {
+      LITERT_ASSIGN_OR_RETURN(value, AddCastTensor(value, ModeFloatType()));
+    }
+    if (value->getType() != nvinfer1::DataType::kHALF &&
+        value->getType() != nvinfer1::DataType::kBF16) {
+      return Error(kLiteRtStatusErrorUnsupported,
+                   "A quantized composite input has no float value");
+    }
+    const nvinfer1::Dims have = value->getDimensions();
+    if (have.nbDims == dims.nbDims &&
+        std::equal(have.d, have.d + have.nbDims, dims.d)) {
+      return value;
+    }
+    return ReshapeTensor(value, dims);
+  }
+
+  // The query a composite takes quantized, as floats with `dims`: the float
+  // before its QUANTIZE (a RESHAPE of the quantized query keeps the order of
+  // its elements), or the query's own value, which float activations hold
+  // dequantized.
+  Expected<nvinfer1::ITensor*> QuantizedQueryAsFloat(
+      const Tensor& tensor, const nvinfer1::Dims& dims) {
+    std::optional<Op> shape_op;
+    LITERT_ASSIGN_OR_RETURN(auto* value,
+                            FloatBeforeQuantize(tensor, &shape_op));
+    if (value == nullptr ||
+        (shape_op.has_value() && shape_op->Code() != kLiteRtOpCodeTflReshape)) {
+      LITERT_ASSIGN_OR_RETURN(value, GetTensor(tensor));
+    }
+    return AsQuantPluginFloat(value, dims);
+  }
+
+  // The keys or values of n tokens a composite takes quantized ([1, H, n, D],
+  // or [1, H, D, n] with `columns`), as float rows [1, H, n, D]. The graphs
+  // quantize the values as [1, n, H, D] and transpose the quantized tensor:
+  // the plugin reads those rows as they are (*token_major), which spares the
+  // transpose.
+  Expected<nvinfer1::ITensor*> QuantizedRowsAsFloat(const Tensor& tensor,
+                                                    bool columns, int32_t heads,
+                                                    int32_t tokens,
+                                                    int32_t depth,
+                                                    bool* token_major) {
+    *token_major = false;
+    const nvinfer1::Dims rows{4, {1, heads, tokens, depth}};
+    std::optional<Op> shape_op;
+    LITERT_ASSIGN_OR_RETURN(auto* value,
+                            FloatBeforeQuantize(tensor, &shape_op));
+    if (value != nullptr && !shape_op.has_value() && !columns) {
+      return AsQuantPluginFloat(value, rows);
+    }
+    if (value != nullptr && shape_op.has_value() &&
+        shape_op->Code() == kLiteRtOpCodeTflReshape && tokens == 1) {
+      // One token: rows and columns hold the same elements in the same order.
+      return AsQuantPluginFloat(value, rows);
+    }
+    if (value != nullptr && shape_op.has_value() &&
+        shape_op->Code() == kLiteRtOpCodeTflTranspose) {
+      const auto perm = ReadInt32Constant(shape_op->Inputs()[1]);
+      const std::vector<int32_t> from_token_rows =
+          columns ? std::vector<int32_t>{0, 2, 3, 1}
+                  : std::vector<int32_t>{0, 2, 1, 3};
+      if (perm && *perm == from_token_rows) {
+        *token_major = true;
+        return AsQuantPluginFloat(value,
+                                  nvinfer1::Dims{4, {1, tokens, heads, depth}});
+      }
+    }
+    LITERT_ASSIGN_OR_RETURN(value, GetTensor(tensor));
+    if (columns) {
+      auto* layer = network_->addShuffle(*value);
+      if (layer == nullptr || layer->getOutput(0) == nullptr) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "Failed to transpose the columns of a quantized input");
+      }
+      layer->setFirstTranspose(nvinfer1::Permutation{{0, 1, 3, 2}});
+      value = layer->getOutput(0);
+    }
+    return AsQuantPluginFloat(value, rows);
+  }
+
+  // The graphs follow odml.sdpa_transposed with a SELECT over its tokens:
+  //   SELECT_V2(NOT_EQUAL(REDUCE_MAX(CAST(mask), context axis), 0),
+  //             attention as [1, n, Hq, D], 0)
+  // gives the tokens whose mask row sees no key zero. The quantized
+  // attention plugin gives such rows zero itself (ParseQuantSdpa), so over
+  // its result the SELECT is the identity, and the reduction of the mask, a
+  // [tokens, context] fp32 tensor for a prefill chunk, is never built.
+  // Returns the SELECT's attention input when `op` is such a SELECT.
+  static std::optional<Tensor> QuantAttentionBehindMaskSelect(const Op& op) {
+    if (op.Inputs().size() != 3) {
+      return std::nullopt;
+    }
+    const auto zero = ReadFloatScalar(op.Inputs()[2]);
+    if (!zero || *zero != 0.0f) {
+      return std::nullopt;
+    }
+    // The attention [1, Hq, n, D] as [1, n, Hq, D]: a reshape for one token.
+    const std::vector<int32_t> tokens_first = {0, 2, 1, 3};
+    const auto as_tokens_first = [&](const Tensor& tensor,
+                                     int32_t tokens) -> std::optional<Tensor> {
+      if (tokens == 1) {
+        if (const auto reshape =
+                ProducerWithCode(tensor, kLiteRtOpCodeTflReshape)) {
+          return reshape->Inputs()[0];
+        }
+      }
+      const auto transpose =
+          ProducerWithCode(tensor, kLiteRtOpCodeTflTranspose);
+      if (!transpose) {
+        return std::nullopt;
+      }
+      const auto perm = ReadInt32Constant(transpose->Inputs()[1]);
+      if (!perm || *perm != tokens_first) {
+        return std::nullopt;
+      }
+      return transpose->Inputs()[0];
+    };
+    const Tensor then = op.Inputs()[1];
+    auto then_type = then.RankedTensorType();
+    if (!then_type || then_type->Layout().Rank() != 4) {
+      return std::nullopt;
+    }
+    const int32_t tokens = then_type->Layout().Dimensions()[1];
+    const auto attention = as_tokens_first(then, tokens);
+    if (!attention) {
+      return std::nullopt;
+    }
+    const auto sdpa = ProducerWithCode(*attention, kLiteRtOpCodeShloComposite);
+    if (!sdpa || CompositeOpName(*sdpa) != "odml.sdpa_transposed") {
+      return std::nullopt;
+    }
+    const auto form = ParseQuantSdpa(*sdpa);
+    if (!form.has_value() || form->tokens != tokens ||
+        !TensorHasShape(then, {1, tokens, form->group * form->caches.heads,
+                               form->caches.depth}) ||
+        !TensorHasShape(op.Inputs()[0], {1, tokens, 1, 1})) {
+      return std::nullopt;
+    }
+    // The condition: whether the token's row of the composite's mask, as
+    // [1, n, 1, S], has a key.
+    const auto not_equal =
+        ProducerWithCode(op.Inputs()[0], kLiteRtOpCodeTflNotEqual);
+    if (!not_equal) {
+      return std::nullopt;
+    }
+    const auto no_key = ReadFloatScalar(not_equal->Inputs()[1]);
+    const auto reduce =
+        ProducerWithCode(not_equal->Inputs()[0], kLiteRtOpCodeTflReduceMax);
+    if (!no_key || *no_key != 0.0f || !reduce) {
+      return std::nullopt;
+    }
+    const auto axes = ReadInt32Constant(reduce->Inputs()[1]);
+    const auto cast =
+        ProducerWithCode(reduce->Inputs()[0], kLiteRtOpCodeTflCast);
+    if (!axes || axes->size() != 1 || ((*axes)[0] != 3 && (*axes)[0] != -1) ||
+        !cast ||
+        !TensorHasShape(cast->Inputs()[0], {1, tokens, 1, form->caches.seq})) {
+      return std::nullopt;
+    }
+    const Tensor mask = sdpa->Inputs()[3];
+    const Tensor rows = cast->Inputs()[0];
+    if (rows.Get() != mask.Get()) {
+      // A reshape of [1, 1, n, S] to [1, n, 1, S] keeps the rows' order.
+      auto moved = ProducerWithCode(rows, kLiteRtOpCodeTflReshape);
+      if (!moved) {
+        const auto transposed = as_tokens_first(rows, /*tokens=*/0);
+        if (!transposed || transposed->Get() != mask.Get()) {
+          return std::nullopt;
+        }
+      } else if (moved->Inputs()[0].Get() != mask.Get()) {
+        return std::nullopt;
+      }
+    }
+    return then;
+  }
+
+  // A layer of the quantized attention plugin; `name` names it in the engine.
+  Expected<nvinfer1::IPluginV3Layer*> AddQuantAttentionLayer(
+      const QuantAttentionOptions& options,
+      std::vector<nvinfer1::ITensor*> inputs, const char* name) {
+    for (const auto* input : inputs) {
+      if (input == nullptr) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "A quantized cache of the composite is not in the "
+                     "network");
+      }
+    }
+    TrtPtr<nvinfer1::IPluginV3> plugin(CreateQuantAttentionPlugin(options));
+    if (!plugin) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to create the CUDA quantized attention plugin");
+    }
+    auto* layer = tensorrt_rtx_1_5_0_99::AddPluginV3(*network_, inputs.data(),
+                                                     inputs.size(), *plugin);
+    if (layer == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to add the CUDA quantized attention plugin layer");
+    }
+    layer->setName(KeepName(UniqueName(name)));
+    owned_plugins_.push_back(std::move(plugin));
+    return layer;
+  }
+
+  // An updated cache of a composite over quantized caches: the raw tensor is
+  // the graph's output and what the attention composites read.
+  Expected<void> SetQuantCacheOutput(const Tensor& tensor,
+                                     nvinfer1::ITensor* out) {
+    if (out == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "The quantized attention plugin has no cache output");
+    }
+    raw_output_map_[tensor.Get()] = out;
+    return SetOutputTensor(tensor, out);
+  }
+
+  // Whether decode attentions alone read the caches a one-token
+  // odml.cache_update writes: every use of both results is an
+  // odml.sdpa_transposed that the plugin's decode kernel runs over exactly
+  // these caches. The first of them to be lowered then writes the token in
+  // its own launches (QuantAttentionMode::kUpdateAttention), and the update
+  // needs none.
+  static bool QuantCacheUpdateJoinsAttention(const Op& op,
+                                             const QuantCacheUpdate& form) {
+    if (form.tokens != 1) {
+      return false;
+    }
+    const auto& caches = form.caches;
+    for (int i = 0; i < 2; ++i) {
+      const auto uses = op.Outputs()[i].Uses();
+      if (uses.empty()) {
+        return false;
+      }
+      for (const auto& use : uses) {
+        const Op& reader = use.user;
+        if (reader.Code() != kLiteRtOpCodeShloComposite ||
+            CompositeOpName(reader) != "odml.sdpa_transposed") {
+          return false;
+        }
+        const auto sdpa = ParseQuantSdpa(reader);
+        if (!sdpa.has_value() ||
+            reader.Inputs()[1].Get() != op.Outputs()[0].Get() ||
+            reader.Inputs()[2].Get() != op.Outputs()[1].Get() ||
+            !LiteRtNvidiaQuantDecodeAttentionUpdateSupports(
+                sdpa->group * sdpa->tokens, caches.depth, caches.bits,
+                caches.seq)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // The token of an odml.cache_update as the plugin takes it: the keys and
+  // the values before their QUANTIZE and the two start indices.
+  struct QuantCacheToken {
+    nvinfer1::ITensor* keys = nullptr;
+    nvinfer1::ITensor* values = nullptr;
+    nvinfer1::ITensor* start_k = nullptr;
+    nvinfer1::ITensor* start_v = nullptr;
+    bool v_token_major = false;
+  };
+
+  Expected<QuantCacheToken> QuantCacheUpdateToken(
+      const Op& op, const QuantCacheUpdate& form) {
+    const auto& caches = form.caches;
+    QuantCacheToken token;
+    bool token_major = false;
+    LITERT_ASSIGN_OR_RETURN(
+        token.keys,
+        QuantizedRowsAsFloat(op.Inputs()[0], /*columns=*/false, caches.heads,
+                             form.tokens, caches.depth, &token_major));
+    if (token_major) {
+      return Error(kLiteRtStatusErrorUnsupported,
+                   "Quantized cache update keys must be rows of heads");
+    }
+    LITERT_ASSIGN_OR_RETURN(
+        token.values,
+        QuantizedRowsAsFloat(op.Inputs()[1], /*columns=*/false, caches.heads,
+                             form.tokens, caches.depth, &token.v_token_major));
+    LITERT_ASSIGN_OR_RETURN(token.start_k, GetTensor(op.Inputs()[5]));
+    LITERT_ASSIGN_OR_RETURN(token.start_v, GetTensor(op.Inputs()[6]));
+    return token;
+  }
+
+  // odml.cache_update over quantized caches (ParseQuantCacheUpdate): one
+  // plugin launch quantizes the step's keys and values and writes them into
+  // both caches at the start indices. A decode block's update waits for the
+  // attention that reads its caches instead (QuantCacheUpdateJoinsAttention).
+  Expected<void> LowerQuantCacheUpdate(const Op& op,
+                                       const QuantCacheUpdate& form) {
+    if (QuantCacheUpdateJoinsAttention(op, form)) {
+      joined_quant_cache_updates_.emplace(op.Outputs()[0].Get(), op);
+      return {};
+    }
+    return AddQuantCacheUpdate(op, form);
+  }
+
+  // The cache updates no attention took (their readers were not lowered as
+  // such): a layer of their own, before the graph's outputs are marked.
+  Expected<void> AddUnjoinedQuantCacheUpdates() {
+    // In the graph's order: the layers' names do not depend on the map's.
+    std::vector<Op> left;
+    for (const auto& [cache, op] : joined_quant_cache_updates_) {
+      left.push_back(op);
+    }
+    joined_quant_cache_updates_.clear();
+    std::sort(left.begin(), left.end(), [this](const Op& a, const Op& b) {
+      return op_order_[a.Get()] < op_order_[b.Get()];
+    });
+    for (const Op& op : left) {
+      const auto form = ParseQuantCacheUpdate(op);
+      if (!form.has_value()) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "A deferred quantized cache update no longer parses");
+      }
+      LITERT_RETURN_IF_ERROR(AddQuantCacheUpdate(op, *form));
+    }
+    return {};
+  }
+
+  Expected<void> AddQuantCacheUpdate(const Op& op,
+                                     const QuantCacheUpdate& form) {
+    const auto& caches = form.caches;
+    LITERT_ASSIGN_OR_RETURN(const QuantCacheToken token,
+                            QuantCacheUpdateToken(op, form));
+    QuantAttentionOptions options;
+    options.mode = QuantAttentionMode::kCacheUpdate;
+    options.quant = {1.0f, caches.k_scale, caches.v_scale, caches.bits};
+    options.v_token_major = token.v_token_major;
+    LITERT_ASSIGN_OR_RETURN(
+        auto* layer, AddQuantAttentionLayer(
+                         options,
+                         {raw_input_map_[op.Inputs()[3].Get()],
+                          raw_input_map_[op.Inputs()[4].Get()], token.keys,
+                          token.values, token.start_k, token.start_v},
+                         "cuda_quant_cache_update"));
+    LITERT_RETURN_IF_ERROR(
+        SetQuantCacheOutput(op.Outputs()[0], layer->getOutput(0)));
+    return SetQuantCacheOutput(op.Outputs()[1], layer->getOutput(1));
+  }
+
+  // odml.sdpa_transposed over quantized caches (ParseQuantSdpa): the query
+  // heads of a KV head become its rows, head-major, which is the order the
+  // plugin's mask rows repeat in.
+  Expected<void> LowerQuantSdpa(const Op& op, const QuantSdpa& form) {
+    const auto& caches = form.caches;
+    const nvinfer1::Dims grouped{
+        4, {1, caches.heads, form.group * form.tokens, caches.depth}};
+    LITERT_ASSIGN_OR_RETURN(auto* q,
+                            QuantizedQueryAsFloat(op.Inputs()[0], grouped));
+    LITERT_ASSIGN_OR_RETURN(auto* mask, GetTensor(op.Inputs()[3]));
+    QuantAttentionOptions options;
+    options.mode = QuantAttentionMode::kAttention;
+    options.quant = {form.q_scale, caches.k_scale, caches.v_scale, caches.bits};
+    nvinfer1::IPluginV3Layer* layer = nullptr;
+    if (const auto joined =
+            joined_quant_cache_updates_.find(op.Inputs()[1].Get());
+        joined != joined_quant_cache_updates_.end()) {
+      // The first attention over the caches of a decode block's update
+      // writes its token: the layer's cache outputs are the updated caches,
+      // which the graph returns and the later attentions read.
+      const Op update = joined->second;
+      joined_quant_cache_updates_.erase(joined);
+      const auto update_form = ParseQuantCacheUpdate(update);
+      if (!update_form.has_value()) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "A deferred quantized cache update no longer parses");
+      }
+      LITERT_ASSIGN_OR_RETURN(const QuantCacheToken token,
+                              QuantCacheUpdateToken(update, *update_form));
+      options.mode = QuantAttentionMode::kUpdateAttention;
+      options.v_token_major = token.v_token_major;
+      LITERT_ASSIGN_OR_RETURN(
+          layer, AddQuantAttentionLayer(
+                     options,
+                     {q, raw_input_map_[update.Inputs()[3].Get()],
+                      raw_input_map_[update.Inputs()[4].Get()], mask,
+                      token.keys, token.values, token.start_k, token.start_v},
+                     "cuda_quant_update_attention"));
+      LITERT_RETURN_IF_ERROR(
+          SetQuantCacheOutput(update.Outputs()[0], layer->getOutput(1)));
+      LITERT_RETURN_IF_ERROR(
+          SetQuantCacheOutput(update.Outputs()[1], layer->getOutput(2)));
+    } else {
+      LITERT_ASSIGN_OR_RETURN(
+          layer,
+          AddQuantAttentionLayer(options,
+                                 {q, RawInt8Cache(op.Inputs()[1].Get()),
+                                  RawInt8Cache(op.Inputs()[2].Get()), mask},
+                                 "cuda_quant_attention"));
+    }
+    LITERT_ASSIGN_OR_RETURN(auto output_type,
+                            op.Outputs()[0].RankedTensorType());
+    LITERT_ASSIGN_OR_RETURN(auto output_dims, ConvertDims(output_type));
+    LITERT_ASSIGN_OR_RETURN(auto* out,
+                            ReshapeTensor(layer->getOutput(0), output_dims));
+    return SetOutputTensor(op.Outputs()[0], out);
+  }
+
+  // odml.fused_sdpa_cache_update (ParseQuantFusedSdpa): one plugin layer
+  // attends to the ring caches and the chunk's keys, then writes the chunk
+  // into the ring.
+  Expected<void> LowerQuantFusedSdpa(const Op& op, const QuantFusedSdpa& form) {
+    const auto& caches = form.caches;
+    LITERT_ASSIGN_OR_RETURN(
+        auto* q,
+        QuantizedQueryAsFloat(
+            op.Inputs()[0],
+            nvinfer1::Dims{4, {1, caches.heads, form.rows, caches.depth}}));
+    bool token_major = false;
+    LITERT_ASSIGN_OR_RETURN(
+        auto* keys,
+        QuantizedRowsAsFloat(op.Inputs()[3], /*columns=*/false, caches.heads,
+                             form.tokens, caches.depth, &token_major));
+    if (token_major) {
+      return Error(kLiteRtStatusErrorUnsupported,
+                   "Fused attention keys must be rows of heads");
+    }
+    LITERT_ASSIGN_OR_RETURN(
+        auto* values,
+        QuantizedRowsAsFloat(op.Inputs()[4], /*columns=*/true, caches.heads,
+                             form.tokens, caches.depth, &token_major));
+    LITERT_ASSIGN_OR_RETURN(auto* mask, GetTensor(op.Inputs()[5]));
+    LITERT_ASSIGN_OR_RETURN(auto* params, GetTensor(op.Inputs()[6]));
+    QuantAttentionOptions options;
+    options.mode = QuantAttentionMode::kFusedAttentionUpdate;
+    options.quant = {form.q_scale, caches.k_scale, caches.v_scale, caches.bits};
+    options.v_token_major = token_major;
+    options.update_cache = form.update_cache;
+    LITERT_ASSIGN_OR_RETURN(
+        auto* layer,
+        AddQuantAttentionLayer(
+            options,
+            {q, raw_input_map_[op.Inputs()[1].Get()],
+             raw_input_map_[op.Inputs()[2].Get()], mask, keys, values, params},
+            "cuda_quant_fused_attention"));
+    LITERT_RETURN_IF_ERROR(
+        SetOutputTensor(op.Outputs()[0], layer->getOutput(0)));
+    LITERT_RETURN_IF_ERROR(
+        SetQuantCacheOutput(op.Outputs()[1], layer->getOutput(1)));
+    return SetQuantCacheOutput(op.Outputs()[2], layer->getOutput(2));
+  }
+
   // odml.runtime_bmm(a, cache, positions) = a @ dequantize(cache)^T over the
   // full context (window-equivalent; see IsCompositeSupported).
   Expected<void> LowerCompositeRuntimeBmm(const Op& op) {
@@ -9478,7 +11078,11 @@ class TensorRtGraphBuilder {
   //   top_weights  <- [reshape] <- div(topk.0, sum(topk.0)) | topk.0
   //   router_in    <- [mul c]* <- [reshape] <- rms_norm(X, w_router)
   //   x            <- [reshape] <- rms_norm(X, w_experts)
-  // with one residual X. The fused plugin takes X and does all of it.
+  // with one residual X; or, as the export with a fused feed-forward selects
+  // before it normalizes,
+  //   top_indices  <- topk(fc(router_in, W_router)).1
+  //   top_weights  <- softmax(topk.0)
+  // The fused plugin takes X and does all of it.
   struct MoeRouting {
     Tensor residual;
     Tensor router_norm;
@@ -9538,28 +11142,45 @@ class TensorRtGraphBuilder {
     }
     const auto k = ReadInt32Constant(topk->Inputs()[1]);
     if (!k || k->size() != 1 || (*k)[0] != moe.top_k) return std::nullopt;
-    // Its values, renormalized by their sum.
+    const auto is_plain_softmax = [](const Op& candidate) {
+      float beta = 1.0f;
+      return candidate.Code() == kLiteRtOpCodeTflSoftmax &&
+             !candidate.Inputs().empty() &&
+             LiteRtGetSoftmaxBetaOption(candidate.Get(), &beta) ==
+                 kLiteRtStatusOk &&
+             beta == 1.0f;
+    };
     const Tensor weights = StripReshapes(op.Inputs()[1]);
-    auto div = weights.GetDefiningOp();
-    if (!div || div->Code() != kLiteRtOpCodeTflDiv ||
-        div->Inputs().size() != 2 || !HasNoFusedActivation(*div) ||
-        StripReshapes(div->Inputs()[0]).Get() != topk->Outputs()[0].Get()) {
-      return std::nullopt;
+    const auto normalized = weights.GetDefiningOp();
+    if (!normalized) return std::nullopt;
+    Tensor logits = topk->Inputs()[0];
+    if (is_plain_softmax(*normalized)) {
+      // The softmax of the selected logits: the same weights as the selected
+      // probabilities over their sum.
+      if (StripReshapes(normalized->Inputs()[0]).Get() !=
+          topk->Outputs()[0].Get()) {
+        return std::nullopt;
+      }
+    } else {
+      // Its values, renormalized by their sum.
+      if (normalized->Code() != kLiteRtOpCodeTflDiv ||
+          normalized->Inputs().size() != 2 ||
+          !HasNoFusedActivation(*normalized) ||
+          StripReshapes(normalized->Inputs()[0]).Get() !=
+              topk->Outputs()[0].Get()) {
+        return std::nullopt;
+      }
+      auto sum = StripReshapes(normalized->Inputs()[1]).GetDefiningOp();
+      if (!sum || sum->Code() != kLiteRtOpCodeTflSum || sum->Inputs().empty() ||
+          StripReshapes(sum->Inputs()[0]).Get() != topk->Outputs()[0].Get()) {
+        return std::nullopt;
+      }
+      // softmax(fc(router_in, W)) with a plain softmax.
+      auto softmax = StripReshapes(logits).GetDefiningOp();
+      if (!softmax || !is_plain_softmax(*softmax)) return std::nullopt;
+      logits = softmax->Inputs()[0];
     }
-    auto sum = StripReshapes(div->Inputs()[1]).GetDefiningOp();
-    if (!sum || sum->Code() != kLiteRtOpCodeTflSum || sum->Inputs().empty() ||
-        StripReshapes(sum->Inputs()[0]).Get() != topk->Outputs()[0].Get()) {
-      return std::nullopt;
-    }
-    // softmax(fc(router_in, W)) with a plain softmax.
-    auto softmax = StripReshapes(topk->Inputs()[0]).GetDefiningOp();
-    float beta = 1.0f;
-    if (!softmax || softmax->Code() != kLiteRtOpCodeTflSoftmax ||
-        LiteRtGetSoftmaxBetaOption(softmax->Get(), &beta) != kLiteRtStatusOk ||
-        beta != 1.0f) {
-      return std::nullopt;
-    }
-    auto fc = StripReshapes(softmax->Inputs()[0]).GetDefiningOp();
+    auto fc = StripReshapes(logits).GetDefiningOp();
     if (!fc || fc->Code() != kLiteRtOpCodeTflFullyConnected ||
         fc->Inputs().size() != 2 || !HasNoFusedActivation(*fc) ||
         !IsBlockwiseInt4Weights(fc->Inputs()[1])) {
@@ -9635,10 +11256,16 @@ class TensorRtGraphBuilder {
   //   ADD(rms_norm(dense, w_dp), rms_norm(moe, w_mp)) -> rms_norm(w_sp)
   //   ADD(X, that) [-> MUL scalar] = the next residual stream.
   // Every intermediate has that one reader; the dense chain has no reshapes.
+  // The export with a fused feed-forward has one projection over the gate and
+  // up rows stacked and odml.swiglu (tanh GELU) for the gate and the product:
+  //   dense = down(swiglu(gate_up(N)))
   struct MoeBlockFusion {
     Tensor dense_norm;    // the dense input norm's scale
     Tensor dense_gate_w;  // [dense_hidden, model_dim], blockwise INT4
     Tensor dense_up_w;
+    // dense_gate_w and dense_up_w are one tensor [2 * dense_hidden,
+    // model_dim], the gate rows first.
+    bool dense_stacked = false;
     Tensor dense_down_w;  // [model_dim, dense_hidden]
     Tensor dense_post;    // the dense output norm's scale
     Tensor moe_post;      // the experts' output norm's scale
@@ -9707,47 +11334,71 @@ class TensorRtGraphBuilder {
     }
     block.dense_down_w = down->Inputs()[1];
     block.absorbed.push_back(down->Get());
-    const auto mul = down->Inputs()[0].GetDefiningOp();
-    if (!mul || mul->Code() != kLiteRtOpCodeTflMul ||
-        mul->Inputs().size() != 2 || !HasNoFusedActivation(*mul)) {
-      return std::nullopt;
-    }
-    block.absorbed.push_back(mul->Get());
-    std::optional<Op> gelu;
-    std::optional<Op> up;
-    for (int i = 0; i < 2; ++i) {
-      if (!ReadOnce(mul->Inputs()[i])) return std::nullopt;
-      const auto producer = mul->Inputs()[i].GetDefiningOp();
-      if (!producer) return std::nullopt;
-      if (producer->Code() == kLiteRtOpCodeTflGelu) {
-        gelu = *producer;
-      } else if (producer->Code() == kLiteRtOpCodeTflFullyConnected) {
-        up = *producer;
+    const auto gated = down->Inputs()[0].GetDefiningOp();
+    if (!gated) return std::nullopt;
+    Tensor dense_in;
+    if (gated->Code() == kLiteRtOpCodeShloComposite &&
+        CompositeOpName(*gated) == "odml.swiglu") {
+      // The fused export: one projection over the gate and up rows stacked,
+      // gated by odml.swiglu with the tanh GELU.
+      const auto swiglu = ParseSwiglu(*gated);
+      if (!swiglu.has_value() ||
+          swiglu->activation != kLiteRtNvidiaGemmGateGeluTanh ||
+          !ReadOnce(gated->Inputs()[0])) {
+        return std::nullopt;
       }
+      const auto gate_up = gated->Inputs()[0].GetDefiningOp();
+      if (!gate_up || !is_fc(*gate_up)) return std::nullopt;
+      block.gate_mode = 1;
+      block.dense_stacked = true;
+      block.absorbed.push_back(gated->Get());
+      block.absorbed.push_back(gate_up->Get());
+      block.dense_gate_w = gate_up->Inputs()[1];
+      block.dense_up_w = gate_up->Inputs()[1];
+      dense_in = gate_up->Inputs()[0];
+    } else {
+      if (gated->Code() != kLiteRtOpCodeTflMul || gated->Inputs().size() != 2 ||
+          !HasNoFusedActivation(*gated)) {
+        return std::nullopt;
+      }
+      block.absorbed.push_back(gated->Get());
+      std::optional<Op> gelu;
+      std::optional<Op> up;
+      for (int i = 0; i < 2; ++i) {
+        if (!ReadOnce(gated->Inputs()[i])) return std::nullopt;
+        const auto producer = gated->Inputs()[i].GetDefiningOp();
+        if (!producer) return std::nullopt;
+        if (producer->Code() == kLiteRtOpCodeTflGelu) {
+          gelu = *producer;
+        } else if (producer->Code() == kLiteRtOpCodeTflFullyConnected) {
+          up = *producer;
+        }
+      }
+      if (!gelu || !up || gelu->Inputs().size() != 1 || !is_fc(*up) ||
+          !ReadOnce(gelu->Inputs()[0])) {
+        return std::nullopt;
+      }
+      bool approximate = false;
+      if (LiteRtGetGeluApproximateOption(gelu->Get(), &approximate) !=
+          kLiteRtStatusOk) {
+        return std::nullopt;
+      }
+      block.gate_mode = approximate ? 1 : 2;
+      block.absorbed.push_back(gelu->Get());
+      block.absorbed.push_back(up->Get());
+      const auto gate = gelu->Inputs()[0].GetDefiningOp();
+      if (!gate || !is_fc(*gate) ||
+          gate->Inputs()[0].Get() != up->Inputs()[0].Get()) {
+        return std::nullopt;
+      }
+      block.absorbed.push_back(gate->Get());
+      block.dense_gate_w = gate->Inputs()[1];
+      block.dense_up_w = up->Inputs()[1];
+      dense_in = gate->Inputs()[0];
     }
-    if (!gelu || !up || gelu->Inputs().size() != 1 || !is_fc(*up) ||
-        !ReadOnce(gelu->Inputs()[0])) {
-      return std::nullopt;
-    }
-    bool approximate = false;
-    if (LiteRtGetGeluApproximateOption(gelu->Get(), &approximate) !=
-        kLiteRtStatusOk) {
-      return std::nullopt;
-    }
-    block.gate_mode = approximate ? 1 : 2;
-    block.absorbed.push_back(gelu->Get());
-    block.absorbed.push_back(up->Get());
-    const auto gate = gelu->Inputs()[0].GetDefiningOp();
-    if (!gate || !is_fc(*gate) ||
-        gate->Inputs()[0].Get() != up->Inputs()[0].Get()) {
-      return std::nullopt;
-    }
-    block.absorbed.push_back(gate->Get());
-    block.dense_gate_w = gate->Inputs()[1];
-    block.dense_up_w = up->Inputs()[1];
-    const Tensor dense_in = gate->Inputs()[0];
+    // Its readers: the gate and the up projection, or the one stacked one.
     if (graph_outputs_.count(dense_in.Get()) != 0 ||
-        dense_in.Uses().size() != 2) {
+        dense_in.Uses().size() != (block.dense_stacked ? 1u : 2u)) {
       return std::nullopt;
     }
     const auto dense_in_norm = dense_in.GetDefiningOp();
@@ -9767,11 +11418,15 @@ class TensorRtGraphBuilder {
     const auto dd = down_type->Layout().Dimensions();
     if (gd.size() != 2 || ud.size() != 2 || dd.size() != 2 ||
         gd[1] != moe.model_dim || ud[1] != moe.model_dim || ud[0] != gd[0] ||
-        dd[0] != moe.model_dim || dd[1] != gd[0] || gd[0] < 32 ||
-        gd[0] % 32 != 0) {
+        (block.dense_stacked && gd[0] % 2 != 0)) {
       return std::nullopt;
     }
-    block.dense_hidden = gd[0];
+    const int32_t dense_hidden = block.dense_stacked ? gd[0] / 2 : gd[0];
+    if (dd[0] != moe.model_dim || dd[1] != dense_hidden || dense_hidden < 32 ||
+        dense_hidden % 32 != 0) {
+      return std::nullopt;
+    }
+    block.dense_hidden = dense_hidden;
     // ADD1 -> rms_norm(w_sp) -> ADD2(X, .) [-> MUL scalar]
     const auto sum_norm = SoleUser(add1->Outputs()[0], &block.absorbed);
     if (!sum_norm || !is_norm(*sum_norm)) return std::nullopt;
@@ -10477,31 +12132,46 @@ class TensorRtGraphBuilder {
     return SetStatefulPluginOutputs(op, layer, name);
   }
 
-  // odml.swiglu(x) = silu(x[.., :N]) * x[.., N:] where its fully connected
+  // odml.swiglu(x) = act(x[.., :N]) * x[.., N:] where its fully connected
   // producer did not absorb it (FindFusedSwiglu): its slices and gates.
   Expected<void> LowerCompositeSwiglu(const Op& op) {
-    const auto gate_size = SwigluGateSize(op);
-    if (!gate_size.has_value()) {
+    const auto parsed = ParseSwiglu(op);
+    if (!parsed.has_value()) {
       return Error(kLiteRtStatusErrorUnsupported,
                    "Unsupported swiglu composite");
     }
     LITERT_ASSIGN_OR_RETURN(auto* x, GetTensor(op.Inputs()[0]));
     const int axis = x->getDimensions().nbDims - 1;
     LITERT_ASSIGN_OR_RETURN(auto* gate,
-                            SliceTensorAxis(x, axis, 0, *gate_size));
-    LITERT_ASSIGN_OR_RETURN(auto* up,
-                            SliceTensorAxis(x, axis, *gate_size, *gate_size));
-    auto* sigmoid =
-        network_->addActivation(*gate, nvinfer1::ActivationType::kSIGMOID);
-    if (sigmoid == nullptr || sigmoid->getOutput(0) == nullptr) {
-      return Error(kLiteRtStatusErrorCompilation, "Failed to add swiglu gate");
+                            SliceTensorAxis(x, axis, 0, parsed->gate_size));
+    LITERT_ASSIGN_OR_RETURN(
+        auto* up,
+        SliceTensorAxis(x, axis, parsed->gate_size, parsed->gate_size));
+    nvinfer1::ITensor* gated = nullptr;
+    if (parsed->activation == kLiteRtNvidiaGemmGateGeluTanh) {
+      auto* gelu =
+          network_->addActivation(*gate, nvinfer1::ActivationType::kGELU_TANH);
+      if (gelu == nullptr || gelu->getOutput(0) == nullptr) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "Failed to add swiglu gate");
+      }
+      gated = gelu->getOutput(0);
+    } else {
+      auto* sigmoid =
+          network_->addActivation(*gate, nvinfer1::ActivationType::kSIGMOID);
+      if (sigmoid == nullptr || sigmoid->getOutput(0) == nullptr) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "Failed to add swiglu gate");
+      }
+      auto* silu = network_->addElementWise(
+          *gate, *sigmoid->getOutput(0), nvinfer1::ElementWiseOperation::kPROD);
+      if (silu == nullptr || silu->getOutput(0) == nullptr) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "Failed to add swiglu silu");
+      }
+      gated = silu->getOutput(0);
     }
-    auto* silu = network_->addElementWise(
-        *gate, *sigmoid->getOutput(0), nvinfer1::ElementWiseOperation::kPROD);
-    if (silu == nullptr || silu->getOutput(0) == nullptr) {
-      return Error(kLiteRtStatusErrorCompilation, "Failed to add swiglu silu");
-    }
-    auto* out = network_->addElementWise(*silu->getOutput(0), *up,
+    auto* out = network_->addElementWise(*gated, *up,
                                          nvinfer1::ElementWiseOperation::kPROD);
     if (out == nullptr || out->getOutput(0) == nullptr) {
       return Error(kLiteRtStatusErrorCompilation,
@@ -10673,10 +12343,16 @@ class TensorRtGraphBuilder {
           break;
         }
         scale_type = type;
-        source.offsets[weight_pieces[i]] = *offset;
-        source.sizes[weight_pieces[i]] = bytes.size();
-        source.offsets[scale_pieces[i]] = *scale_offset;
-        source.sizes[scale_pieces[i]] = scale_bytes.size();
+        // The halves of a stacked projection are the gate and the up piece.
+        const bool half = block->dense_stacked && i < 2;
+        const size_t weight_size = half ? bytes.size() / 2 : bytes.size();
+        const size_t scale_size =
+            half ? scale_bytes.size() / 2 : scale_bytes.size();
+        const size_t skipped = half && i == 1 ? 1 : 0;
+        source.offsets[weight_pieces[i]] = *offset + skipped * weight_size;
+        source.sizes[weight_pieces[i]] = weight_size;
+        source.offsets[scale_pieces[i]] = *scale_offset + skipped * scale_size;
+        source.sizes[scale_pieces[i]] = scale_size;
       }
       if (in_file) {
         source.dense_scale_type = scale_type;
@@ -10779,6 +12455,1955 @@ class TensorRtGraphBuilder {
     return SetOutputTensor(op.Outputs()[0], layer->getOutput(0));
   }
 
+  // ===========================================================================
+  // Statically quantized products (trtllm/quant_linear.h,
+  // quant_linear_plugin.h).
+  //
+  // Such a model keeps INT8 activations through every product: QUANTIZE ->
+  // FULLY_CONNECTED or BATCH_MATMUL (INT4 per-channel or centered INT2 weights,
+  // an INT8 result with its own scale) -> DEQUANTIZE, with the RMS norms, the
+  // residual update and the rotary embedding in floats between them. The
+  // rounding of every INT8 result is part of the trained function, so these ops
+  // do not take the FP16-activation lowering, which carries INT8 tensors as
+  // reals. FindQuantRegions matches the model's op sequences and replaces each
+  // with layers of the quant plugin, which round as LiteRT's CPU kernels do:
+  //   projections  FULLY_CONNECTED ops that read one INT8 tensor, one launch
+  //   MLP          a factorized MLP, four launches (MatchQuantFactorizedMlp,
+  //                LowerQuantFactorizedMlp)
+  //   glue         the float steps in front of a QUANTIZE, one launch, or
+  //                part of the projections' launch that reads its result
+  //   qkv rope     the head norms and odml.rope behind q, k and v, one launch
+  //   head         the vocabulary product behind its dynamic quantization
+  // INT8 results stay INT8 between the layers (quant_values_) and float ones
+  // FLOAT16. A region's ops are not lowered one by one: the region is emitted
+  // at its first op, by which its inputs exist.
+
+  // The INT8 values of a model tensor that a quant layer produced: columns
+  // [offset, offset + width) of the rows of `int8`.
+  struct QuantValue {
+    nvinfer1::ITensor* int8 = nullptr;
+    int32_t offset = 0;
+    int32_t width = 0;
+    float scale = 0.0f;
+  };
+
+  // FLOAT16 -> CAST -> odml.rms_norm -> CAST -> FLOAT16.
+  struct QuantNorm {
+    Tensor input;
+    Tensor weights;
+    float eps = 1e-6f;
+  };
+
+  // The float steps that end in the FLOAT16 tensor a QUANTIZE or the head
+  // reads (LiteRtNvidiaQuantGlueParams): an optional residual update
+  //   x' = x * c_x + rms_norm(DEQUANTIZE(branch)) * c_y
+  // and an optional RMS norm of the result.
+  struct QuantGlueChain {
+    std::optional<Tensor> x;
+    std::optional<Tensor> updated;  // x'
+    std::optional<Tensor> branch;   // INT8, or the FLOAT16 of a quant layer
+    std::optional<QuantNorm> branch_norm;
+    float c_x = 1.0f;
+    float c_y = 1.0f;
+    std::optional<QuantNorm> norm;
+    std::optional<Tensor> normed;  // the norm's FLOAT16 result
+    std::vector<LiteRtOp> members;
+  };
+
+  struct QuantGlue {
+    QuantGlueChain chain;
+    // The QUANTIZE's INT8 result, or the FLOAT16 x of a carved factorized MLP,
+    // whose QUANTIZE is inside the composite; and its INT8 scale.
+    std::optional<Tensor> quantized;
+    float scale = 0.0f;
+  };
+
+  // A glue as a layer runs it (PrepareQuantGlue): its kernel parameters,
+  // its inputs (x, then y and the branch norm's weights, then the norm's
+  // weights) and its outputs (the QuantGlueOutput mask).
+  struct QuantGlueLayer {
+    const QuantGlueChain* chain = nullptr;
+    LiteRtNvidiaQuantGlueParams params = {};
+    std::vector<nvinfer1::ITensor*> inputs;
+    int32_t outputs = 0;
+  };
+
+  struct QuantProjections {
+    std::optional<Tensor> input;
+    std::vector<Op> ops;  // in row order
+    // The glue (quant_glues_) whose INT8 result is `input`, run by the
+    // product's launch.
+    std::optional<size_t> glue;
+  };
+
+  // A factorized MLP on INT8 activations, all weights centered INT2:
+  //   x [m, 2 C] -> two FULLY_CONNECTED [R1, C] over its halves, regrouped
+  //   per block [m, B, 2 R1 / B] -> BATCH_MATMUL [B, 2 R1 / B, N] -> SiLU ->
+  //   BATCH_MATMUL [B, N, 2 D] -> its halves [m, B D] each -> two
+  //   FULLY_CONNECTED [R4, B D] -> y [m, 2 R4].
+  struct QuantFactorizedMlp {
+    // x: an INT8 tensor, or a float one to quantize with scales[0].
+    std::optional<Tensor> input;
+    // up-1 a, up-1 b, up-2, down-1, down-2 a, down-2 b.
+    std::vector<Tensor> weights;
+    // The INT8 scales of x, up-1, up-2, the SiLU, down-1 and down-2 (y).
+    float scales[6] = {};
+    // y: the INT8 result, or the FLOAT16 tensor its DEQUANTIZE makes.
+    std::optional<Tensor> output;
+    // The glue (quant_glues_) whose INT8 result is x, run by the MLP's
+    // launch.
+    std::optional<size_t> glue;
+  };
+
+  struct QuantQkvRope {
+    size_t projections = 0;
+    // Per projection in row order: its role (0 q, 1 k, 2 v), the head norm
+    // and the FLOAT16 result (behind the rotation and the query multiplier).
+    std::vector<int> roles;
+    std::vector<QuantNorm> norms;
+    std::vector<Tensor> outputs;
+    std::optional<Tensor> positions;
+    QuantRope rope;
+    int32_t depth = 0;
+    float q_multiplier = 1.0f;
+  };
+
+  struct QuantHead {
+    QuantGlueChain chain;
+    std::optional<Op> product;
+    std::optional<Tensor> logits;  // behind the soft cap when it matched
+    float cap_in = 0.0f;
+    float cap_out = 0.0f;
+  };
+
+  enum class QuantRegionKind {
+    kProjections,
+    kFactorizedMlp,
+    kGlue,
+    kQkvRope,
+    kHead
+  };
+  struct QuantRegion {
+    QuantRegionKind kind;
+    size_t index;
+  };
+
+  static float RoundFp16(float value) {
+    return HalfBitsToFloat(Fp32ToFp16Bits(value));
+  }
+
+  static int32_t QuantTypeOf(const nvinfer1::ITensor* tensor) {
+    switch (tensor->getType()) {
+      case nvinfer1::DataType::kINT8:
+        return kLiteRtNvidiaQuantInt8;
+      case nvinfer1::DataType::kHALF:
+        return kLiteRtNvidiaQuantFp16;
+      case nvinfer1::DataType::kBF16:
+        return kLiteRtNvidiaQuantBf16;
+      default:
+        return kLiteRtNvidiaQuantFp32;
+    }
+  }
+
+  static int64_t QuantElements(const nvinfer1::ITensor* tensor) {
+    const auto dims = tensor->getDimensions();
+    int64_t count = 1;
+    for (int i = 0; i < dims.nbDims; ++i) count *= dims.d[i];
+    return count;
+  }
+
+  // `tensor` as rows [m, width].
+  Expected<nvinfer1::ITensor*> QuantRows(nvinfer1::ITensor* tensor,
+                                         int64_t width) {
+    const auto dims = tensor->getDimensions();
+    const int64_t count = QuantElements(tensor);
+    if (width <= 0 || count <= 0 || count % width != 0) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "A quantized product's tensor does not hold whole rows");
+    }
+    if (dims.nbDims == 2 && dims.d[1] == width) return tensor;
+    nvinfer1::Dims rows{};
+    rows.nbDims = 2;
+    rows.d[0] = count / width;
+    rows.d[1] = width;
+    return ReshapeTensor(tensor, rows);
+  }
+
+  // The rows [m, width] of the INT8 values of one tensor.
+  Expected<nvinfer1::ITensor*> QuantInt8Rows(const QuantValue& value) {
+    const auto dims = value.int8->getDimensions();
+    if (dims.nbDims != 2) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Quant layer results are rows");
+    }
+    if (value.offset == 0 && dims.d[1] == value.width) return value.int8;
+    nvinfer1::Dims start{};
+    start.nbDims = 2;
+    start.d[1] = value.offset;
+    nvinfer1::Dims size{};
+    size.nbDims = 2;
+    size.d[0] = dims.d[0];
+    size.d[1] = value.width;
+    nvinfer1::Dims stride{};
+    stride.nbDims = 2;
+    stride.d[0] = stride.d[1] = 1;
+    auto* layer = network_->addSlice(*value.int8, start, size, stride);
+    if (layer == nullptr || layer->getOutput(0) == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to slice a quant layer's result");
+    }
+    return layer->getOutput(0);
+  }
+
+  // The float value of `tensor` at the best precision the network has: the
+  // FLOAT16 a quant layer made, a float network input as the runtime gives
+  // it (also behind the model's CAST to FLOAT16: the kernels round as the
+  // cast does), else the activation-typed tensor, which the FP16-activation
+  // mode may have narrowed.
+  Expected<nvinfer1::ITensor*> QuantFloatSource(const Tensor& tensor) {
+    if (auto it = quant_floats_.find(tensor.Get()); it != quant_floats_.end()) {
+      return it->second;
+    }
+    const auto raw_float = [&](const Tensor& input) -> nvinfer1::ITensor* {
+      const auto raw = raw_input_map_.find(input.Get());
+      return raw != raw_input_map_.end() &&
+                     (raw->second->getType() == nvinfer1::DataType::kFLOAT ||
+                      raw->second->getType() == nvinfer1::DataType::kHALF)
+                 ? raw->second
+                 : nullptr;
+    };
+    if (auto* raw = raw_float(tensor); raw != nullptr) {
+      return raw;
+    }
+    if (auto cast = tensor.GetDefiningOp();
+        cast && cast->Code() == kLiteRtOpCodeTflCast &&
+        tensor.ElementType() == litert::ElementType::Float16 &&
+        cast->Inputs().size() == 1) {
+      if (auto* raw = raw_float(cast->Inputs()[0]); raw != nullptr) {
+        return raw;
+      }
+    }
+    return GetTensor(tensor);
+  }
+
+  // Records the FLOAT16 result of a quant layer as the value of `tensor`.
+  Expected<void> SetQuantFloat(const Tensor& tensor, nvinfer1::ITensor* value) {
+    quant_floats_[tensor.Get()] = value;
+    return SetOutputTensor(tensor, value);
+  }
+
+  // The activation rows a product reads through its INT8 tensor `input`:
+  // the INT8 values a quant layer made, or the float input of its QUANTIZE
+  // for the kernel to quantize.
+  struct QuantActivation {
+    nvinfer1::ITensor* rows = nullptr;
+    int32_t type = kLiteRtNvidiaQuantInt8;
+    float quantize_scale = 0.0f;
+  };
+
+  Expected<QuantActivation> GetQuantActivation(const Tensor& input,
+                                               int64_t width) {
+    Tensor tensor = input;
+    // The transposes between the QUANTIZE and the product (the prefill's
+    // attention output is quantized head-major), last first.
+    std::vector<Op> transposes;
+    for (int hops = 0; hops < 6; ++hops) {
+      if (auto it = quant_values_.find(tensor.Get());
+          it != quant_values_.end() && transposes.empty()) {
+        LITERT_ASSIGN_OR_RETURN(auto* rows, QuantInt8Rows(it->second));
+        LITERT_ASSIGN_OR_RETURN(rows, QuantRows(rows, width));
+        return QuantActivation{rows, kLiteRtNvidiaQuantInt8, 0.0f};
+      }
+      if (auto raw = raw_input_map_.find(tensor.Get());
+          raw != raw_input_map_.end() && transposes.empty() &&
+          raw->second->getType() == nvinfer1::DataType::kINT8) {
+        LITERT_ASSIGN_OR_RETURN(auto* rows, QuantRows(raw->second, width));
+        return QuantActivation{rows, kLiteRtNvidiaQuantInt8, 0.0f};
+      }
+      auto producer = tensor.GetDefiningOp();
+      if (!producer || producer->Inputs().empty()) break;
+      if (producer->Code() == kLiteRtOpCodeTflQuantize) {
+        // Rounding commutes with moving elements: the float input takes the
+        // transposes and the kernel quantizes what the product reads.
+        LITERT_ASSIGN_OR_RETURN(auto* source,
+                                QuantFloatSource(producer->Inputs()[0]));
+        for (auto op = transposes.rbegin(); op != transposes.rend(); ++op) {
+          LITERT_ASSIGN_OR_RETURN(auto type,
+                                  op->Inputs()[0].RankedTensorType());
+          LITERT_ASSIGN_OR_RETURN(auto dims, ConvertDims(type));
+          LITERT_ASSIGN_OR_RETURN(auto perm,
+                                  ReadInt32Constant(op->Inputs()[1]));
+          LITERT_ASSIGN_OR_RETURN(source, ReshapeTensor(source, dims));
+          nvinfer1::Permutation order{};
+          for (size_t i = 0; i < perm.size(); ++i) order.order[i] = perm[i];
+          auto* layer = network_->addShuffle(*source);
+          if (layer == nullptr || layer->getOutput(0) == nullptr ||
+              perm.size() != static_cast<size_t>(dims.nbDims)) {
+            return Error(kLiteRtStatusErrorCompilation,
+                         "Failed to transpose a quantized product's input");
+          }
+          layer->setFirstTranspose(order);
+          source = layer->getOutput(0);
+        }
+        LITERT_ASSIGN_OR_RETURN(auto* rows, QuantRows(source, width));
+        return QuantActivation{
+            rows, QuantTypeOf(rows),
+            RoundFp16(1.0f / tensor.PerTensorQuantization().scale)};
+      }
+      if (producer->Code() == kLiteRtOpCodeTflTranspose &&
+          producer->Inputs().size() == 2) {
+        transposes.push_back(*producer);
+      } else if (producer->Code() != kLiteRtOpCodeTflReshape) {
+        break;
+      }
+      tensor = producer->Inputs()[0];
+    }
+    return Error(kLiteRtStatusErrorUnsupported,
+                 "A quantized product reads an INT8 tensor that neither a "
+                 "QUANTIZE nor a quant layer makes");
+  }
+
+  // The FP32 values of a constant FP32 tensor as a network constant.
+  Expected<nvinfer1::ITensor*> QuantFloatConstant(const Tensor& tensor,
+                                                  const std::string& name) {
+    const auto bytes = tensor.Weights().Bytes();
+    std::vector<float> values(bytes.size() / sizeof(float));
+    std::memcpy(values.data(), bytes.data(), values.size() * sizeof(float));
+    nvinfer1::Dims dims{};
+    dims.nbDims = 1;
+    dims.d[0] = static_cast<int64_t>(values.size());
+    return AddFloatConstant(values, dims, name, nvinfer1::DataType::kFLOAT);
+  }
+
+  // The weights input of a product layer: `members` are the packed weights
+  // of its matrices in row order, views of the model file when they are the
+  // model's. With a weight store they stay there and the layer reads the
+  // holder of their segment (`location`), else they are copied into a
+  // constant.
+  struct QuantWeights {
+    nvinfer1::ITensor* tensor = nullptr;
+    std::optional<TensorRtWeightLocation> location;
+  };
+
+  Expected<QuantWeights> AddQuantWeights(
+      const LiteRtNvidiaQuantLinearParams& params,
+      absl::Span<const absl::Span<const uint8_t>> members) {
+    size_t bytes = 0;
+    for (const auto& member : members) bytes += member.size();
+    if (bytes != static_cast<size_t>(params.rows) * params.columns *
+                     params.bit_width / 8) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Unexpected weights of a quantized product");
+    }
+    QuantWeights weights;
+    if (weight_store_ != nullptr) {
+      auto added = weight_store_->Add(members);
+      if (added.HasValue()) {
+        weights.location = *added;
+      } else if (added.Error().Status() != kLiteRtStatusErrorNotFound) {
+        return added.Error();
+      }
+    }
+    if (weights.location.has_value()) {
+      // The holder of the segment replaces this once the segments of the
+      // partition are final (AddWeightHolders).
+      LITERT_ASSIGN_OR_RETURN(weights.tensor, ProvisionalWeightHolder());
+      return weights;
+    }
+    std::vector<uint8_t> packed;
+    packed.reserve(bytes);
+    for (const auto& member : members) {
+      packed.insert(packed.end(), member.begin(), member.end());
+    }
+    owned_weights_.push_back(std::move(packed));
+    nvinfer1::Dims dims{};
+    dims.nbDims = 1;
+    dims.d[0] = static_cast<int64_t>(bytes);
+    auto* constant = network_->addConstant(
+        dims, nvinfer1::Weights{nvinfer1::DataType::kINT8,
+                                owned_weights_.back().data(),
+                                static_cast<int64_t>(bytes)});
+    if (constant == nullptr || constant->getOutput(0) == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to add the weights of a quantized product");
+    }
+    weights.tensor = constant->getOutput(0);
+    return weights;
+  }
+
+  // The INT8 table of a quantized product as a constant.
+  Expected<nvinfer1::ITensor*> AddQuantTable(const std::vector<int8_t>& lut) {
+    owned_weights_.emplace_back(lut.begin(), lut.end());
+    nvinfer1::Dims dims{};
+    dims.nbDims = 1;
+    dims.d[0] = static_cast<int64_t>(lut.size());
+    auto* constant = network_->addConstant(
+        dims, nvinfer1::Weights{nvinfer1::DataType::kINT8,
+                                owned_weights_.back().data(), dims.d[0]});
+    if (constant == nullptr || constant->getOutput(0) == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to add the table of a quantized product");
+    }
+    return constant->getOutput(0);
+  }
+
+  // Adds a product layer on the weights `members` (AddQuantWeights).
+  // Returns INT8 [m, rows], or the FP32 logits. With `glue` the layer runs
+  // that glue in front and reads its x instead of `activation` (an INT8
+  // activation, the glue's q).
+  Expected<nvinfer1::ITensor*> AddQuantLinear(
+      const LiteRtNvidiaQuantLinearParams& params,
+      nvinfer1::ITensor* activation,
+      absl::Span<const absl::Span<const uint8_t>> members,
+      const std::vector<float>& multipliers, const std::vector<int8_t>* lut,
+      nvinfer1::ITensor* row_scale, const std::string& name,
+      const QuantGlueLayer* glue = nullptr) {
+    if (multipliers.size() != static_cast<size_t>(params.rows)) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Unexpected weights of a quantized product");
+    }
+    LITERT_ASSIGN_OR_RETURN(const QuantWeights added,
+                            AddQuantWeights(params, members));
+    nvinfer1::ITensor* weights = added.tensor;
+    const std::optional<TensorRtWeightLocation>& location = added.location;
+    nvinfer1::Dims multiplier_dims{};
+    multiplier_dims.nbDims = 1;
+    multiplier_dims.d[0] = params.rows;
+    LITERT_ASSIGN_OR_RETURN(
+        auto* multiplier_tensor,
+        AddFloatConstant(multipliers, multiplier_dims, name + "_multipliers",
+                         nvinfer1::DataType::kFLOAT));
+    std::vector<nvinfer1::ITensor*> inputs = {
+        glue != nullptr ? glue->inputs[0] : activation, weights,
+        multiplier_tensor};
+    if (lut != nullptr) {
+      LITERT_ASSIGN_OR_RETURN(auto* table, AddQuantTable(*lut));
+      inputs.push_back(table);
+    }
+    if (row_scale != nullptr) {
+      inputs.push_back(row_scale);
+    }
+    const int64_t weight_offset =
+        location.has_value() ? static_cast<int64_t>(location->offset) : 0;
+    const int64_t holder_granule =
+        location.has_value() ? static_cast<int64_t>(weight_store_->granule())
+                             : 0;
+    TrtPtr<nvinfer1::IPluginV3> plugin;
+    if (glue != nullptr) {
+      inputs.insert(inputs.end(), glue->inputs.begin() + 1, glue->inputs.end());
+      plugin.reset(CreateQuantGlueLinearPlugin(
+          glue->params, params,
+          glue->outputs & (kQuantGlueOutputX | kQuantGlueOutputZ),
+          weight_offset, holder_granule));
+    } else {
+      plugin.reset(
+          CreateQuantLinearPlugin(params, weight_offset, holder_granule));
+    }
+    if (!plugin) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to create the quantized product plugin");
+    }
+    auto* layer = tensorrt_rtx_1_5_0_99::AddPluginV3(
+        *network_, inputs.data(), static_cast<int32_t>(inputs.size()), *plugin);
+    if (layer == nullptr || layer->getOutput(0) == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to add the quantized product plugin layer");
+    }
+    if (location.has_value()) {
+      holder_readers_.push_back(
+          {layer, location->segment, /*scales_too=*/false});
+    }
+    layer->setName(KeepName(UniqueName(name)));
+    layer->getOutput(0)->setName(KeepName(UniqueName(name)));
+    owned_plugins_.push_back(std::move(plugin));
+    uses_cuda_subbyte_gemv_ = true;
+    if (glue != nullptr) {
+      int32_t next = 1;
+      LITERT_RETURN_IF_ERROR(SetQuantGlueFloats(*glue, layer, next));
+    }
+    return layer->getOutput(0);
+  }
+
+  // Records the INT8 values of a model tensor: `width` columns from `offset`
+  // of the quant layer result `int8`.
+  void SetQuantValue(const Tensor& tensor, nvinfer1::ITensor* int8,
+                     int32_t offset, int32_t width, float scale) {
+    quant_values_[tensor.Get()] = {int8, offset, width, scale};
+  }
+
+  // The activation-typed real view of an INT8 tensor that a quant layer
+  // produced, for an op outside the quant regions that reads it.
+  Expected<nvinfer1::ITensor*> QuantRealView(const Tensor& tensor,
+                                             const QuantValue& value) {
+    LITERT_ASSIGN_OR_RETURN(auto* rows, QuantInt8Rows(value));
+    LITERT_ASSIGN_OR_RETURN(auto type, tensor.RankedTensorType());
+    LITERT_ASSIGN_OR_RETURN(auto dims, ConvertDims(type));
+    LITERT_ASSIGN_OR_RETURN(rows, ReshapeTensor(rows, dims));
+    if (tensor.ElementType() == litert::ElementType::Int8) {
+      return AddDequantizeTensor(tensor, rows, ModeFloatType());
+    }
+    // The FLOAT16 result of a carved composite: the scale is the layer's.
+    nvinfer1::Dims scalar{};
+    const float scale[] = {value.scale};
+    LITERT_ASSIGN_OR_RETURN(
+        auto* scale_tensor,
+        AddFloatConstant(
+            scale, scalar,
+            "quant_view_scale_" + std::to_string(tensor.TensorIndex()),
+            QuantizationScaleType(ModeFloatType())));
+    auto* layer =
+        network_->addDequantize(*rows, *scale_tensor, ModeFloatType());
+    if (layer == nullptr || layer->getOutput(0) == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to dequantize a quant layer's result");
+    }
+    return layer->getOutput(0);
+  }
+
+  bool QuantOpsAreFree(const std::vector<LiteRtOp>& ops) const {
+    for (LiteRtOp op : ops) {
+      if (op_order_.count(op) == 0 || unlowered_ops_.count(op) != 0) {
+        return false;
+      }
+    }
+    return !ops.empty();
+  }
+
+  // Makes `members` a region emitted at its first op.
+  void AddQuantRegion(QuantRegionKind kind, size_t index,
+                      const std::vector<LiteRtOp>& members) {
+    LiteRtOp first = members.front();
+    for (LiteRtOp op : members) {
+      if (op_order_[op] < op_order_[first]) first = op;
+    }
+    unlowered_ops_.insert(members.begin(), members.end());
+    quant_regions_[first] = {kind, index};
+  }
+
+  // Adds the glue quant_glues_.back() of `members` to the region that reads its
+  // INT8 result `read` and runs the glue in its launch: the projections
+  // (QuantProjections::glue), or the factorized MLP of a decode step's one row
+  // (QuantFactorizedMlp::glue). The region is emitted at its first op, now the
+  // glue's. Any other glue is a region of its own (a prefill chunk's factorized
+  // MLP starts with rows too short to hide a glue).
+  void AddQuantGlueRegion(const Tensor& read,
+                          const std::vector<LiteRtOp>& members) {
+    const size_t index = quant_glues_.size() - 1;
+    QuantRegion owner;
+    const auto projections = quant_projections_by_input_.find(read.Get());
+    const auto factorized_mlp =
+        quant_factorized_mlps_by_input_.find(read.Get());
+    if (projections != quant_projections_by_input_.end()) {
+      quant_projections_[projections->second].glue = index;
+      owner = {QuantRegionKind::kProjections, projections->second};
+    } else if (factorized_mlp != quant_factorized_mlps_by_input_.end() &&
+               QuantOneRow(read)) {
+      quant_factorized_mlps_[factorized_mlp->second].glue = index;
+      owner = {QuantRegionKind::kFactorizedMlp, factorized_mlp->second};
+    } else {
+      AddQuantRegion(QuantRegionKind::kGlue, index, members);
+      return;
+    }
+    LiteRtOp first = members.front();
+    for (LiteRtOp op : members) {
+      if (op_order_[op] < op_order_[first]) first = op;
+    }
+    for (auto it = quant_regions_.begin(); it != quant_regions_.end(); ++it) {
+      if (it->second.kind == owner.kind && it->second.index == owner.index) {
+        if (op_order_[it->first] < op_order_[first]) first = it->first;
+        quant_regions_.erase(it);
+        break;
+      }
+    }
+    unlowered_ops_.insert(members.begin(), members.end());
+    quant_regions_[first] = owner;
+  }
+
+  // Whether `tensor` [..., n] holds one row.
+  static bool QuantOneRow(const Tensor& tensor) {
+    const auto type = tensor.RankedTensorType();
+    if (!type) return false;
+    const auto dims = type->Layout().Dimensions();
+    int64_t rows = 1;
+    for (size_t d = 0; d + 1 < dims.size(); ++d) rows *= dims[d];
+    return !dims.empty() && rows == 1;
+  }
+
+  // The glue in front of the projections (QuantProjections::glue) as their
+  // layer runs it, if the kernel takes it with `params` (which read the
+  // glue's INT8 result); else the glue gets its own layer here, whose INT8
+  // result the projections then read.
+  Expected<std::optional<QuantGlueLayer>> QuantGlueInFront(
+      std::optional<size_t> index,
+      const LiteRtNvidiaQuantLinearParams& params) {
+    if (!index.has_value()) return std::optional<QuantGlueLayer>();
+    const QuantGlue& glue = quant_glues_[*index];
+    LITERT_ASSIGN_OR_RETURN(
+        auto layer,
+        PrepareQuantGlue(glue.chain, kLiteRtNvidiaQuantGlueStatic, glue.scale,
+                         "cuda_quant_glue_" +
+                             std::to_string(glue.quantized->TensorIndex())));
+    if (LiteRtNvidiaQuantGlueLinearSupports(&layer.params, &params)) {
+      return std::optional<QuantGlueLayer>(std::move(layer));
+    }
+    LITERT_RETURN_IF_ERROR(LowerQuantGlue(glue));
+    return std::optional<QuantGlueLayer>();
+  }
+
+  // The op of `code` that computes `tensor`, when one op reads `tensor`.
+  std::optional<Op> QuantProducer(const Tensor& tensor,
+                                  LiteRtOpCode code) const {
+    auto producer = tensor.GetDefiningOp();
+    if (!producer || producer->Code() != code || !ReadOnce(tensor)) {
+      return std::nullopt;
+    }
+    return *producer;
+  }
+
+  // The op that alone reads `tensor`, if its code is `code`.
+  std::optional<Op> QuantUser(const Tensor& tensor, LiteRtOpCode code) const {
+    if (!ReadOnce(tensor)) return std::nullopt;
+    Op user = tensor.Uses()[0].user;
+    if (user.Code() != code || user.Outputs().size() != 1) return std::nullopt;
+    return user;
+  }
+
+  // `tensor` = CAST(odml.rms_norm(CAST(input), weights)) over the last dim,
+  // FLOAT16 in and out. `shared`: other ops may read `tensor` too.
+  std::optional<QuantNorm> MatchQuantNorm(
+      const Tensor& tensor, bool shared, std::vector<LiteRtOp>& members) const {
+    auto narrow = tensor.GetDefiningOp();
+    if (!narrow || narrow->Code() != kLiteRtOpCodeTflCast ||
+        narrow->Inputs().size() != 1 ||
+        tensor.ElementType() != litert::ElementType::Float16 ||
+        narrow->Inputs()[0].ElementType() != litert::ElementType::Float32 ||
+        (!shared && !ReadOnce(tensor))) {
+      return std::nullopt;
+    }
+    auto norm = QuantProducer(narrow->Inputs()[0], kLiteRtOpCodeShloComposite);
+    if (!norm || CompositeOpName(*norm) != "odml.rms_norm" ||
+        norm->Inputs().size() != 2 || norm->Outputs().size() != 1) {
+      return std::nullopt;
+    }
+    auto widen = QuantProducer(norm->Inputs()[0], kLiteRtOpCodeTflCast);
+    if (!widen || widen->Inputs().size() != 1 ||
+        widen->Inputs()[0].ElementType() != litert::ElementType::Float16) {
+      return std::nullopt;
+    }
+    const Tensor weights = norm->Inputs()[1];
+    const auto type = tensor.RankedTensorType();
+    if (!type || type->Layout().Rank() < 1 || !weights.HasWeights() ||
+        weights.ElementType() != litert::ElementType::Float32 ||
+        weights.Weights().Bytes().size() !=
+            static_cast<size_t>(type->Layout().Dimensions().back()) *
+                sizeof(float)) {
+      return std::nullopt;
+    }
+    QuantNorm result{widen->Inputs()[0], weights, 1e-6f};
+    CompositeOptions options;
+    if (options.InitFromOp(norm->Get()) == kLiteRtStatusOk &&
+        options.attributes_map.has_value() &&
+        !options.attributes_map.value()["epsilon"].IsNull()) {
+      result.eps = options.attributes_map.value()["epsilon"].AsFloat();
+    }
+    members.push_back(widen->Get());
+    members.push_back(norm->Get());
+    members.push_back(narrow->Get());
+    return result;
+  }
+
+  // The float steps that end in `z` (QuantGlueChain), matched backwards.
+  // `shared`: ops outside the chain may read `z` too.
+  QuantGlueChain MatchQuantGlueChain(const Tensor& z, bool shared) const {
+    QuantGlueChain chain;
+    Tensor value = z;
+    for (int hops = 0; hops < 3 && !shared; ++hops) {
+      auto reshape = QuantProducer(value, kLiteRtOpCodeTflReshape);
+      if (!reshape || reshape->Inputs().empty()) break;
+      chain.members.push_back(reshape->Get());
+      value = reshape->Inputs()[0];
+    }
+    chain.x = value;
+    chain.norm = MatchQuantNorm(value, shared, chain.members);
+    if (!chain.norm.has_value()) {
+      return chain;
+    }
+    chain.normed = value;
+    chain.x = chain.norm->input;
+    // x' = ADD(MUL(x, c_x), MUL(rms_norm(DEQUANTIZE(branch)), c_y)).
+    const Tensor stream = chain.norm->input;
+    auto add = stream.GetDefiningOp();
+    if (!add || add->Code() != kLiteRtOpCodeTflAdd ||
+        add->Inputs().size() != 2 || !HasNoFusedActivation(*add)) {
+      return chain;
+    }
+    struct Side {
+      Tensor value;
+      float scalar;
+      LiteRtOp multiply;
+    };
+    std::vector<Side> sides;
+    for (int i = 0; i < 2; ++i) {
+      auto multiply = QuantProducer(add->Inputs()[i], kLiteRtOpCodeTflMul);
+      if (!multiply || multiply->Inputs().size() != 2 ||
+          !HasNoFusedActivation(*multiply)) {
+        return chain;
+      }
+      for (int j = 0; j < 2; ++j) {
+        if (auto scalar = ReadFloatScalar(multiply->Inputs()[j])) {
+          sides.push_back(
+              {multiply->Inputs()[1 - j], *scalar, multiply->Get()});
+          break;
+        }
+      }
+    }
+    if (sides.size() != 2) return chain;
+    for (int i = 0; i < 2; ++i) {
+      std::vector<LiteRtOp> members;
+      auto norm = MatchQuantNorm(sides[i].value, /*shared=*/false, members);
+      if (!norm.has_value()) continue;
+      // The branch: a DEQUANTIZE of a quant layer's INT8 result, or the
+      // FLOAT16 tensor a quant layer stands for.
+      Tensor source = norm->input;
+      if (quant_outputs_.count(source.Get()) == 0) {
+        auto dequantize = QuantProducer(source, kLiteRtOpCodeTflDequantize);
+        if (!dequantize || dequantize->Inputs().size() != 1) continue;
+        members.push_back(dequantize->Get());
+        source = dequantize->Inputs()[0];
+        for (int hops = 0; hops < 3 && quant_outputs_.count(source.Get()) == 0;
+             ++hops) {
+          auto reshape = QuantProducer(source, kLiteRtOpCodeTflReshape);
+          if (!reshape || reshape->Inputs().empty()) break;
+          members.push_back(reshape->Get());
+          source = reshape->Inputs()[0];
+        }
+        if (quant_outputs_.count(source.Get()) == 0 || !ReadOnce(source)) {
+          continue;
+        }
+      }
+      chain.branch = source;
+      chain.branch_norm = *norm;
+      chain.c_y = sides[i].scalar;
+      chain.c_x = sides[1 - i].scalar;
+      chain.x = sides[1 - i].value;
+      chain.updated = stream;
+      chain.members.insert(chain.members.end(), members.begin(), members.end());
+      chain.members.push_back(sides[0].multiply);
+      chain.members.push_back(sides[1].multiply);
+      chain.members.push_back(add->Get());
+      break;
+    }
+    return chain;
+  }
+
+  // The parameters and inputs of the glue of `chain` with the quantization
+  // `quantize` (LiteRtNvidiaQuantGlueQuantize) to `scale`, for its own layer
+  // (AddQuantGlue) or the layer of the product behind it (AddQuantLinear).
+  Expected<QuantGlueLayer> PrepareQuantGlue(const QuantGlueChain& chain,
+                                            int32_t quantize, float scale,
+                                            const std::string& name) {
+    LITERT_ASSIGN_OR_RETURN(auto x_type, chain.x->RankedTensorType());
+    const int32_t width = x_type.Layout().Dimensions().back();
+    LiteRtNvidiaQuantGlueParams params = {};
+    params.width = width;
+    LITERT_ASSIGN_OR_RETURN(auto* x, QuantFloatSource(*chain.x));
+    LITERT_ASSIGN_OR_RETURN(x, QuantRows(x, width));
+    params.x_type = QuantTypeOf(x);
+    params.z_type = kLiteRtNvidiaQuantFp16;
+    params.quantize = quantize;
+    params.quantize_scale = quantize == kLiteRtNvidiaQuantGlueStatic
+                                ? RoundFp16(1.0f / scale)
+                                : 0.0f;
+    std::vector<nvinfer1::ITensor*> inputs = {x};
+    int32_t outputs = kQuantGlueOutputQ;
+    if (chain.branch.has_value()) {
+      const auto value = quant_values_.find(chain.branch->Get());
+      if (value == quant_values_.end()) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "The residual branch of a quant glue has no INT8 values");
+      }
+      LITERT_ASSIGN_OR_RETURN(auto* y, QuantInt8Rows(value->second));
+      LITERT_ASSIGN_OR_RETURN(y, QuantRows(y, width));
+      LITERT_ASSIGN_OR_RETURN(auto* weights,
+                              QuantFloatConstant(chain.branch_norm->weights,
+                                                 name + "_branch_norm"));
+      inputs.push_back(y);
+      inputs.push_back(weights);
+      params.branch = 1;
+      params.branch_scale = RoundFp16(value->second.scale);
+      params.branch_eps = chain.branch_norm->eps;
+      params.c_x = chain.c_x;
+      params.c_y = chain.c_y;
+      outputs |= kQuantGlueOutputX;
+    }
+    if (chain.norm.has_value()) {
+      LITERT_ASSIGN_OR_RETURN(
+          auto* weights,
+          QuantFloatConstant(chain.norm->weights, name + "_norm"));
+      inputs.push_back(weights);
+      params.norm = 1;
+      params.norm_eps = chain.norm->eps;
+    }
+    // The norm's result is an output for the ops outside the chain that read
+    // it (the head's hidden state is a model output too).
+    const bool z_output = chain.normed.has_value() && !ReadOnce(*chain.normed);
+    if (z_output) outputs |= kQuantGlueOutputZ;
+    if (quantize == kLiteRtNvidiaQuantGlueDynamic) {
+      outputs |= kQuantGlueOutputRowScale;
+    }
+    return QuantGlueLayer{&chain, params, std::move(inputs), outputs};
+  }
+
+  // Records the outputs x' and z of a layer that ran `glue`, from output
+  // `next` on, as the FLOAT16 values of their tensors.
+  Expected<void> SetQuantGlueFloats(const QuantGlueLayer& glue,
+                                    nvinfer1::ILayer* layer, int32_t& next) {
+    const auto float_output = [&](const Tensor& tensor) -> Expected<void> {
+      LITERT_ASSIGN_OR_RETURN(auto type, tensor.RankedTensorType());
+      LITERT_ASSIGN_OR_RETURN(auto dims, ConvertDims(type));
+      LITERT_ASSIGN_OR_RETURN(auto* value,
+                              ReshapeTensor(layer->getOutput(next++), dims));
+      return SetQuantFloat(tensor, value);
+    };
+    if ((glue.outputs & kQuantGlueOutputX) != 0) {
+      LITERT_RETURN_IF_ERROR(float_output(*glue.chain->updated));
+    }
+    if ((glue.outputs & kQuantGlueOutputZ) != 0) {
+      LITERT_RETURN_IF_ERROR(float_output(*glue.chain->normed));
+    }
+    return {};
+  }
+
+  // Adds the glue layer of `chain` with the quantization `quantize`
+  // (LiteRtNvidiaQuantGlueQuantize) to `scale`. Returns its INT8 result
+  // [m, width]; `row_scale`, when not null, receives the dynamic scales.
+  // The updated residual stream and the norm's result (for other readers)
+  // become the FLOAT16 values of their tensors.
+  Expected<nvinfer1::ITensor*> AddQuantGlue(const QuantGlueChain& chain,
+                                            int32_t quantize, float scale,
+                                            nvinfer1::ITensor** row_scale,
+                                            const std::string& name) {
+    LITERT_ASSIGN_OR_RETURN(auto glue,
+                            PrepareQuantGlue(chain, quantize, scale, name));
+    TrtPtr<nvinfer1::IPluginV3> plugin(
+        CreateQuantGluePlugin(glue.params, glue.outputs));
+    if (!plugin) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to create the quant glue plugin");
+    }
+    auto* layer = tensorrt_rtx_1_5_0_99::AddPluginV3(
+        *network_, glue.inputs.data(), static_cast<int32_t>(glue.inputs.size()),
+        *plugin);
+    if (layer == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to add the quant glue plugin layer");
+    }
+    layer->setName(KeepName(UniqueName(name)));
+    owned_plugins_.push_back(std::move(plugin));
+    int32_t next = 0;
+    LITERT_RETURN_IF_ERROR(SetQuantGlueFloats(glue, layer, next));
+    nvinfer1::ITensor* q = layer->getOutput(next++);
+    q->setName(KeepName(UniqueName(name + "_q")));
+    if (row_scale != nullptr) {
+      *row_scale = layer->getOutput(next++);
+    }
+    return q;
+  }
+
+  // The SiLU between two INT8 tensors as the model computes it, per INT8
+  // value: DEQUANTIZE (`in_scale`), x * logistic(x) in FLOAT16, QUANTIZE
+  // (`out_scale`).
+  static std::vector<int8_t> QuantSiluTable(float in_scale, float out_scale) {
+    std::vector<int8_t> table(256);
+    const float dequantize = RoundFp16(in_scale);
+    const float quantize = RoundFp16(1.0f / out_scale);
+    for (int q = -128; q <= 127; ++q) {
+      const float x = RoundFp16(static_cast<float>(q) * dequantize);
+      const float logistic = RoundFp16(
+          static_cast<float>(1.0 / (1.0 + std::exp(-static_cast<double>(x)))));
+      const float y = RoundFp16(x * logistic);
+      const float scaled = y * quantize;
+      table[q + 128] = static_cast<int8_t>(
+          std::max(-128L, std::min(127L, std::lrintf(scaled))));
+    }
+    return table;
+  }
+
+  // Packed INT2 BATCH_MATMUL weights [blocks, columns, outputs] as the rows
+  // [blocks * outputs, columns] of a FULLY_CONNECTED per block.
+  static std::vector<uint8_t> QuantTransposedBlocks(
+      absl::Span<const uint8_t> packed, int32_t blocks, int32_t columns,
+      int32_t outputs) {
+    std::vector<uint8_t> rows(packed.size(), 0);
+    for (int32_t b = 0; b < blocks; ++b) {
+      for (int32_t k = 0; k < columns; ++k) {
+        const size_t from = (static_cast<size_t>(b) * columns + k) * outputs;
+        for (int32_t n = 0; n < outputs; ++n) {
+          const uint8_t field =
+              (packed[(from + n) / 4] >> (2 * ((from + n) % 4))) & 3;
+          const size_t to =
+              (static_cast<size_t>(b) * outputs + n) * columns + k;
+          rows[to / 4] |= field << (2 * (to % 4));
+        }
+      }
+    }
+    return rows;
+  }
+
+  // The dims [.., blocks, columns, outputs] of BATCH_MATMUL weights.
+  static std::array<int32_t, 3> QuantBlockDims(const Tensor& weights) {
+    const auto type = weights.RankedTensorType();
+    const auto dims = type->Layout().Dimensions();
+    const size_t rank = dims.size();
+    return {dims[rank - 3], dims[rank - 2], dims[rank - 1]};
+  }
+
+  static std::pair<int32_t, int32_t> QuantMatrixDims(const Tensor& weights) {
+    const auto type = weights.RankedTensorType();
+    const auto dims = type->Layout().Dimensions();
+    return {dims[0], dims[1]};
+  }
+
+  // Adds the layer of a factorized MLP's four products on one INT8 row
+  // (CreateQuantFactorizedMlpPlugin): the weights `members` of each stage
+  // (AddQuantWeights), its multipliers, and `lut` for the stages that have a
+  // table. With `glue` the layer runs that glue in front and reads its x
+  // instead of `activation`. Returns INT8 [1, rows of stage 3].
+  Expected<nvinfer1::ITensor*> AddQuantFactorizedMlp(
+      const LiteRtNvidiaQuantFactorizedMlpParams& stages,
+      nvinfer1::ITensor* activation,
+      const absl::Span<const absl::Span<const uint8_t>> (&members)[4],
+      const std::vector<float> (&multipliers)[4],
+      const std::vector<int8_t>& lut, const std::string& name,
+      const QuantGlueLayer* glue = nullptr) {
+    std::vector<nvinfer1::ITensor*> inputs = {glue != nullptr ? glue->inputs[0]
+                                                              : activation};
+    std::array<int64_t, 4> offsets = {};
+    std::optional<TensorRtWeightLocation> locations[4];
+    for (int s = 0; s < 4; ++s) {
+      LITERT_ASSIGN_OR_RETURN(const QuantWeights added,
+                              AddQuantWeights(stages.stages[s], members[s]));
+      inputs.push_back(added.tensor);
+      locations[s] = added.location;
+      offsets[s] = added.location.has_value()
+                       ? static_cast<int64_t>(added.location->offset)
+                       : -1;
+    }
+    for (int s = 0; s < 4; ++s) {
+      if (multipliers[s].size() != static_cast<size_t>(stages.stages[s].rows)) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "Unexpected weights of a quantized product");
+      }
+      nvinfer1::Dims dims{};
+      dims.nbDims = 1;
+      dims.d[0] = stages.stages[s].rows;
+      LITERT_ASSIGN_OR_RETURN(
+          auto* tensor,
+          AddFloatConstant(multipliers[s], dims,
+                           name + "_multipliers" + std::to_string(s),
+                           nvinfer1::DataType::kFLOAT));
+      inputs.push_back(tensor);
+    }
+    bool table = false;
+    for (const auto& stage : stages.stages) table = table || stage.lut != 0;
+    if (table) {
+      LITERT_ASSIGN_OR_RETURN(auto* tensor, AddQuantTable(lut));
+      inputs.push_back(tensor);
+    }
+    if (glue != nullptr) {
+      inputs.insert(inputs.end(), glue->inputs.begin() + 1, glue->inputs.end());
+    }
+    bool holders = false;
+    for (const int64_t offset : offsets) holders = holders || offset >= 0;
+    TrtPtr<nvinfer1::IPluginV3> plugin(CreateQuantFactorizedMlpPlugin(
+        stages, offsets,
+        holders ? static_cast<int64_t>(weight_store_->granule()) : 0,
+        glue != nullptr ? &glue->params : nullptr,
+        glue != nullptr
+            ? glue->outputs & (kQuantGlueOutputX | kQuantGlueOutputZ)
+            : 0));
+    if (!plugin) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to create the factorized MLP plugin");
+    }
+    auto* layer = tensorrt_rtx_1_5_0_99::AddPluginV3(
+        *network_, inputs.data(), static_cast<int32_t>(inputs.size()), *plugin);
+    if (layer == nullptr || layer->getOutput(0) == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to add the factorized MLP plugin layer");
+    }
+    for (int s = 0; s < 4; ++s) {
+      if (locations[s].has_value()) {
+        holder_readers_.push_back({layer, locations[s]->segment,
+                                   /*scales_too=*/false, /*input=*/1 + s});
+      }
+    }
+    layer->setName(KeepName(UniqueName(name)));
+    layer->getOutput(0)->setName(KeepName(UniqueName(name)));
+    owned_plugins_.push_back(std::move(plugin));
+    uses_cuda_subbyte_gemv_ = true;
+    if (glue != nullptr) {
+      int32_t next = 1;
+      LITERT_RETURN_IF_ERROR(SetQuantGlueFloats(*glue, layer, next));
+    }
+    return layer->getOutput(0);
+  }
+
+  // Emits a factorized MLP as four product layers: the first quantizes a float
+  // x itself, the second applies the SiLU as a table, and their INT8 results
+  // are regrouped on the way out so that every stage reads rows.
+  Expected<void> LowerQuantFactorizedMlp(const QuantFactorizedMlp& mlp) {
+    if (mlp.weights.size() != 6 || !mlp.input.has_value() ||
+        !mlp.output.has_value()) {
+      return Error(kLiteRtStatusErrorCompilation, "Incomplete factorized MLP");
+    }
+    std::vector<std::vector<float>> scales;
+    for (int i = 0; i < 6; ++i) {
+      auto weight_scales = CenteredInt2Scales(
+          mlp.weights[i],
+          i == 2 || i == 3 ? QuantBlockRank(mlp.weights[i]) - 2 : 1);
+      if (!weight_scales.has_value()) {
+        return Error(kLiteRtStatusErrorUnsupported,
+                     "Factorized MLP weights are not centered INT2");
+      }
+      scales.push_back(std::move(*weight_scales));
+    }
+    const auto [up1_rows, up1_columns] = QuantMatrixDims(mlp.weights[0]);
+    const auto up2 = QuantBlockDims(mlp.weights[2]);
+    const auto down1 = QuantBlockDims(mlp.weights[3]);
+    const auto [down2_rows, down2_columns] = QuantMatrixDims(mlp.weights[4]);
+    const int32_t blocks = up2[0];
+    if (QuantMatrixDims(mlp.weights[1]) !=
+            std::make_pair(up1_rows, up1_columns) ||
+        QuantMatrixDims(mlp.weights[5]) !=
+            std::make_pair(down2_rows, down2_columns) ||
+        blocks <= 0 || up1_rows % blocks != 0 ||
+        up2[1] != 2 * up1_rows / blocks || down1[0] != blocks ||
+        down1[1] != up2[2] || down1[2] % 2 != 0 ||
+        down2_columns != blocks * down1[2] / 2) {
+      return Error(kLiteRtStatusErrorUnsupported,
+                   "Factorized MLP weights do not fit each other");
+    }
+    const std::string name = "cuda_quant_factorized_mlp_" +
+                             std::to_string(mlp.output->TensorIndex());
+    const auto ratio = [&](int from, int to) {
+      return static_cast<double>(mlp.scales[from]) /
+             static_cast<double>(mlp.scales[to]);
+    };
+    const auto bytes = [&](int i) { return mlp.weights[i].Weights().Bytes(); };
+    const auto joined = [](const std::vector<float>& a,
+                           const std::vector<float>& b) {
+      std::vector<float> all(a);
+      all.insert(all.end(), b.begin(), b.end());
+      return all;
+    };
+
+    // The glue in front quantizes x for the MLP (an INT8 activation); its
+    // layer, if the MLP's launch does not take it, comes first.
+    std::optional<QuantGlueLayer> glue;
+    QuantActivation activation;
+    if (mlp.glue.has_value()) {
+      const QuantGlue& in_front = quant_glues_[*mlp.glue];
+      LITERT_ASSIGN_OR_RETURN(
+          glue,
+          PrepareQuantGlue(
+              in_front.chain, kLiteRtNvidiaQuantGlueStatic, in_front.scale,
+              "cuda_quant_glue_" +
+                  std::to_string(in_front.quantized->TensorIndex())));
+    } else if (mlp.input->ElementType() == litert::ElementType::Int8 ||
+               quant_values_.count(mlp.input->Get()) != 0) {
+      LITERT_ASSIGN_OR_RETURN(activation,
+                              GetQuantActivation(*mlp.input, 2 * up1_columns));
+    } else {
+      LITERT_ASSIGN_OR_RETURN(auto* source, QuantFloatSource(*mlp.input));
+      LITERT_ASSIGN_OR_RETURN(activation.rows,
+                              QuantRows(source, 2 * up1_columns));
+      activation.type = QuantTypeOf(activation.rows);
+      activation.quantize_scale = RoundFp16(1.0f / mlp.scales[0]);
+    }
+    LiteRtNvidiaQuantFactorizedMlpParams stages = {};
+    LiteRtNvidiaQuantLinearParams& params = stages.stages[0];
+    params.layout = kLiteRtNvidiaQuantLayoutRows;
+    params.bit_width = 2;
+    params.rows = 2 * up1_rows;
+    params.columns = up1_columns;
+    params.segments = 2;
+    params.swap0 = 2;
+    params.swap1 = blocks;
+    params.activation = activation.type;
+    params.quantize_scale = activation.quantize_scale;
+    params.requant = kLiteRtNvidiaQuantRequantDouble;
+    params.ratio = ratio(0, 1);
+    const absl::Span<const uint8_t> up1_members[] = {bytes(0), bytes(1)};
+
+    // The middle stages' weights are stored [blocks, inputs, outputs], one
+    // output's weights spread over the input rows. Transposed copies give
+    // every output its weights as a row, and the rows kernel takes them four
+    // inputs per dp4a: a third of the launch time of the blocks kernel for a
+    // decode step and a seventh for a prefill chunk. The copies are constants
+    // of the plan (the model file's bytes would be shared through the weight
+    // store, but the decode and the prefill graphs hold separate copies of
+    // these weights in the file anyway).
+    LiteRtNvidiaQuantLinearParams& up2_params = stages.stages[1];
+    up2_params.layout = kLiteRtNvidiaQuantLayoutRows;
+    up2_params.bit_width = 2;
+    up2_params.rows = blocks * up2[2];
+    up2_params.columns = up2[1];
+    up2_params.segments = blocks;
+    up2_params.swap0 = 1;
+    up2_params.swap1 = 1;
+    up2_params.activation = kLiteRtNvidiaQuantInt8;
+    up2_params.requant = kLiteRtNvidiaQuantRequantDouble;
+    up2_params.lut = 1;
+    up2_params.ratio = ratio(1, 2);
+    const auto silu = QuantSiluTable(mlp.scales[2], mlp.scales[3]);
+    const auto up2_rows =
+        QuantTransposedBlocks(bytes(2), blocks, up2[1], up2[2]);
+    const absl::Span<const uint8_t> up2_members[] = {up2_rows};
+
+    LiteRtNvidiaQuantLinearParams& down1_params = stages.stages[2];
+    down1_params = up2_params;
+    down1_params.rows = blocks * down1[2];
+    down1_params.columns = down1[1];
+    down1_params.swap0 = blocks;
+    down1_params.swap1 = 2;
+    down1_params.lut = 0;
+    down1_params.ratio = ratio(3, 4);
+    const auto down1_rows =
+        QuantTransposedBlocks(bytes(3), blocks, down1[1], down1[2]);
+    const absl::Span<const uint8_t> down1_members[] = {down1_rows};
+
+    LiteRtNvidiaQuantLinearParams& down2_params = stages.stages[3];
+    down2_params.layout = kLiteRtNvidiaQuantLayoutRows;
+    down2_params.bit_width = 2;
+    down2_params.rows = 2 * down2_rows;
+    down2_params.columns = down2_columns;
+    down2_params.segments = 2;
+    down2_params.swap0 = 1;
+    down2_params.swap1 = 1;
+    down2_params.activation = kLiteRtNvidiaQuantInt8;
+    down2_params.requant = kLiteRtNvidiaQuantRequantDouble;
+    down2_params.ratio = ratio(4, 5);
+    const absl::Span<const uint8_t> down2_members[] = {bytes(4), bytes(5)};
+
+    const absl::Span<const absl::Span<const uint8_t>> members[] = {
+        up1_members, up2_members, down1_members, down2_members};
+    const std::vector<float> multipliers[] = {joined(scales[0], scales[1]),
+                                              scales[2], scales[3],
+                                              joined(scales[4], scales[5])};
+    nvinfer1::ITensor* stage = nullptr;
+    const bool glued =
+        glue.has_value() && glue->inputs[0]->getDimensions().d[0] == 1 &&
+        LiteRtNvidiaQuantGlueFactorizedMlpSupports(&glue->params, &stages);
+    if (glue.has_value() && !glued) {
+      LITERT_RETURN_IF_ERROR(LowerQuantGlue(quant_glues_[*mlp.glue]));
+      LITERT_ASSIGN_OR_RETURN(activation,
+                              GetQuantActivation(*mlp.input, 2 * up1_columns));
+    }
+    // A decode step's MLP (one INT8 row) is one launch, with the glue in
+    // front when it has one; every other MLP is the four launches.
+    if (glued) {
+      LITERT_ASSIGN_OR_RETURN(
+          stage, AddQuantFactorizedMlp(stages, nullptr, members, multipliers,
+                                       silu, name, &*glue));
+    } else if (activation.type == kLiteRtNvidiaQuantInt8 &&
+               activation.rows->getDimensions().d[0] == 1 &&
+               LiteRtNvidiaQuantFactorizedMlpSupports(&stages)) {
+      LITERT_ASSIGN_OR_RETURN(
+          stage, AddQuantFactorizedMlp(stages, activation.rows, members,
+                                       multipliers, silu, name));
+    } else {
+      static const char* const kStageNames[] = {"_up1", "_up2", "_down1",
+                                                "_down2"};
+      stage = activation.rows;
+      for (int s = 0; s < 4; ++s) {
+        LITERT_ASSIGN_OR_RETURN(
+            stage, AddQuantLinear(stages.stages[s], stage, members[s],
+                                  multipliers[s], s == 1 ? &silu : nullptr,
+                                  nullptr, name + kStageNames[s]));
+      }
+    }
+    SetQuantValue(*mlp.output, stage, 0, 2 * down2_rows, mlp.scales[5]);
+    LITERT_LOG(LITERT_INFO,
+               "NVIDIA TensorRT-RTX quant factorized MLP: output=%u blocks=%d "
+               "up=%dx%d hidden=%d down=%dx%d",
+               mlp.output->TensorIndex(), blocks, up1_rows, up1_columns,
+               blocks * up2[2], down2_rows, down2_columns);
+    return {};
+  }
+
+  static size_t QuantBlockRank(const Tensor& weights) {
+    const auto type = weights.RankedTensorType();
+    return type ? type->Layout().Dimensions().size() : 0;
+  }
+
+  static bool QuantScalesMatch(const Tensor& a, const Tensor& b) {
+    return IsSymmetricInt8(a) && IsSymmetricInt8(b) &&
+           a.PerTensorQuantization().scale == b.PerTensorQuantization().scale;
+  }
+
+  // The constant int32 values of `tensor`, or nothing.
+  static std::vector<int32_t> QuantInts(const Tensor& tensor) {
+    auto values = ReadInt32Constant(tensor);
+    return values.HasValue() ? values.Value() : std::vector<int32_t>();
+  }
+
+  // SLICE of `rows` [m, ...] that keeps dim 0 whole and takes `size` of
+  // `axis` from `begin`, every other dim whole.
+  static bool QuantIsSlice(const Op& op, size_t axis, int32_t begin,
+                           int32_t size) {
+    if (op.Code() != kLiteRtOpCodeTflSlice || op.Inputs().size() != 3) {
+      return false;
+    }
+    const auto type = op.Inputs()[0].RankedTensorType();
+    const auto begins = QuantInts(op.Inputs()[1]);
+    const auto sizes = QuantInts(op.Inputs()[2]);
+    if (!type) return false;
+    const auto dims = type->Layout().Dimensions();
+    if (begins.size() != dims.size() || sizes.size() != dims.size() ||
+        axis >= dims.size()) {
+      return false;
+    }
+    for (size_t d = 0; d < dims.size(); ++d) {
+      const int32_t want_begin = d == axis ? begin : 0;
+      const int32_t want_size = d == axis ? size : dims[d];
+      if (begins[d] != want_begin ||
+          (sizes[d] != want_size && !(sizes[d] == -1 && d != axis))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // The factorized MLP around its first BATCH_MATMUL `up2`
+  // (QuantFactorizedMlp), as the model's graph has it:
+  //   x INT8 [m, 2 C] -> SLICE [m, C] -> FULLY_CONNECTED -> RESHAPE
+  //     [m, B, 1, R1 / B], twice -> CONCATENATION on axis 2 -> RESHAPE
+  //     [m, B, 1, 2 R1 / B] -> up2 -> RESHAPE [m, B N] -> DEQUANTIZE ->
+  //     LOGISTIC, MUL -> QUANTIZE -> RESHAPE [m, B, 1, N] -> BATCH_MATMUL ->
+  //     RESHAPE [m, B, 2, D] -> SLICE [m, B, 1, D] -> RESHAPE [m, B D] ->
+  //     FULLY_CONNECTED, twice -> CONCATENATION -> y INT8 [m, 2 R4]
+  // with one reader per intermediate. `members` receives its ops.
+  std::optional<QuantFactorizedMlp> MatchQuantFactorizedMlp(
+      const Op& up2, std::vector<LiteRtOp>& members) const {
+    QuantFactorizedMlp mlp;
+    mlp.weights.resize(6, up2.Inputs()[1]);
+    const auto block = QuantBlockDims(up2.Inputs()[1]);
+    const int32_t blocks = block[0];
+    // Behind up2: the regrouped results of the two up-1 products.
+    auto regroup = QuantProducer(up2.Inputs()[0], kLiteRtOpCodeTflReshape);
+    if (!regroup) return std::nullopt;
+    auto concat =
+        QuantProducer(regroup->Inputs()[0], kLiteRtOpCodeTflConcatenation);
+    int32_t axis = 0;
+    if (!concat || concat->Inputs().size() != 2 ||
+        LiteRtGetConcatenationAxisOption(concat->Get(), &axis) !=
+            kLiteRtStatusOk ||
+        (axis != 2 && axis != -2)) {
+      return std::nullopt;
+    }
+    members.push_back(regroup->Get());
+    members.push_back(concat->Get());
+    std::optional<Tensor> x;
+    for (int half = 0; half < 2; ++half) {
+      auto reshape =
+          QuantProducer(concat->Inputs()[half], kLiteRtOpCodeTflReshape);
+      if (!reshape) return std::nullopt;
+      auto product =
+          QuantProducer(reshape->Inputs()[0], kLiteRtOpCodeTflFullyConnected);
+      if (!product || !IsQuantFullyConnected(*product)) return std::nullopt;
+      const auto [rows, columns] = QuantMatrixDims(product->Inputs()[1]);
+      auto slice = QuantProducer(product->Inputs()[0], kLiteRtOpCodeTflSlice);
+      if (!slice || !QuantIsSlice(*slice, 1, half * columns, columns) ||
+          rows % blocks != 0 ||
+          !TensorHasShape(
+              reshape->Outputs()[0],
+              {TensorRows(slice->Inputs()[0]), blocks, 1, rows / blocks}) ||
+          (x.has_value() && x->Get() != slice->Inputs()[0].Get())) {
+        return std::nullopt;
+      }
+      x = slice->Inputs()[0];
+      mlp.weights[half] = product->Inputs()[1];
+      mlp.scales[1] = product->Outputs()[0].PerTensorQuantization().scale;
+      members.push_back(slice->Get());
+      members.push_back(product->Get());
+      members.push_back(reshape->Get());
+    }
+    const int32_t m = TensorRows(*x);
+    if (!IsSymmetricInt8(*x) ||
+        !TensorHasShape(*x, {m, 2 * QuantMatrixDims(mlp.weights[0]).second}) ||
+        x->Uses().size() != 2 ||
+        !QuantScalesMatch(concat->Inputs()[0], concat->Inputs()[1]) ||
+        !QuantScalesMatch(concat->Inputs()[0], up2.Inputs()[0]) ||
+        !TensorHasShape(up2.Inputs()[0], {m, blocks, 1, block[1]})) {
+      return std::nullopt;
+    }
+    mlp.input = *x;
+    mlp.scales[0] = x->PerTensorQuantization().scale;
+    mlp.weights[2] = up2.Inputs()[1];
+    mlp.scales[2] = up2.Outputs()[0].PerTensorQuantization().scale;
+    members.push_back(up2.Get());
+    // Past up2: the SiLU between a DEQUANTIZE and a QUANTIZE.
+    auto flat = QuantUser(up2.Outputs()[0], kLiteRtOpCodeTflReshape);
+    if (!flat) return std::nullopt;
+    auto dequantize = QuantUser(flat->Outputs()[0], kLiteRtOpCodeTflDequantize);
+    if (!dequantize ||
+        dequantize->Outputs()[0].ElementType() !=
+            litert::ElementType::Float16 ||
+        dequantize->Outputs()[0].Uses().size() != 2) {
+      return std::nullopt;
+    }
+    std::optional<Op> logistic;
+    std::optional<Op> multiply;
+    for (const auto& use : dequantize->Outputs()[0].Uses()) {
+      if (use.user.Code() == kLiteRtOpCodeTflLogistic) logistic = use.user;
+      if (use.user.Code() == kLiteRtOpCodeTflMul) multiply = use.user;
+    }
+    if (!logistic || !multiply || !HasNoFusedActivation(*multiply) ||
+        !ReadOnce(logistic->Outputs()[0]) ||
+        logistic->Outputs()[0].Uses()[0].user.Get() != multiply->Get()) {
+      return std::nullopt;
+    }
+    auto quantize = QuantUser(multiply->Outputs()[0], kLiteRtOpCodeTflQuantize);
+    if (!quantize || !IsSymmetricInt8(quantize->Outputs()[0])) {
+      return std::nullopt;
+    }
+    mlp.scales[3] = quantize->Outputs()[0].PerTensorQuantization().scale;
+    auto blocked = QuantUser(quantize->Outputs()[0], kLiteRtOpCodeTflReshape);
+    if (!blocked) return std::nullopt;
+    auto down1 = QuantUser(blocked->Outputs()[0], kLiteRtOpCodeTflBatchMatmul);
+    if (!down1 || !IsQuantBatchMatmul(*down1)) return std::nullopt;
+    const auto down = QuantBlockDims(down1->Inputs()[1]);
+    const int32_t depth = down[2] / 2;
+    if (down[0] != blocks || down[1] != block[2] || down[2] % 2 != 0 ||
+        !TensorHasShape(blocked->Outputs()[0], {m, blocks, 1, block[2]})) {
+      return std::nullopt;
+    }
+    mlp.weights[3] = down1->Inputs()[1];
+    mlp.scales[4] = down1->Outputs()[0].PerTensorQuantization().scale;
+    for (const Op& op : {*flat, *dequantize, *logistic, *multiply, *quantize,
+                         *blocked, *down1}) {
+      members.push_back(op.Get());
+    }
+    // Past down-1: its halves feed the two down-2 products.
+    auto halves = QuantUser(down1->Outputs()[0], kLiteRtOpCodeTflReshape);
+    if (!halves ||
+        !TensorHasShape(halves->Outputs()[0], {m, blocks, 2, depth}) ||
+        halves->Outputs()[0].Uses().size() != 2) {
+      return std::nullopt;
+    }
+    members.push_back(halves->Get());
+    std::optional<Op> join;
+    for (const auto& use : halves->Outputs()[0].Uses()) {
+      const Op slice = use.user;
+      int half = -1;
+      for (int h = 0; h < 2; ++h) {
+        if (QuantIsSlice(slice, 2, h, 1)) half = h;
+      }
+      if (half < 0 || slice.Outputs().size() != 1) return std::nullopt;
+      auto reshape = QuantUser(slice.Outputs()[0], kLiteRtOpCodeTflReshape);
+      if (!reshape ||
+          !TensorHasShape(reshape->Outputs()[0], {m, blocks * depth})) {
+        return std::nullopt;
+      }
+      auto product =
+          QuantUser(reshape->Outputs()[0], kLiteRtOpCodeTflFullyConnected);
+      if (!product || !IsQuantFullyConnected(*product)) return std::nullopt;
+      auto user =
+          QuantUser(product->Outputs()[0], kLiteRtOpCodeTflConcatenation);
+      // The halves are joined in their order.
+      if (!user || user->Inputs().size() != 2 ||
+          user->Inputs()[half].Get() != product->Outputs()[0].Get() ||
+          (join.has_value() && join->Get() != user->Get())) {
+        return std::nullopt;
+      }
+      join = user;
+      mlp.weights[4 + half] = product->Inputs()[1];
+      mlp.scales[5] = product->Outputs()[0].PerTensorQuantization().scale;
+      members.push_back(slice.Get());
+      members.push_back(reshape->Get());
+      members.push_back(product->Get());
+    }
+    const int32_t down2_rows = QuantMatrixDims(mlp.weights[4]).first;
+    if (!join.has_value() ||
+        !QuantScalesMatch(join->Inputs()[0], join->Inputs()[1]) ||
+        !QuantScalesMatch(join->Inputs()[0], join->Outputs()[0]) ||
+        !TensorHasShape(join->Outputs()[0], {m, 2 * down2_rows})) {
+      return std::nullopt;
+    }
+    members.push_back(join->Get());
+    mlp.output = join->Outputs()[0];
+    for (int i = 0; i < 6; ++i) {
+      if (!CenteredInt2Scales(
+               mlp.weights[i],
+               i == 2 || i == 3 ? QuantBlockRank(mlp.weights[i]) - 2 : 1)
+               .has_value()) {
+        return std::nullopt;
+      }
+    }
+    return mlp;
+  }
+
+  // Dim 0 of a tensor: the rows of the factorized MLP's tensors.
+  static int32_t TensorRows(const Tensor& tensor) {
+    const auto type = tensor.RankedTensorType();
+    return type && type->Layout().Rank() > 0 ? type->Layout().Dimensions()[0]
+                                             : -1;
+  }
+
+  // The head norms and rotations behind the projections of `group`: per
+  // FULLY_CONNECTED result
+  //   RESHAPE [1, n, heads, depth] -> DEQUANTIZE -> CAST -> odml.rms_norm ->
+  //   CAST, then for queries and keys TRANSPOSE (RESHAPE for one token)
+  //   to [1, heads, n, depth] -> odml.rope, for queries -> MUL scalar.
+  std::optional<QuantQkvRope> MatchQuantQkvRope(
+      size_t index, std::vector<LiteRtOp>& members) const {
+    const QuantProjections& group = quant_projections_[index];
+    QuantQkvRope match;
+    match.projections = index;
+    bool rotated = false;
+    for (const Op& product : group.ops) {
+      auto reshape = QuantUser(product.Outputs()[0], kLiteRtOpCodeTflReshape);
+      if (!reshape) return std::nullopt;
+      auto dequantize =
+          QuantUser(reshape->Outputs()[0], kLiteRtOpCodeTflDequantize);
+      if (!dequantize) return std::nullopt;
+      auto widen = QuantUser(dequantize->Outputs()[0], kLiteRtOpCodeTflCast);
+      if (!widen) return std::nullopt;
+      auto norm_op = QuantUser(widen->Outputs()[0], kLiteRtOpCodeShloComposite);
+      if (!norm_op) return std::nullopt;
+      auto narrow = QuantUser(norm_op->Outputs()[0], kLiteRtOpCodeTflCast);
+      if (!narrow) return std::nullopt;
+      const Tensor normed = narrow->Outputs()[0];
+      std::vector<LiteRtOp> chain;
+      auto norm = MatchQuantNorm(normed, /*shared=*/true, chain);
+      const auto type = normed.RankedTensorType();
+      if (!norm.has_value() ||
+          norm->input.Get() != dequantize->Outputs()[0].Get() || !type ||
+          type->Layout().Rank() != 4 || type->Layout().Dimensions()[0] != 1) {
+        return std::nullopt;
+      }
+      const auto dims = type->Layout().Dimensions();
+      const int32_t tokens = dims[1];
+      const int32_t heads = dims[2];
+      if (match.depth != 0 && match.depth != dims[3]) return std::nullopt;
+      match.depth = dims[3];
+      members.push_back(reshape->Get());
+      members.push_back(dequantize->Get());
+      members.insert(members.end(), chain.begin(), chain.end());
+      // A rotation behind the norm makes a query or a key; a norm other ops
+      // read is the value.
+      std::optional<Op> rope;
+      if (ReadOnce(normed)) {
+        const Op turn = normed.Uses()[0].user;
+        const bool transposes =
+            turn.Code() == kLiteRtOpCodeTflTranspose &&
+            turn.Inputs().size() == 2 &&
+            QuantInts(turn.Inputs()[1]) == std::vector<int32_t>{0, 2, 1, 3};
+        const bool reshapes =
+            turn.Code() == kLiteRtOpCodeTflReshape && tokens == 1;
+        if ((transposes || reshapes) && turn.Outputs().size() == 1 &&
+            TensorHasShape(turn.Outputs()[0], {1, heads, tokens, dims[3]})) {
+          rope = QuantUser(turn.Outputs()[0], kLiteRtOpCodeShloComposite);
+          if (rope.has_value()) members.push_back(turn.Get());
+        }
+      }
+      if (!rope.has_value()) {
+        // The value: its norm is what the attention's QUANTIZE reads.
+        if (match.roles.empty() || match.roles.back() == 2) return std::nullopt;
+        match.roles.push_back(2);
+        match.norms.push_back(*norm);
+        match.outputs.push_back(normed);
+        continue;
+      }
+      const auto parsed = ParseQuantRope(*rope);
+      if (!parsed.has_value() || parsed->heads != heads ||
+          parsed->tokens != tokens ||
+          (rotated && (parsed->min_timescale != match.rope.min_timescale ||
+                       parsed->max_timescale != match.rope.max_timescale ||
+                       parsed->proportion != match.rope.proportion ||
+                       rope->Inputs()[1].Get() != match.positions->Get()))) {
+        return std::nullopt;
+      }
+      match.rope = *parsed;
+      match.positions = rope->Inputs()[1];
+      rotated = true;
+      members.push_back(rope->Get());
+      Tensor output = rope->Outputs()[0];
+      // The query's scalar behind its rotation; a key has none.
+      std::optional<float> multiplier;
+      if (auto scale = QuantUser(output, kLiteRtOpCodeTflMul);
+          scale && scale->Inputs().size() == 2 &&
+          HasNoFusedActivation(*scale)) {
+        for (int j = 0; j < 2; ++j) {
+          if (auto scalar = ReadFloatScalar(scale->Inputs()[j])) {
+            multiplier = *scalar;
+            output = scale->Outputs()[0];
+            members.push_back(scale->Get());
+            break;
+          }
+        }
+      }
+      // Rows are queries, then keys, then values; without a scalar the
+      // first rotated projection of a group of three is still the query.
+      const bool is_query = match.roles.empty() &&
+                            (multiplier.has_value() || group.ops.size() != 2);
+      if (!is_query && (multiplier.has_value() ||
+                        (!match.roles.empty() && match.roles.back() != 0))) {
+        return std::nullopt;
+      }
+      match.roles.push_back(is_query ? 0 : 1);
+      if (is_query) match.q_multiplier = multiplier.value_or(1.0f);
+      match.norms.push_back(*norm);
+      match.outputs.push_back(output);
+    }
+    if (!rotated) return std::nullopt;
+    return match;
+  }
+
+  // Finds the regions of the statically quantized products (see above) and
+  // takes their ops out of the op-by-op lowering.
+  Expected<void> FindQuantRegions(const Subgraph& subgraph) {
+    if (!QuantProductsEnabled()) {
+      return {};
+    }
+    const auto ops = subgraph.Ops();
+    // Factorized MLPs, around their first BATCH_MATMUL.
+    for (const auto& op : ops) {
+      if (!IsQuantBatchMatmul(op) || unlowered_ops_.count(op.Get()) != 0) {
+        continue;
+      }
+      std::vector<LiteRtOp> members;
+      auto mlp = MatchQuantFactorizedMlp(op, members);
+      if (!mlp.has_value() || !QuantOpsAreFree(members)) continue;
+      quant_outputs_.insert(mlp->output->Get());
+      quant_product_inputs_.insert(mlp->input->Get());
+      quant_factorized_mlps_by_input_[mlp->input->Get()] =
+          quant_factorized_mlps_.size();
+      AddQuantRegion(QuantRegionKind::kFactorizedMlp,
+                     quant_factorized_mlps_.size(), members);
+      quant_factorized_mlps_.push_back(std::move(*mlp));
+    }
+    // Factorized MLPs carved into odml.factorized_mlp: the composite is the
+    // region.
+    for (const auto& op : ops) {
+      const auto carved = ParseQuantFactorizedMlpComposite(op);
+      if (!carved.has_value() || !QuantOpsAreFree({op.Get()})) continue;
+      QuantFactorizedMlp mlp;
+      mlp.input = op.Inputs()[0];
+      for (int i = 1; i <= 6; ++i) mlp.weights.push_back(op.Inputs()[i]);
+      std::copy(std::begin(carved->scales), std::end(carved->scales),
+                mlp.scales);
+      mlp.output = op.Outputs()[0];
+      quant_outputs_.insert(mlp.output->Get());
+      quant_factorized_mlps_by_input_[mlp.input->Get()] =
+          quant_factorized_mlps_.size();
+      AddQuantRegion(QuantRegionKind::kFactorizedMlp,
+                     quant_factorized_mlps_.size(), {op.Get()});
+      quant_factorized_mlps_.push_back(std::move(mlp));
+    }
+    // The other INT8 products with INT4 weights, grouped by the tensor they
+    // read: the q, k and v projections are one launch.
+    for (const auto& op : ops) {
+      if (unlowered_ops_.count(op.Get()) != 0 ||
+          op_order_.count(op.Get()) == 0 || !IsQuantFullyConnected(op) ||
+          op.Inputs()[1].ElementType() != litert::ElementType::Int4) {
+        continue;
+      }
+      QuantProjections group;
+      group.input = op.Inputs()[0];
+      std::vector<LiteRtOp> members;
+      for (const auto& use : group.input->Uses()) {
+        const Op& user = use.user;
+        if (use.user_arg_ind == 0 && unlowered_ops_.count(user.Get()) == 0 &&
+            op_order_.count(user.Get()) != 0 && IsQuantFullyConnected(user) &&
+            user.Inputs()[1].ElementType() == litert::ElementType::Int4 &&
+            QuantMatrixDims(user.Inputs()[1]).second ==
+                QuantMatrixDims(op.Inputs()[1]).second) {
+          group.ops.push_back(user);
+          members.push_back(user.Get());
+        }
+      }
+      std::sort(group.ops.begin(), group.ops.end(),
+                [&](const Op& a, const Op& b) {
+                  return op_order_[a.Get()] < op_order_[b.Get()];
+                });
+      for (const Op& member : group.ops) {
+        quant_outputs_.insert(member.Outputs()[0].Get());
+      }
+      quant_product_inputs_.insert(group.input->Get());
+      quant_projections_by_input_[group.input->Get()] =
+          quant_projections_.size();
+      AddQuantRegion(QuantRegionKind::kProjections, quant_projections_.size(),
+                     members);
+      quant_projections_.push_back(std::move(group));
+    }
+    // The head norms and rotations behind the projection groups.
+    for (size_t i = 0; i < quant_projections_.size(); ++i) {
+      std::vector<LiteRtOp> members;
+      auto match = MatchQuantQkvRope(i, members);
+      if (!match.has_value() || !QuantOpsAreFree(members)) continue;
+      AddQuantRegion(QuantRegionKind::kQkvRope, quant_qkv_ropes_.size(),
+                     members);
+      quant_qkv_ropes_.push_back(std::move(*match));
+    }
+    // The vocabulary head with the float steps in front of it.
+    for (const auto& op : ops) {
+      if (unlowered_ops_.count(op.Get()) != 0 ||
+          op_order_.count(op.Get()) == 0 || !IsQuantLogitsFullyConnected(op)) {
+        continue;
+      }
+      QuantHead head;
+      head.product = op;
+      head.logits = op.Outputs()[0];
+      head.chain = MatchQuantGlueChain(op.Inputs()[0], /*shared=*/true);
+      std::vector<LiteRtOp> members = head.chain.members;
+      members.push_back(op.Get());
+      // The soft cap: CAST -> MUL scalar -> TANH -> MUL scalar.
+      std::vector<LiteRtOp> cap;
+      auto widen = QuantUser(op.Outputs()[0], kLiteRtOpCodeTflCast);
+      auto scale_in = widen
+                          ? QuantUser(widen->Outputs()[0], kLiteRtOpCodeTflMul)
+                          : std::nullopt;
+      auto tanh = scale_in
+                      ? QuantUser(scale_in->Outputs()[0], kLiteRtOpCodeTflTanh)
+                      : std::nullopt;
+      auto scale_out = tanh ? QuantUser(tanh->Outputs()[0], kLiteRtOpCodeTflMul)
+                            : std::nullopt;
+      if (scale_out.has_value() && scale_in->Inputs().size() == 2 &&
+          scale_out->Inputs().size() == 2 &&
+          widen->Outputs()[0].ElementType() == litert::ElementType::Float32 &&
+          HasNoFusedActivation(*scale_in) && HasNoFusedActivation(*scale_out)) {
+        const auto cap_in = ReadFloat32Scalar(scale_in->Inputs()[1]);
+        const auto cap_out = ReadFloat32Scalar(scale_out->Inputs()[1]);
+        if (cap_in.has_value() && cap_out.has_value() && *cap_in != 0.0f) {
+          head.cap_in = *cap_in;
+          head.cap_out = *cap_out;
+          head.logits = scale_out->Outputs()[0];
+          for (const Op& member : {*widen, *scale_in, *tanh, *scale_out}) {
+            members.push_back(member.Get());
+          }
+        }
+      }
+      if (!QuantOpsAreFree(members)) continue;
+      AddQuantRegion(QuantRegionKind::kHead, quant_heads_.size(), members);
+      quant_heads_.push_back(std::move(head));
+    }
+    // The float steps in front of a carved factorized MLP, whose QUANTIZE is
+    // inside the composite: behind an RMS norm the glue quantizes for it.
+    for (const auto& mlp : quant_factorized_mlps_) {
+      if (mlp.input->ElementType() != litert::ElementType::Float16 ||
+          !ReadOnce(*mlp.input)) {
+        continue;
+      }
+      QuantGlue glue;
+      glue.chain = MatchQuantGlueChain(*mlp.input, /*shared=*/false);
+      if (!glue.chain.norm.has_value() ||
+          !QuantOpsAreFree(glue.chain.members)) {
+        continue;
+      }
+      glue.quantized = *mlp.input;
+      glue.scale = mlp.scales[0];
+      const std::vector<LiteRtOp> members = glue.chain.members;
+      quant_glues_.push_back(std::move(glue));
+      AddQuantGlueRegion(*mlp.input, members);
+    }
+    // The float steps in front of the QUANTIZE ops that feed the products:
+    // a QUANTIZE behind an RMS norm becomes a glue layer; any other is left
+    // to the product's kernel, which quantizes its float input itself.
+    for (const auto& op : ops) {
+      if (op.Code() != kLiteRtOpCodeTflQuantize ||
+          unlowered_ops_.count(op.Get()) != 0 ||
+          op_order_.count(op.Get()) == 0 || op.Inputs().size() != 1 ||
+          op.Outputs().size() != 1 ||
+          op.Inputs()[0].ElementType() != litert::ElementType::Float16 ||
+          !IsSymmetricInt8(op.Outputs()[0]) || !ReadOnce(op.Inputs()[0])) {
+        continue;
+      }
+      std::vector<LiteRtOp> members = {op.Get()};
+      Tensor read = op.Outputs()[0];
+      for (int hops = 0;
+           hops < 3 && quant_product_inputs_.count(read.Get()) == 0; ++hops) {
+        auto reshape = QuantUser(read, kLiteRtOpCodeTflReshape);
+        if (!reshape) break;
+        members.push_back(reshape->Get());
+        read = reshape->Outputs()[0];
+      }
+      if (quant_product_inputs_.count(read.Get()) == 0) continue;
+      QuantGlue glue;
+      glue.chain = MatchQuantGlueChain(op.Inputs()[0], /*shared=*/false);
+      if (!glue.chain.norm.has_value()) continue;
+      glue.quantized = op.Outputs()[0];
+      glue.scale = op.Outputs()[0].PerTensorQuantization().scale;
+      members.insert(members.end(), glue.chain.members.begin(),
+                     glue.chain.members.end());
+      if (!QuantOpsAreFree(members)) continue;
+      quant_glues_.push_back(std::move(glue));
+      AddQuantGlueRegion(read, members);
+    }
+    if (!quant_regions_.empty()) {
+      size_t glues_in_projections = 0;
+      for (const auto& group : quant_projections_) {
+        glues_in_projections += group.glue.has_value() ? 1 : 0;
+      }
+      size_t glues_in_factorized_mlps = 0;
+      for (const auto& mlp : quant_factorized_mlps_) {
+        glues_in_factorized_mlps += mlp.glue.has_value() ? 1 : 0;
+      }
+      LITERT_LOG(
+          LITERT_INFO,
+          "NVIDIA TensorRT-RTX quantized products: %zu projection "
+          "launches (%zu with the glue in front), %zu factorized MLPs "
+          "(%zu with the glue in front), %zu glue launches, %zu qkv "
+          "rope launches, %zu heads",
+          quant_projections_.size(), glues_in_projections,
+          quant_factorized_mlps_.size(), glues_in_factorized_mlps,
+          quant_glues_.size() - glues_in_projections - glues_in_factorized_mlps,
+          quant_qkv_ropes_.size(), quant_heads_.size());
+    }
+    return {};
+  }
+
+  Expected<void> LowerQuantProjections(const QuantProjections& group) {
+    const auto [first_rows, columns] =
+        QuantMatrixDims(group.ops[0].Inputs()[1]);
+    static_cast<void>(first_rows);
+    const float input_scale = group.input->PerTensorQuantization().scale;
+    std::vector<absl::Span<const uint8_t>> members;
+    std::vector<float> multipliers;
+    for (const Op& op : group.ops) {
+      const Tensor weights = op.Inputs()[1];
+      const auto q = weights.PerChannelQuantization();
+      const float output_scale = op.Outputs()[0].PerTensorQuantization().scale;
+      members.push_back(weights.Weights().Bytes());
+      for (uint64_t r = 0; r < q.num_channels; ++r) {
+        // XNNPACK's requantization scale, in FP32.
+        const float product = input_scale * q.scales[r];
+        multipliers.push_back(product / output_scale);
+      }
+    }
+    LiteRtNvidiaQuantLinearParams params = {};
+    params.layout = kLiteRtNvidiaQuantLayoutRows;
+    params.bit_width = 4;
+    params.rows = static_cast<int32_t>(multipliers.size());
+    params.columns = columns;
+    params.segments = 1;
+    params.swap0 = 1;
+    params.swap1 = 1;
+    params.activation = kLiteRtNvidiaQuantInt8;
+    params.requant = kLiteRtNvidiaQuantRequantFp32;
+    LITERT_ASSIGN_OR_RETURN(auto glue, QuantGlueInFront(group.glue, params));
+    QuantActivation activation;
+    if (!glue.has_value()) {
+      LITERT_ASSIGN_OR_RETURN(activation,
+                              GetQuantActivation(*group.input, columns));
+      params.activation = activation.type;
+      params.quantize_scale = activation.quantize_scale;
+    }
+    const std::string name =
+        "cuda_quant_projections_" + std::to_string(group.input->TensorIndex());
+    LITERT_ASSIGN_OR_RETURN(
+        auto* result,
+        AddQuantLinear(params, activation.rows, members, multipliers, nullptr,
+                       nullptr, name, glue.has_value() ? &*glue : nullptr));
+    int32_t offset = 0;
+    for (const Op& op : group.ops) {
+      const int32_t rows = QuantMatrixDims(op.Inputs()[1]).first;
+      SetQuantValue(op.Outputs()[0], result, offset, rows,
+                    op.Outputs()[0].PerTensorQuantization().scale);
+      offset += rows;
+    }
+    return {};
+  }
+
+  Expected<void> LowerQuantGlue(const QuantGlue& glue) {
+    const float scale = glue.scale;
+    LITERT_ASSIGN_OR_RETURN(
+        auto* q,
+        AddQuantGlue(glue.chain, kLiteRtNvidiaQuantGlueStatic, scale, nullptr,
+                     "cuda_quant_glue_" +
+                         std::to_string(glue.quantized->TensorIndex())));
+    LITERT_ASSIGN_OR_RETURN(auto type, glue.quantized->RankedTensorType());
+    SetQuantValue(*glue.quantized, q, 0, type.Layout().Dimensions().back(),
+                  scale);
+    return {};
+  }
+
+  Expected<void> LowerQuantQkvRope(const QuantQkvRope& match) {
+    const QuantProjections& group = quant_projections_[match.projections];
+    // The projections' results are the columns of one quant layer result.
+    nvinfer1::ITensor* qkv = nullptr;
+    int32_t offset = 0;
+    LiteRtNvidiaQuantQkvRopeParams params = {};
+    params.depth = match.depth;
+    params.epsilon = match.norms[0].eps;
+    params.q_multiplier = match.q_multiplier;
+    std::vector<nvinfer1::ITensor*> inputs;
+    const std::string name =
+        "cuda_quant_qkv_rope_" + std::to_string(group.input->TensorIndex());
+    for (size_t i = 0; i < group.ops.size(); ++i) {
+      const auto value = quant_values_.find(group.ops[i].Outputs()[0].Get());
+      if (value == quant_values_.end() || value->second.offset != offset ||
+          (qkv != nullptr && value->second.int8 != qkv) ||
+          value->second.width % match.depth != 0 ||
+          match.norms[i].eps != params.epsilon) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "The projections of a quant qkv rope are not one result");
+      }
+      qkv = value->second.int8;
+      offset += value->second.width;
+      const int32_t heads = value->second.width / match.depth;
+      const float scale = RoundFp16(value->second.scale);
+      switch (match.roles[i]) {
+        case 0:
+          params.q_heads = heads;
+          params.q_scale = scale;
+          break;
+        case 1:
+          params.k_heads = heads;
+          params.k_scale = scale;
+          break;
+        default:
+          params.v_heads = heads;
+          params.v_scale = scale;
+      }
+    }
+    if (qkv->getDimensions().d[1] != offset) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "A quant qkv rope does not read every projection");
+    }
+    LITERT_ASSIGN_OR_RETURN(auto* positions, GetTensor(*match.positions));
+    if (positions->getType() != nvinfer1::DataType::kINT32) {
+      return Error(kLiteRtStatusErrorUnsupported,
+                   "odml.rope positions must be int32");
+    }
+    inputs.push_back(qkv);
+    inputs.push_back(positions);
+    for (size_t i = 0; i < group.ops.size(); ++i) {
+      LITERT_ASSIGN_OR_RETURN(
+          auto* weights,
+          QuantFloatConstant(match.norms[i].weights,
+                             name + "_norm_" + std::to_string(i)));
+      inputs.push_back(weights);
+    }
+    // The inverse timescales as the model's decomposition holds them: the
+    // timescale in doubles rounded to FP32, then its reciprocal; the pairs
+    // past the rotated proportion keep an angle of 0.
+    const int32_t pairs = match.depth / 2;
+    const int32_t rotated = static_cast<int32_t>(
+        std::lround(static_cast<double>(match.rope.proportion) * pairs));
+    std::vector<float> inverse(pairs, 0.0f);
+    for (int32_t i = 0; i < rotated && i < pairs; ++i) {
+      const float timescale = static_cast<float>(
+          static_cast<double>(match.rope.min_timescale) *
+          std::pow(static_cast<double>(match.rope.max_timescale) /
+                       match.rope.min_timescale,
+                   static_cast<double>(i) / pairs));
+      inverse[i] = 1.0f / timescale;
+    }
+    nvinfer1::Dims inverse_dims{};
+    inverse_dims.nbDims = 1;
+    inverse_dims.d[0] = pairs;
+    LITERT_ASSIGN_OR_RETURN(
+        auto* timescales,
+        AddFloatConstant(inverse, inverse_dims, name + "_timescales",
+                         nvinfer1::DataType::kFLOAT));
+    inputs.push_back(timescales);
+    TrtPtr<nvinfer1::IPluginV3> plugin(CreateQuantQkvRopePlugin(params));
+    if (!plugin) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to create the quant qkv rope plugin");
+    }
+    auto* layer = tensorrt_rtx_1_5_0_99::AddPluginV3(
+        *network_, inputs.data(), static_cast<int32_t>(inputs.size()), *plugin);
+    if (layer == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to add the quant qkv rope plugin layer");
+    }
+    layer->setName(KeepName(UniqueName(name)));
+    owned_plugins_.push_back(std::move(plugin));
+    // The plugin's outputs are in the order q, k, v, as the rows are.
+    for (size_t i = 0; i < match.outputs.size(); ++i) {
+      LITERT_RETURN_IF_ERROR(SetQuantFloat(
+          match.outputs[i], layer->getOutput(static_cast<int32_t>(i))));
+    }
+    return {};
+  }
+
+  Expected<void> LowerQuantHead(const QuantHead& head) {
+    const Tensor weights = head.product->Inputs()[1];
+    const auto [rows, columns] = QuantMatrixDims(weights);
+    auto scales = CenteredInt2Scales(weights, 1);
+    if (!scales.has_value()) {
+      return Error(kLiteRtStatusErrorUnsupported,
+                   "The head's weights are not centered INT2");
+    }
+    const std::string name =
+        "cuda_quant_head_" + std::to_string(weights.TensorIndex());
+    nvinfer1::ITensor* row_scale = nullptr;
+    LITERT_ASSIGN_OR_RETURN(
+        auto* q, AddQuantGlue(head.chain, kLiteRtNvidiaQuantGlueDynamic, 0.0f,
+                              &row_scale, name + "_glue"));
+    LiteRtNvidiaQuantLinearParams params = {};
+    params.layout = kLiteRtNvidiaQuantLayoutRows;
+    params.bit_width = 2;
+    params.rows = rows;
+    params.columns = columns;
+    params.segments = 1;
+    params.swap0 = 1;
+    params.swap1 = 1;
+    params.activation = kLiteRtNvidiaQuantInt8;
+    params.requant = kLiteRtNvidiaQuantRequantLogits;
+    params.cap_in = head.cap_in;
+    params.cap_out = head.cap_out;
+    const absl::Span<const uint8_t> members[] = {weights.Weights().Bytes()};
+    LITERT_ASSIGN_OR_RETURN(
+        auto* logits,
+        AddQuantLinear(params, q, members, *scales, nullptr, row_scale, name));
+    LITERT_ASSIGN_OR_RETURN(auto type, head.logits->RankedTensorType());
+    LITERT_ASSIGN_OR_RETURN(auto dims, ConvertDims(type));
+    LITERT_ASSIGN_OR_RETURN(logits, ReshapeTensor(logits, dims));
+    // The FP32 logits are the model's output as they are; the hidden state
+    // in FP32 is too, where a CAST makes it one.
+    if (head.logits->ElementType() == litert::ElementType::Float32) {
+      raw_output_map_[head.logits->Get()] = logits;
+    }
+    if (head.chain.normed.has_value()) {
+      for (const auto& use : head.chain.normed->Uses()) {
+        const Op& user = use.user;
+        if (user.Code() == kLiteRtOpCodeTflCast && user.Outputs().size() == 1 &&
+            user.Outputs()[0].ElementType() == litert::ElementType::Float32 &&
+            graph_outputs_.count(user.Outputs()[0].Get()) != 0) {
+          LITERT_ASSIGN_OR_RETURN(auto* hidden, GetTensor(*head.chain.normed));
+          LITERT_ASSIGN_OR_RETURN(
+              hidden, AddCastTensor(hidden, nvinfer1::DataType::kFLOAT));
+          raw_output_map_[user.Outputs()[0].Get()] = hidden;
+        }
+      }
+    }
+    LITERT_LOG(LITERT_INFO,
+               "NVIDIA TensorRT-RTX quant head: weights=%u [%d, %d] soft "
+               "cap=%g",
+               weights.TensorIndex(), rows, columns, head.cap_out);
+    return SetOutputTensor(*head.logits, logits);
+  }
+
+  Expected<void> LowerQuantRegion(const QuantRegion& region) {
+    switch (region.kind) {
+      case QuantRegionKind::kProjections:
+        return LowerQuantProjections(quant_projections_[region.index]);
+      case QuantRegionKind::kFactorizedMlp:
+        return LowerQuantFactorizedMlp(quant_factorized_mlps_[region.index]);
+      case QuantRegionKind::kGlue:
+        return LowerQuantGlue(quant_glues_[region.index]);
+      case QuantRegionKind::kQkvRope:
+        return LowerQuantQkvRope(quant_qkv_ropes_[region.index]);
+      case QuantRegionKind::kHead:
+        return LowerQuantHead(quant_heads_[region.index]);
+    }
+    return Error(kLiteRtStatusErrorCompilation, "Unknown quant region");
+  }
+
   // The fused qkv norm and rotary embedding as one plugin launch.
   Expected<void> LowerCompositeQkvNormRope(const Op& op) {
     const auto parsed = ParseQkvNormRope(op);
@@ -10853,7 +14478,20 @@ class TensorRtGraphBuilder {
       return LowerCompositeSwiglu(op);
     }
     if (name == "odml.cache_update") {
+      if (const auto form = ParseQuantCacheUpdate(op); form.has_value()) {
+        return LowerQuantCacheUpdate(op, *form);
+      }
       return LowerCompositeCacheUpdate(op);
+    }
+    if (name == "odml.sdpa_transposed") {
+      if (const auto form = ParseQuantSdpa(op); form.has_value()) {
+        return LowerQuantSdpa(op, *form);
+      }
+    }
+    if (name == "odml.fused_sdpa_cache_update") {
+      if (const auto form = ParseQuantFusedSdpa(op); form.has_value()) {
+        return LowerQuantFusedSdpa(op, *form);
+      }
     }
     if (name == "odml.runtime_bmm") {
       return LowerCompositeRuntimeBmm(op);
@@ -10943,6 +14581,10 @@ class TensorRtGraphBuilder {
         gdn != gdn_anchor_ops_.end()) {
       return LowerGatedDeltaNetBlock(gdn->second);
     }
+    if (auto region = quant_regions_.find(op.Get());
+        region != quant_regions_.end()) {
+      return LowerQuantRegion(region->second);
+    }
     if (unlowered_ops_.count(op.Get()) != 0) {
       return {};
     }
@@ -11001,6 +14643,8 @@ class TensorRtGraphBuilder {
         return LowerConcatenation(op);
       case kLiteRtOpCodeTflBatchMatmul:
         return LowerBatchMatmul(op);
+      case kLiteRtOpCodeTflOneHot:
+        return LowerOneHot(op);
       case kLiteRtOpCodeTflFullyConnected:
         return LowerFullyConnected(op);
       case kLiteRtOpCodeTflSelectV2:
@@ -11061,6 +14705,9 @@ class TensorRtGraphBuilder {
   // Produced tensors that already carry the boundary format (e.g. int8 cache
   // scatter results); MarkOutputs prefers these over the FP16 view.
   std::unordered_map<LiteRtTensor, nvinfer1::ITensor*> raw_output_map_;
+  // The INT4 caches the engine declares as their INT8 bytes
+  // (FindPackedInt4Caches); true for a value cache.
+  std::unordered_map<LiteRtTensor, bool> packed_int4_caches_;
   std::vector<std::string> input_names_;
   std::vector<std::string> output_names_;
   int next_name_id_ = 0;
@@ -11072,7 +14719,12 @@ class TensorRtGraphBuilder {
     nvinfer1::ILayer* layer = nullptr;
     uint32_t segment = 0;
     bool scales_too = false;  // the blockwise scales are in the segment too
+    int32_t input = 1;        // the layer's input that takes the holder
   };
+  // The odml.cache_update ops whose token the attention over their caches
+  // writes (LowerQuantCacheUpdate), by their updated key cache, until that
+  // attention is lowered.
+  std::unordered_map<LiteRtTensor, Op> joined_quant_cache_updates_;
   // Float32 caches declared to TensorRT as FP16 (Fp16CacheStorageEnabled).
   std::unordered_set<LiteRtTensor> fp16_stored_caches_;
   // Cache inputs another engine keeps in place (FindSharedCacheInputs).
@@ -11112,6 +14764,23 @@ class TensorRtGraphBuilder {
   // (FindGatedDeltaNetBlocks).
   std::vector<GatedDeltaNetBlock> gdn_blocks_;
   std::unordered_map<LiteRtOp, size_t> gdn_anchor_ops_;
+  // The statically quantized products (FindQuantRegions): the INT8 values
+  // the quant layers produced, by model tensor; the regions, by the op that
+  // emits them; the INT8 tensors the product regions will produce and read.
+  std::unordered_map<LiteRtTensor, QuantValue> quant_values_;
+  // The FLOAT16 results of the quant layers, by model tensor.
+  std::unordered_map<LiteRtTensor, nvinfer1::ITensor*> quant_floats_;
+  std::unordered_map<LiteRtOp, QuantRegion> quant_regions_;
+  std::unordered_set<LiteRtTensor> quant_outputs_;
+  std::unordered_set<LiteRtTensor> quant_product_inputs_;
+  // The projections regions (quant_projections_) by the tensor they read.
+  std::unordered_map<LiteRtTensor, size_t> quant_projections_by_input_;
+  std::unordered_map<LiteRtTensor, size_t> quant_factorized_mlps_by_input_;
+  std::vector<QuantProjections> quant_projections_;
+  std::vector<QuantFactorizedMlp> quant_factorized_mlps_;
+  std::vector<QuantGlue> quant_glues_;
+  std::vector<QuantQkvRope> quant_qkv_ropes_;
+  std::vector<QuantHead> quant_heads_;
 };
 
 }  // namespace
@@ -11197,6 +14866,10 @@ bool IsTensorRtOpSupported(const Op& op) {
       break;
     case kLiteRtOpCodeTflBatchMatmul:
       result = IsBatchMatmulSupported(op);
+      break;
+    case kLiteRtOpCodeTflOneHot:
+      // Only as the selector of a table lookup, whose rows are gathered.
+      result = OneHotTableLookup(op).has_value();
       break;
     case kLiteRtOpCodeTflFullyConnected:
       result = IsFullyConnectedSupported(op);

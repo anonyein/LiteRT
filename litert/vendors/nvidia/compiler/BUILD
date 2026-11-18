@@ -209,6 +209,19 @@ cc_library(
 )
 
 cc_library(
+    name = "quant_linear_plugin",
+    srcs = ["quant_linear_plugin.cc"],
+    hdrs = ["quant_linear_plugin.h"],
+    tags = ["manual"],
+    deps = [
+        "//litert/vendors/nvidia/trtllm:gemma4_head_kernels",
+        "@local_cuda//:cuda_headers",
+        "@local_cuda//:cuda_runtime",
+        "@local_tensorrt_rtx//:tensorrt_rtx_headers",
+    ],
+)
+
+cc_library(
     name = "gated_delta_plugin",
     srcs = ["gated_delta_plugin.cc"],
     hdrs = ["gated_delta_plugin.h"],
@@ -254,6 +267,73 @@ cc_test(
         "//litert/vendors/nvidia:windows_compat",
         "//litert/vendors/nvidia/trtllm:gemma4_head_kernels",
         "@com_google_googletest//:gtest_main",
+        "@local_cuda//:cuda_headers",
+        "@local_cuda//:cuda_runtime",
+        "@local_tensorrt_rtx//:tensorrt_rtx_headers",
+        "@local_tensorrt_rtx//:tensorrt_rtx_stub",
+    ],
+)
+
+cc_library(
+    name = "quant_attention_plugin",
+    srcs = ["quant_attention_plugin.cc"],
+    hdrs = ["quant_attention_plugin.h"],
+    tags = ["manual"],
+    deps = [
+        "//litert/vendors/nvidia/trtllm:gemma4_head_kernels",
+        "@local_cuda//:cuda_headers",
+        "@local_cuda//:cuda_runtime",
+        "@local_tensorrt_rtx//:tensorrt_rtx_headers",
+    ],
+)
+
+cc_library(
+    name = "quant_attention_test_graph",
+    testonly = True,
+    hdrs = ["quant_attention_test_graph.h"],
+    tags = ["manual"],
+    deps = [
+        "//litert/c:litert_model_types",
+        "//litert/c:litert_op_code",
+        "//litert/cc:litert_buffer_ref",
+        "//litert/core/model",
+        "//tflite/schema:schema_fbs",
+        "@flatbuffers",
+    ],
+)
+
+cc_test(
+    name = "quant_attention_graph_test",
+    srcs = ["quant_attention_graph_test.cc"],
+    env = {
+        "LITERT_NVIDIA_TENSORRT_FP16_ACTIVATIONS": "bf16",
+        "LITERT_NVIDIA_TENSORRT_SHARED_WEIGHTS": "0",
+    },
+    tags = [
+        "exclusive",
+        "manual",
+        "requires-gpu",
+    ],
+    target_compatible_with = select({
+        "//litert:linux_x86_64": [],
+        "//litert:windows": [],
+        "//litert:linux_aarch64": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":quant_attention_test_graph",
+        ":tensorrt_graph_builder",
+        "//litert/c:litert_model_types",
+        "//litert/c:litert_op_code",
+        "//litert/c/internal:litert_compiler_context",
+        "//litert/cc:litert_buffer_ref",
+        "//litert/compiler/cc:litert_model",
+        "//litert/core/model",
+        "//litert/vendors/nvidia:tensorrt_logger",
+        "//litert/vendors/nvidia/trtllm:quant_attention_reference",
+        "//tflite/schema:schema_fbs",
+        "@com_google_googletest//:gtest_main",
+        "@flatbuffers",
         "@local_cuda//:cuda_headers",
         "@local_cuda//:cuda_runtime",
         "@local_tensorrt_rtx//:tensorrt_rtx_headers",
@@ -371,6 +451,8 @@ cc_library(
         ":int8_cache_write_plugin",
         ":moe_plugin",
         ":qkv_norm_rope_plugin",
+        ":quant_attention_plugin",
+        ":quant_linear_plugin",
         ":subbyte_gemv_plugin",
         ":weight_store_builder",
         "//litert/c:litert_common",
@@ -435,6 +517,7 @@ cc_test(
         "//conditions:default": ["@platforms//:incompatible"],
     }),
     deps = [
+        ":moe_plugin",
         ":tensorrt_graph_builder",
         ":weight_holder_calibration",
         ":weight_store_builder",
@@ -446,6 +529,45 @@ cc_test(
         "//litert/core/model",
         "//litert/vendors/nvidia:cache_layout",
         "//litert/vendors/nvidia:tensorrt_logger",
+        "//tflite/schema:schema_fbs",
+        "@com_google_googletest//:gtest_main",
+        "@flatbuffers",
+        "@local_cuda//:cuda_headers",
+        "@local_cuda//:cuda_runtime",
+        "@local_tensorrt_rtx//:tensorrt_rtx_headers",
+        "@local_tensorrt_rtx//:tensorrt_rtx_stub",
+    ],
+)
+
+cc_test(
+    name = "quant_linear_lowering_test",
+    srcs = ["quant_linear_lowering_test.cc"],
+    env = {
+        "LITERT_NVIDIA_TENSORRT_FP16_ACTIVATIONS": "bf16",
+        "LITERT_NVIDIA_TENSORRT_SHARED_WEIGHTS": "0",
+    },
+    tags = [
+        "exclusive",
+        "manual",
+        "requires-gpu",
+    ],
+    target_compatible_with = select({
+        "//litert:linux_x86_64": [],
+        "//litert:windows": [],
+        "//litert:linux_aarch64": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":tensorrt_graph_builder",
+        "//litert/c:litert_model_types",
+        "//litert/c:litert_op_code",
+        "//litert/c/internal:litert_compiler_context",
+        "//litert/cc:litert_buffer_ref",
+        "//litert/compiler/cc:litert_model",
+        "//litert/core/model",
+        "//litert/vendors/nvidia:tensorrt_logger",
+        "//litert/vendors/nvidia/trtllm:gemma4_head_kernels",
+        "//litert/vendors/nvidia/trtllm:quant_linear_reference",
         "//tflite/schema:schema_fbs",
         "@com_google_googletest//:gtest_main",
         "@flatbuffers",
@@ -485,6 +607,7 @@ cc_test(
         "//conditions:default": ["@platforms//:incompatible"],
     }),
     deps = [
+        ":moe_plugin",
         ":tensorrt_graph_builder",
         ":weight_holder_calibration",
         ":weight_store_builder",

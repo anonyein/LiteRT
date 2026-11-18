@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +26,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -809,6 +811,71 @@ TEST_F(AotEngineResidencyTest, UploadsHostWritesWhenAnInvocationReadsThem) {
   input_.device_ptr = output_.device_ptr = nullptr;
 }
 
+void CUDART_CB HoldTheStream(void*) {
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+}
+
+// LiteRT-LM clears a CUDA tensor buffer and then writes it (the vision
+// encoder's input patches). The clear must have landed when the next
+// invocation uploads the write, whatever else the device is busy with: a
+// blocking stream's work holds the default stream back here.
+TEST_F(AotEngineResidencyTest, AClearLandsBeforeTheWriteThatFollowsIt) {
+  ScopedEnvironment eager("LITERT_NVIDIA_DISPATCH_LAZY_AOT_ENGINES", "0");
+  const auto* handlers = tensor_buffer_handlers_def_;
+  ASSERT_NE(handlers, nullptr);
+  ASSERT_EQ(cudaFree(input_.device_ptr), cudaSuccess);
+  ASSERT_EQ(cudaFree(output_.device_ptr), cudaSuccess);
+  input_.device_ptr = output_.device_ptr = nullptr;
+  auto type = TensorType();
+  HwMemoryInfoPtr input_info = nullptr;
+  HwMemoryInfoPtr output_info = nullptr;
+  ASSERT_EQ(handlers->create_func(nullptr, nullptr, &type, kCudaBufferType,
+                                  kBytes, kBytes, &input_info),
+            kLiteRtStatusOk);
+  ASSERT_EQ(handlers->create_func(nullptr, nullptr, &type, kCudaBufferType,
+                                  kBytes, kBytes, &output_info),
+            kLiteRtStatusOk);
+  input_.device_ptr = input_info->memory_handle;
+  output_.device_ptr = output_info->memory_handle;
+  CreateDevice();
+  ASSERT_FALSE(HasFatalFailure());
+  auto bytes = BuildBytecode("a", 1.0f, false);
+  ASSERT_TRUE(bytes) << bytes.Error().Message();
+  ASSERT_EQ(CreateContext(*bytes, "a", &a_), kLiteRtStatusOk);
+  Bind(a_);
+  ASSERT_FALSE(HasFatalFailure());
+
+  cudaStream_t busy = nullptr;
+  ASSERT_EQ(cudaStreamCreate(&busy), cudaSuccess);
+  ASSERT_EQ(cudaLaunchHostFunc(busy, HoldTheStream, nullptr), cudaSuccess);
+  ASSERT_EQ(handlers->clear_func(input_info), kLiteRtStatusOk);
+  void* host = nullptr;
+  ASSERT_EQ(
+      handlers->lock_func(input_info, kLiteRtTensorBufferLockModeWrite, &host),
+      kLiteRtStatusOk);
+  ASSERT_NE(host, nullptr);
+  for (int i = 0; i < kElements; ++i) {
+    static_cast<float*>(host)[i] = 5.0f + i;
+  }
+  ASSERT_EQ(handlers->unlock_func(input_info), kLiteRtStatusOk);
+  ASSERT_EQ(interface_->invoke(a_), kLiteRtStatusOk);
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  ASSERT_EQ(cudaStreamDestroy(busy), cudaSuccess);
+  std::array<float, kElements> device;
+  ASSERT_EQ(cudaMemcpy(device.data(), input_.device_ptr, kBytes,
+                       cudaMemcpyDeviceToHost),
+            cudaSuccess);
+  for (int i = 0; i < kElements; ++i) {
+    EXPECT_FLOAT_EQ(device[i], 5.0f + i) << i;
+  }
+
+  EXPECT_EQ(interface_->invocation_context_destroy(a_), kLiteRtStatusOk);
+  contexts_.clear();
+  EXPECT_EQ(handlers->destroy_func(input_info), kLiteRtStatusOk);
+  EXPECT_EQ(handlers->destroy_func(output_info), kLiteRtStatusOk);
+  input_.device_ptr = output_.device_ptr = nullptr;
+}
+
 TEST_F(AotEngineResidencyTest, DefaultEagerModeDoesNotReopenArtifacts) {
   ScopedEnvironment eager("LITERT_NVIDIA_DISPATCH_LAZY_AOT_ENGINES", "0");
   PreparePair();
@@ -818,6 +885,63 @@ TEST_F(AotEngineResidencyTest, DefaultEagerModeDoesNotReopenArtifacts) {
   Run(a_, 0.0f, 1.0f);
   Run(b_, 0.0f, 2.0f);
   Run(a_, 10.0f, 1.0f);
+}
+
+TEST_F(AotEngineResidencyTest, KeepsOneVariantOfAPlanResident) {
+  // Two plans refitted with the same constants stand for a partition compiled
+  // for two input sizes (a vision encoder's signatures). Creating the second
+  // evicts the first (keeping its runtime cache); the first is reloaded from
+  // its artifact when it runs, and both then stay resident.
+  ScopedEnvironment eager("LITERT_NVIDIA_DISPATCH_LAZY_AOT_ENGINES", "0");
+  ScopedEnvironment cache("LITERT_NVIDIA_DISPATCH_RUNTIME_CACHE_DIR",
+                          directory_.c_str());
+  CreateDevice();
+  ASSERT_FALSE(HasFatalFailure());
+  std::array<std::string, 2> paths;
+  std::array<std::string, 2> cache_paths;
+  std::array<LiteRtDispatchInvocationContext, 2> variants = {nullptr, nullptr};
+  for (int i = 0; i < 2; ++i) {
+    const char* name = i == 0 ? "a" : "b";
+    auto bytes = BuildBytecode(name, 3.0f, /*stripped=*/true);
+    ASSERT_TRUE(bytes) << bytes.Error().Message();
+    paths[i] = directory_ + "/" + name + ".bin";
+    ASSERT_TRUE(Write(paths[i], *bytes));
+    auto locator = Locator(paths[i], *bytes);
+    ASSERT_TRUE(locator) << locator.Error().Message();
+    const auto fingerprint =
+        FingerprintTensorRtAotArtifact(bytes->data(), bytes->size());
+    char key[33];
+    std::snprintf(key, sizeof(key), "%016llx%016llx",
+                  static_cast<unsigned long long>(fingerprint.low),
+                  static_cast<unsigned long long>(fingerprint.high));
+    cache_paths[i] =
+        directory_ + "/" + name + "_" + key + ".trt_rtx_runtime_cache";
+    paths_.push_back(cache_paths[i]);
+    ASSERT_EQ(CreateContext(*locator, name, &variants[i]), kLiteRtStatusOk);
+    Bind(variants[i]);
+    ASSERT_FALSE(HasFatalFailure());
+  }
+  // The evicted variant kept the runtime cache of its execution context,
+  // though it never ran, as an eager context does at its destruction.
+  struct stat status{};
+  EXPECT_EQ(stat(cache_paths[0].c_str(), &status), 0);
+  // The last variant created is resident: it runs without its artifact.
+  const std::string saved = directory_ + "/saved.bin";
+  paths_.push_back(saved);
+  ASSERT_EQ(rename(paths[1].c_str(), saved.c_str()), 0);
+  Run(variants[1], 0.0f, 3.0f);
+  ASSERT_EQ(rename(saved.c_str(), paths[1].c_str()), 0);
+  // The first was evicted: it needs its artifact.
+  ASSERT_EQ(rename(paths[0].c_str(), saved.c_str()), 0);
+  EXPECT_EQ(interface_->invoke(variants[0]), kLiteRtStatusErrorFileIO);
+  ASSERT_EQ(rename(saved.c_str(), paths[0].c_str()), 0);
+  Run(variants[0], 10.0f, 3.0f);
+  // Reloaded, it stays resident beside the other.
+  ASSERT_EQ(unlink(paths[0].c_str()), 0);
+  ASSERT_EQ(unlink(paths[1].c_str()), 0);
+  Run(variants[1], 20.0f, 3.0f);
+  Run(variants[0], 30.0f, 3.0f);
+  Run(variants[1], 40.0f, 3.0f);
 }
 
 TEST_F(AotEngineResidencyTest, NamesTheRuntimeCacheByTheArtifactFingerprint) {

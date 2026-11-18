@@ -85,7 +85,7 @@ using litert::Expected;
 
 constexpr char kPluginManufacturer[] = "NVIDIA";
 constexpr char kPluginSocModel[] = "tensorrt-rtx";
-constexpr uint32_t kNvidiaCompilerCacheSchemaVersion = 19;
+constexpr uint32_t kNvidiaCompilerCacheSchemaVersion = 26;
 
 enum class PartitionPolicy {
   kSafe,
@@ -189,6 +189,8 @@ struct PendingBundleEntry {
       feed.multiplier = step_feed->multiplier;
       feed.row_scales = step_feed->row_scales.data();
       feed.row_scales_size = step_feed->row_scales.size();
+      feed.table_bits = step_feed->table_bits;
+      feed.table_zero_point = step_feed->table_zero_point;
       feed_ptr = &feed;
     }
     if (trtllm_head.has_value()) {
@@ -358,11 +360,16 @@ bool IsValidatedGemma4TensorRtOp(const litert::compiler::Op& op) {
     case kLiteRtOpCodeTflGreaterEqual:
     case kLiteRtOpCodeTflLess:
     case kLiteRtOpCodeTflLogicalAnd:
+    // The SiLU between the stages of a factorized MLP (LOGISTIC, MUL).
+    case kLiteRtOpCodeTflLogistic:
     case kLiteRtOpCodeTflMaximum:
     case kLiteRtOpCodeTflMean:
     case kLiteRtOpCodeTflMinimum:
     case kLiteRtOpCodeTflMul:
     case kLiteRtOpCodeTflNotEqual:
+    // Only as the selector of a table lookup (the Gemma 4 vision export's
+    // position embeddings); other one-hots are not supported.
+    case kLiteRtOpCodeTflOneHot:
     case kLiteRtOpCodeTflPack:
     case kLiteRtOpCodeTflQuantize:
     case kLiteRtOpCodeTflReduceMax:
@@ -1407,8 +1414,9 @@ bool ContainsReductionOp(const LiteRtCompilerContext* ctx,
   return false;
 }
 
-// Whether the island writes a KV cache: an odml.cache_update composite or a
-// dynamic update slice. Such an island is kept however small: on the CPU it
+// Whether the island writes a KV cache: an odml.cache_update or
+// odml.fused_sdpa_cache_update composite or a dynamic update slice. Such an
+// island is kept however small: on the CPU it
 // would rewrite a whole cache that the engines keep on the device (Gemma 4
 // 26B's prefill ends with the last layer's cache update, which the unlowered
 // rope composite before it cuts off from the rest of the graph).
@@ -1422,7 +1430,9 @@ bool ContainsCacheUpdate(const LiteRtCompilerContext* ctx,
     const char* name = nullptr;
     if (op.Code() == kLiteRtOpCodeShloComposite &&
         LiteRtGetSHLOCompositeOpName(raw_op, &name) == kLiteRtStatusOk &&
-        name != nullptr && std::strcmp(name, "odml.cache_update") == 0) {
+        name != nullptr &&
+        (std::strcmp(name, "odml.cache_update") == 0 ||
+         std::strcmp(name, "odml.fused_sdpa_cache_update") == 0)) {
       return true;
     }
   }

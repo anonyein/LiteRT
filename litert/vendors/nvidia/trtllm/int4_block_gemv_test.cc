@@ -387,6 +387,109 @@ TEST(Int4BlockGemvTest, GatedFeedForwardMatchesCpuReference) {
   }
 }
 
+// Whether BF16 outputs `test` agree with `reference` to their rounding: each
+// within two units in the last place of the larger, or of a hundredth of
+// the outputs' RMS where they cancel to near zero. Returns the share of
+// bit-identical values.
+double ExpectBf16Close(const std::vector<uint16_t>& reference,
+                       const std::vector<uint16_t>& test) {
+  EXPECT_EQ(reference.size(), test.size());
+  double squares = 0.0;
+  for (const uint16_t value : reference) {
+    squares +=
+        static_cast<double>(Bf16BitsToFloat(value)) * Bf16BitsToFloat(value);
+  }
+  const float floor =
+      0.01f * static_cast<float>(
+                  std::sqrt(squares / std::max<size_t>(1, reference.size())));
+  size_t same = 0;
+  for (size_t i = 0; i < reference.size() && i < test.size(); ++i) {
+    same += reference[i] == test[i] ? 1 : 0;
+    const float a = Bf16BitsToFloat(reference[i]);
+    const float b = Bf16BitsToFloat(test[i]);
+    const float scale = std::max({std::fabs(a), std::fabs(b), floor});
+    EXPECT_LE(std::fabs(a - b), scale * (2.0f / 128.0f))
+        << "i=" << i << " " << a << " " << b;
+  }
+  return static_cast<double>(same) / std::max<size_t>(1, reference.size());
+}
+
+// A verify step's rows (2 or more) multiply on the tensor cores; a row alone
+// takes the FP32 kernel. The products agree to the outputs' rounding (most
+// bit for bit), plain, gated and with the norm fused, over the projections'
+// input sizes and a partial tile of channels.
+TEST(Int4BlockGemvTest, VerifyRowsMatchEachRowAlone) {
+  struct Case {
+    int n;
+    int k;
+    int gate;
+    bool norm;
+  };
+  const Case cases[] = {
+      {44, 704, 0, false},   {2816, 2112, 0, false}, {2816, 4096, 0, false},
+      {1000, 2816, 0, true}, {270, 2816, 1, true},   {136, 2112, 2, false},
+  };
+  for (const auto& c : cases) {
+    for (const int rows : {2, 5, 8}) {
+      SCOPED_TRACE(::testing::Message()
+                   << "n=" << c.n << " k=" << c.k << " gate=" << c.gate
+                   << " norm=" << c.norm << " rows=" << rows);
+      const int channels = c.gate != 0 ? 2 * c.n : c.n;
+      const std::vector<uint8_t> weights = MakeInt4Weights(channels, c.k, 11);
+      const std::vector<uint16_t> scales = MakeScales(channels, c.k, 11);
+      std::vector<uint16_t> activation(static_cast<size_t>(rows) * c.k);
+      for (size_t i = 0; i < activation.size(); ++i) {
+        activation[i] = FloatToBf16Bits(
+            static_cast<float>(static_cast<int>((i * 37) % 211) - 105) /
+            (i % 97 == 0 ? 3.0f : 53.0f));
+      }
+      std::vector<float> norm_scale(c.k);
+      for (int i = 0; i < c.k; ++i) norm_scale[i] = 0.6f + 0.0037f * (i % 89);
+      auto d_w = AllocateCuda(weights.size());
+      auto d_s = AllocateCuda(scales.size() * 2);
+      auto d_a = AllocateCuda(activation.size() * 2);
+      auto d_ns = AllocateCuda(norm_scale.size() * 4);
+      auto d_rows = AllocateCuda(static_cast<size_t>(rows) * c.n * 2);
+      auto d_one = AllocateCuda(static_cast<size_t>(rows) * c.n * 2);
+      ASSERT_TRUE(d_w && d_s && d_a && d_ns && d_rows && d_one);
+      cudaMemcpy(d_w.get(), weights.data(), weights.size(),
+                 cudaMemcpyHostToDevice);
+      cudaMemcpy(d_s.get(), scales.data(), scales.size() * 2,
+                 cudaMemcpyHostToDevice);
+      cudaMemcpy(d_a.get(), activation.data(), activation.size() * 2,
+                 cudaMemcpyHostToDevice);
+      cudaMemcpy(d_ns.get(), norm_scale.data(), norm_scale.size() * 4,
+                 cudaMemcpyHostToDevice);
+      const float* ns =
+          c.norm ? static_cast<const float*>(d_ns.get()) : nullptr;
+      ASSERT_EQ(
+          LiteRtNvidiaLaunchBf16Int4BlockGemvRowsNormed(
+              d_a.get(), static_cast<const uint8_t*>(d_w.get()), d_s.get(), ns,
+              1e-6f, 0.75f, d_rows.get(), rows, c.k, c.n, c.gate, nullptr),
+          cudaSuccess);
+      for (int r = 0; r < rows; ++r) {
+        ASSERT_EQ(LiteRtNvidiaLaunchBf16Int4BlockGemvRowsNormed(
+                      static_cast<const uint16_t*>(d_a.get()) +
+                          static_cast<size_t>(r) * c.k,
+                      static_cast<const uint8_t*>(d_w.get()), d_s.get(), ns,
+                      1e-6f, 0.75f,
+                      static_cast<uint16_t*>(d_one.get()) +
+                          static_cast<size_t>(r) * c.n,
+                      1, c.k, c.n, c.gate, nullptr),
+                  cudaSuccess);
+      }
+      ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+      std::vector<uint16_t> together(static_cast<size_t>(rows) * c.n);
+      std::vector<uint16_t> alone(together.size());
+      cudaMemcpy(together.data(), d_rows.get(), together.size() * 2,
+                 cudaMemcpyDeviceToHost);
+      cudaMemcpy(alone.data(), d_one.get(), alone.size() * 2,
+                 cudaMemcpyDeviceToHost);
+      EXPECT_GE(ExpectBf16Close(alone, together), 0.9);
+    }
+  }
+}
+
 // The experts' weights in the model's interleaved layout: row o of expert e
 // is row o * experts + e.
 struct MoeCase {
@@ -796,6 +899,12 @@ TEST(Int4BlockGemvTest, TimesDecodeShapes) {
       {"head [262144 x 2816]", 1, 262144, 2816, 0},
       {"qkv, 4 rows", 4, 8192, 2816, 0},
       {"head, 4 rows", 4, 262144, 2816, 0},
+      // A verify step's five rows (four drafts and the token before them).
+      {"qkv, 5 rows", 5, 8192, 2816, 0},
+      {"o, 5 rows", 5, 2816, 4096, 0},
+      {"gate+up, 5 rows", 5, 4224, 2816, 0},
+      {"down, 5 rows", 5, 2816, 2112, 0},
+      {"head, 5 rows", 5, 262144, 2816, 0},
   };
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
@@ -925,6 +1034,206 @@ TEST(Int4BlockGemvTest, TimesDecodeShapes) {
         8.0 * (2 * 704 * 1408 + 2816 * 352 + 2 * 704 * 88 * 2 + 2816 * 22 * 2);
     std::printf("%-30s %8.1f us  %6.0f GB/s (3 launches)\n",
                 "moe decode, 8 experts", us, bytes / (us * 1e-6) / 1e9);
+  }
+  // The expert launch of a verify step: 5 rows of 8 experts, 28 of them
+  // distinct (three experts every row routes to, five of the row's own),
+  // from an expert-major arena with compact scales as the plugin loads it,
+  // its rows grouped by expert (integrated GPUs) and not (discrete ones).
+  {
+    const LiteRtNvidiaMoeShape shape = {5, 8, 128, 2816, 704, 1};
+    const size_t gate_rows = 704 * 128, down_rows = 2816 * 128;
+    const auto filled = [](size_t bytes, uint8_t value) {
+      auto device = AllocateCuda(bytes);
+      cudaMemset(device.get(), value, bytes);
+      return device;
+    };
+    auto d_gate = filled(gate_rows * 2816 / 2, 0x5a);
+    auto d_up = filled(gate_rows * 2816 / 2, 0x3c);
+    auto d_down = filled(down_rows * 704 / 2, 0x5a);
+    auto d_gate_q = filled(gate_rows * 88, 200);
+    auto d_up_q = filled(gate_rows * 88, 200);
+    auto d_down_q = filled(down_rows * 22, 200);
+    auto d_gate_m = filled(gate_rows * 2, 0x20);
+    auto d_up_m = filled(gate_rows * 2, 0x20);
+    auto d_down_m = filled(down_rows * 2, 0x20);
+    std::vector<int32_t> indices(40);
+    for (int r = 0; r < 5; ++r) {
+      for (int j = 0; j < 5; ++j) indices[r * 8 + j] = (r * 5 + j) * 4 + 1;
+      indices[r * 8 + 5] = 2;
+      indices[r * 8 + 6] = 50;
+      indices[r * 8 + 7] = 126;
+    }
+    std::vector<int32_t> distinct = indices;
+    std::sort(distinct.begin(), distinct.end());
+    distinct.erase(std::unique(distinct.begin(), distinct.end()),
+                   distinct.end());
+    const std::vector<float> weights(40, 0.125f);
+    const std::vector<float> expert_scale(128, 1.0f);
+    std::vector<uint16_t> activation(5 * 2816);
+    for (size_t i = 0; i < activation.size(); ++i) {
+      activation[i] =
+          FloatToBf16Bits(0.25f + 0.001f * static_cast<float>(i % 89));
+    }
+    const auto upload = [](const void* data, size_t bytes) {
+      auto device = AllocateCuda(bytes);
+      cudaMemcpy(device.get(), data, bytes, cudaMemcpyHostToDevice);
+      return device;
+    };
+    auto d_act = upload(activation.data(), activation.size() * 2);
+    auto d_idx = upload(indices.data(), indices.size() * 4);
+    auto d_w = upload(weights.data(), weights.size() * 4);
+    auto d_es = upload(expert_scale.data(), expert_scale.size() * 4);
+    auto d_ws = AllocateCuda(LiteRtNvidiaMoeWorkspaceBytes(&shape));
+    auto d_out = AllocateCuda(5 * 2816 * 2);
+    LiteRtNvidiaMoeArena arena = {};
+    arena.gate = static_cast<const uint8_t*>(d_gate.get());
+    arena.up = static_cast<const uint8_t*>(d_up.get());
+    arena.down = static_cast<const uint8_t*>(d_down.get());
+    arena.gate_scales = d_gate_q.get();
+    arena.up_scales = d_up_q.get();
+    arena.down_scales = d_down_q.get();
+    arena.gate_scale_max = d_gate_m.get();
+    arena.up_scale_max = d_up_m.get();
+    arena.down_scale_max = d_down_m.get();
+    arena.compact_scales = 1;
+    arena.expert_major = 1;
+    for (const int grouped : {1, 0}) {
+      arena.group_rows = grouped;
+      const auto launch = [&]() {
+        return LiteRtNvidiaLaunchMoeInt4Block(
+            &shape, &arena, d_act.get(),
+            static_cast<const int32_t*>(d_idx.get()),
+            static_cast<const float*>(d_w.get()),
+            static_cast<const float*>(d_es.get()), d_ws.get(), d_out.get(),
+            nullptr);
+      };
+      ASSERT_EQ(launch(), cudaSuccess);
+      ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+      cudaEventRecord(start);
+      for (int i = 0; i < kIterations; ++i) ASSERT_EQ(launch(), cudaSuccess);
+      cudaEventRecord(stop);
+      ASSERT_EQ(cudaEventSynchronize(stop), cudaSuccess);
+      float ms = 0.0f;
+      cudaEventElapsedTime(&ms, start, stop);
+      const double us = ms * 1000.0 / kIterations;
+      // Each distinct expert's rows and compact scales, read once.
+      const double bytes =
+          static_cast<double>(distinct.size()) *
+          (2.0 * 704 * (1408 + 88 + 2) + 2816 * (352 + 22 + 2));
+      std::printf("%-30s %8.1f us  %6.0f GB/s (%zu experts)\n",
+                  grouped ? "moe verify, grouped" : "moe verify, per pair", us,
+                  bytes / (us * 1e-6) / 1e9, distinct.size());
+    }
+  }
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+}
+
+// The expert launch of a 1,024-token prefill chunk (Gemma 4 26B-A4B's shape,
+// an expert-major arena with compact scales, as the plugin loads it) under
+// three routings: every expert 64 rows (half of a GEMM tile), a pseudo-random
+// one, and all rows on 8 experts (whole tiles: LiteRT-LM's synthetic
+// benchmark prompt is mostly one token, which routes alike).
+TEST(Int4BlockGemvTest, TimesPrefillRoutings) {
+  if (std::getenv("INT4_BLOCK_GEMV_TIMING") == nullptr) {
+    GTEST_SKIP() << "Set INT4_BLOCK_GEMV_TIMING=1.";
+  }
+  const LiteRtNvidiaMoeShape shape = {1024, 8, 128, 2816, 704, 1};
+  const int experts = shape.experts, dim = shape.model_dim,
+            hidden = shape.hidden_dim;
+  const size_t gate_rows = static_cast<size_t>(hidden) * experts;
+  const size_t down_rows = static_cast<size_t>(dim) * experts;
+  const auto filled = [](size_t bytes, uint8_t value) {
+    auto device = AllocateCuda(bytes);
+    cudaMemset(device.get(), value, bytes);
+    return device;
+  };
+  auto d_gate = filled(gate_rows * dim / 2, 0x5a);
+  auto d_up = filled(gate_rows * dim / 2, 0x3c);
+  auto d_down = filled(down_rows * hidden / 2, 0x5a);
+  auto d_gate_q = filled(gate_rows * (dim / 32), 200);
+  auto d_up_q = filled(gate_rows * (dim / 32), 200);
+  auto d_down_q = filled(down_rows * (hidden / 32), 200);
+  const auto upload = [](const void* data, size_t bytes) {
+    auto device = AllocateCuda(bytes);
+    cudaMemcpy(device.get(), data, bytes, cudaMemcpyHostToDevice);
+    return device;
+  };
+  const std::vector<uint16_t> gate_max(gate_rows, FloatToHalfBits(0.01f));
+  const std::vector<uint16_t> down_max(down_rows, FloatToHalfBits(0.01f));
+  auto d_gate_m = upload(gate_max.data(), gate_max.size() * 2);
+  auto d_up_m = upload(gate_max.data(), gate_max.size() * 2);
+  auto d_down_m = upload(down_max.data(), down_max.size() * 2);
+  std::vector<uint16_t> x(static_cast<size_t>(shape.rows) * dim);
+  for (size_t i = 0; i < x.size(); ++i) {
+    x[i] = FloatToBf16Bits(static_cast<float>(i * 7 % 13) / 13.0f - 0.5f);
+  }
+  auto d_x = upload(x.data(), x.size() * 2);
+  const std::vector<float> weights(static_cast<size_t>(shape.rows) * 8, 0.125f);
+  const std::vector<float> expert_scale(experts, 1.0f);
+  auto d_w = upload(weights.data(), weights.size() * 4);
+  auto d_es = upload(expert_scale.data(), expert_scale.size() * 4);
+  auto d_ws = AllocateCuda(LiteRtNvidiaMoeWorkspaceBytes(&shape));
+  auto d_out = AllocateCuda(static_cast<size_t>(shape.rows) * dim * 2);
+  LiteRtNvidiaMoeArena arena = {static_cast<const uint8_t*>(d_gate.get()),
+                                static_cast<const uint8_t*>(d_up.get()),
+                                static_cast<const uint8_t*>(d_down.get()),
+                                d_gate_q.get(),
+                                d_up_q.get(),
+                                d_down_q.get()};
+  arena.gate_scale_max = d_gate_m.get();
+  arena.up_scale_max = d_up_m.get();
+  arena.down_scale_max = d_down_m.get();
+  arena.compact_scales = 1;
+  arena.expert_major = 1;
+  struct Routing {
+    const char* name;
+    std::vector<int32_t> indices;
+  };
+  std::vector<Routing> routings(3);
+  routings[0].name = "64 rows on every expert";
+  routings[1].name = "pseudo-random experts";
+  routings[2].name = "all rows on 8 experts";
+  uint32_t state = 12345;
+  for (int r = 0; r < shape.rows; ++r) {
+    std::vector<int32_t> chosen;
+    while (chosen.size() < 8) {
+      state = state * 1664525u + 1013904223u;
+      const int e = static_cast<int>((state >> 8) % experts);
+      if (std::find(chosen.begin(), chosen.end(), e) == chosen.end()) {
+        chosen.push_back(e);
+      }
+    }
+    for (int j = 0; j < 8; ++j) {
+      routings[0].indices.push_back((r * 8 + j) % experts);
+      routings[1].indices.push_back(chosen[j]);
+      routings[2].indices.push_back(j);
+    }
+  }
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  constexpr int kIterations = 20;
+  for (const Routing& routing : routings) {
+    auto d_idx = upload(routing.indices.data(), routing.indices.size() * 4);
+    const auto launch = [&]() {
+      return LiteRtNvidiaLaunchMoeInt4Block(
+          &shape, &arena, d_x.get(), static_cast<const int32_t*>(d_idx.get()),
+          static_cast<const float*>(d_w.get()),
+          static_cast<const float*>(d_es.get()), d_ws.get(), d_out.get(),
+          nullptr);
+    };
+    // A few launches so the clocks are up.
+    for (int i = 0; i < 10; ++i) ASSERT_EQ(launch(), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    cudaEventRecord(start);
+    for (int i = 0; i < kIterations; ++i) ASSERT_EQ(launch(), cudaSuccess);
+    cudaEventRecord(stop);
+    ASSERT_EQ(cudaEventSynchronize(stop), cudaSuccess);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, start, stop);
+    std::printf("moe prefill, 1024 rows, %-24s %8.1f us\n", routing.name,
+                ms * 1000.0f / kIterations);
   }
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
@@ -1496,10 +1805,11 @@ TEST(Int4BlockGemvTest, MoeExpertMajorMatchesTheModelsOrder) {
 }
 
 // A verify step's rows grouped by expert (LiteRtNvidiaMoeArena::group_rows)
-// give the bits of one launch block per routed pair: the plain launch over
-// routings with experts shared between rows, an expert that fills more than
-// one group and a pair without an expert; the fused launch, which then
-// routes before it groups; and the layer block.
+// agree with one launch block per routed pair to the outputs' rounding (the
+// groups multiply on the tensor cores): the plain launch over routings with
+// experts shared between rows, an expert that fills more than one group and
+// a pair without an expert; the fused launch, which then routes before it
+// groups; and the layer block.
 TEST(Int4BlockGemvTest, MoeGroupedRowsMatchTheirPairs) {
   const int top_k = 4, experts = 64, dim = 704, hidden = 128, dense_hidden = 96;
   const std::vector<uint8_t> gate_w = MakeInt4Weights(hidden * experts, dim, 5);
@@ -1696,7 +2006,7 @@ TEST(Int4BlockGemvTest, MoeGroupedRowsMatchTheirPairs) {
                                cudaMemcpyDeviceToHost),
                     cudaSuccess);
         }
-        EXPECT_TRUE(outputs[0] == outputs[1]);
+        EXPECT_GE(ExpectBf16Close(outputs[0], outputs[1]), 0.9);
         EXPECT_NE(std::count(outputs[0].begin(), outputs[0].end(), 0),
                   static_cast<ptrdiff_t>(outputs[0].size()));
       }
