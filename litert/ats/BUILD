@@ -747,10 +747,6 @@ INTEL_OPENVINO_SOC_MODELS = {
 litert_define_ats(
     name = "intel_openvino_compile_ats",
     aot_shard_count = 32,
-    aot_tags = [
-        "manual",
-        "notap",
-    ],
     backend = "intel_openvino",
     dont_register = INTEL_OPENVINO_DONT_REGISTER,
     mode = "compile_only",
@@ -768,10 +764,6 @@ litert_define_ats(
 litert_define_ats(
     name = "intel_openvino_aot_ats",
     aot_shard_count = 32,
-    aot_tags = [
-        "manual",
-        "notap",
-    ],
     backend = "intel_openvino",
     dont_register = INTEL_OPENVINO_DONT_REGISTER + INTEL_OPENVINO_RUN_DONT_REGISTER,
     mode = "aot",
@@ -1898,7 +1890,6 @@ cc_library(
         "//litert/c:litert_common",
         "//litert/c/internal:litert_logging",
         "//litert/c/options:litert_cpu_options",
-        "//litert/cc:litert_buffer_ref",
         "//litert/cc:litert_common",
         "//litert/cc:litert_environment",
         "//litert/cc:litert_environment_options",
@@ -1907,6 +1898,7 @@ cc_library(
         "//litert/cc:litert_options",
         "//litert/cc/internal:litert_detail",
         "//litert/cc/internal:litert_rng",
+        "//litert/cc/options:litert_arm_vulkan_ml_options",
         "//litert/cc/options:litert_gpu_options",
         "//litert/cc/options:litert_mediatek_options",
         "//litert/cc/options:litert_qualcomm_options",
@@ -1915,6 +1907,7 @@ cc_library(
         "//litert/core:filesystem_testonly",
         "//litert/core/model:model_load",
         "//litert/core/model:model_serialize",
+        "//litert/tools/flags/vendors:arm_vulkan_ml_flags",
         "//litert/tools/flags/vendors:mediatek_flags",
         "//litert/tools/flags/vendors:qualcomm_flags",
         "//litert/tools/flags/vendors:samsung_flags",
