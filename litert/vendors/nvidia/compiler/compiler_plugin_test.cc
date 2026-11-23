@@ -35,6 +35,7 @@
 #include "litert/vendors/c/litert_compiler_plugin_api.h"
 #include "litert/vendors/nvidia/bytecode.h"
 #include "litert/vendors/nvidia/cache_layout.h"
+#include "litert/vendors/nvidia/windows_compat.h"
 #include "tflite/schema/schema_generated.h"
 
 namespace {
@@ -49,11 +50,13 @@ class CompilerAotTest : public testing::Test {
     directory_ = pattern;
     source_ = directory_ / "model.bin";
     std::ofstream(source_) << "test model identity";
-    ASSERT_EQ(
-        setenv("LITERT_NVIDIA_TENSORRT_AOT_CACHE_DIR", directory_.c_str(), 1),
-        0);
-    ASSERT_EQ(
-        setenv("LITERT_NVIDIA_TENSORRT_AOT_MODEL_PATH", source_.c_str(), 1), 0);
+    // string(): a path's own characters are wide on Windows.
+    ASSERT_EQ(setenv("LITERT_NVIDIA_TENSORRT_AOT_CACHE_DIR",
+                     directory_.string().c_str(), 1),
+              0);
+    ASSERT_EQ(setenv("LITERT_NVIDIA_TENSORRT_AOT_MODEL_PATH",
+                     source_.string().c_str(), 1),
+              0);
     LiteRtInterface raw_interface = nullptr;
     ASSERT_EQ(LiteRtCompilerPluginQueryInterface(
                   kLiteRtCompilerPluginInterfaceBasic,
@@ -122,6 +125,65 @@ class CompilerAotTest : public testing::Test {
       litert::internal::AttachInput(value, exp);
       litert::internal::AttachOutput(&output, exp);
       value = &output;
+    }
+    graph.Outputs().push_back(value);
+    return graph;
+  }
+
+  // An op of `code` with `options` from `inputs` to a new [128, 128] FP32
+  // tensor of `graph`, which it returns.
+  LiteRtTensorT* AddOp(LiteRtSubgraphT& graph, LiteRtOpCode code,
+                       std::vector<LiteRtTensorT*> inputs,
+                       tflite::BuiltinOptionsUnion options) {
+    auto& output = graph.EmplaceTensor();
+    output.SetType(MakeRankedTensorType(kLiteRtElementTypeFloat32, {128, 128}));
+    auto& op = graph.EmplaceOp();
+    op.SetOpCode(code);
+    litert::internal::SetTflOptions(op, std::move(options));
+    for (auto* input : inputs) litert::internal::AttachInput(input, op);
+    litert::internal::AttachOutput(&output, op);
+    return &output;
+  }
+
+  // Qwen 4's PLE gate over a 64 KiB tensor, sigmoid(sign(g) *
+  // sqrt(max(abs(g), 1e-6))), then EXPs to eight ops; or with `lone_sign`, a
+  // SIGN that is no part of it, then eight EXPs.
+  LiteRtSubgraphT& AddSignedRootGate(LiteRtModelT& model, bool lone_sign) {
+    auto& graph = model.EmplaceSubgraph();
+    auto* g = &graph.EmplaceTensor();
+    g->SetType(MakeRankedTensorType(kLiteRtElementTypeFloat32, {128, 128}));
+    graph.Inputs().push_back(g);
+    const auto none = [] { return tflite::BuiltinOptionsUnion(); };
+    LiteRtTensorT* value = nullptr;
+    int exps = 8;
+    if (lone_sign) {
+      value = AddOp(graph, kLiteRtOpCodeTflSign, {g}, none());
+    } else {
+      auto& floor = graph.EmplaceTensor();
+      floor.SetType(MakeRankedTensorType(kLiteRtElementTypeFloat32, {1}));
+      static const float kFloor[] = {1e-6f};
+      SetWeightsFromUnownedBuffer(
+          floor.Weights(),
+          litert::BufferRef<uint8_t>(reinterpret_cast<const uint8_t*>(kFloor),
+                                     sizeof(kFloor)));
+      auto* sign = AddOp(graph, kLiteRtOpCodeTflSign, {g}, none());
+      auto* abs = AddOp(graph, kLiteRtOpCodeTflAbs, {g}, none());
+      tflite::BuiltinOptionsUnion maximum;
+      maximum.Set(tflite::MaximumMinimumOptionsT{});
+      auto* floored = AddOp(graph, kLiteRtOpCodeTflMaximum, {abs, &floor},
+                            std::move(maximum));
+      auto* root = AddOp(graph, kLiteRtOpCodeTflSqrt, {floored}, none());
+      tflite::BuiltinOptionsUnion mul;
+      mul.Set(tflite::MulOptionsT{});
+      auto* product =
+          AddOp(graph, kLiteRtOpCodeTflMul, {sign, root}, std::move(mul));
+      value = AddOp(graph, kLiteRtOpCodeTflLogistic, {product}, none());
+      exps = 2;
+    }
+    for (int i = 0; i < exps; ++i) {
+      tflite::BuiltinOptionsUnion exp;
+      exp.Set(tflite::ExpOptionsT{});
+      value = AddOp(graph, kLiteRtOpCodeTflExp, {value}, std::move(exp));
     }
     graph.Outputs().push_back(value);
     return graph;
@@ -263,6 +325,19 @@ TEST_F(CompilerAotTest, DefaultPolicyTakesTheValidatedLlmOps) {
   EXPECT_EQ(SelectedOps(graph, "gemma4"), 0);
   EXPECT_EQ(SelectedOps(graph, "safe"), 0);
   EXPECT_EQ(SelectedOps(graph, "unknown"), 0);
+}
+
+// SIGN, ABS and SQRT only as Qwen 4's PLE gate: the Gemma 4 vision encoders'
+// SIGN ops stay on the CPU.
+TEST_F(CompilerAotTest, DefaultPolicyTakesSignOnlyInThePleGate) {
+  LiteRtModelT gate_model;
+  EXPECT_EQ(SelectedOps(AddSignedRootGate(gate_model, /*lone_sign=*/false),
+                        /*policy=*/nullptr),
+            8);
+  LiteRtModelT sign_model;
+  EXPECT_EQ(SelectedOps(AddSignedRootGate(sign_model, /*lone_sign=*/true),
+                        /*policy=*/nullptr),
+            8);  // the EXPs, not the SIGN
 }
 
 TEST_F(CompilerAotTest, NonAotStillSharesOneWeightStoreAcrossEngines) {

@@ -55,15 +55,20 @@
 #include "litert/vendors/nvidia/compiler/decode_attention_plugin.h"
 #include "litert/vendors/nvidia/compiler/gated_delta_plugin.h"
 #include "litert/vendors/nvidia/compiler/general_attention_plugin.h"
+#include "litert/vendors/nvidia/compiler/hyper_connection_plugin.h"
 #include "litert/vendors/nvidia/compiler/int8_cache_write_plugin.h"
 #include "litert/vendors/nvidia/compiler/moe_plugin.h"
+#include "litert/vendors/nvidia/compiler/ple_tail_plugin.h"
 #include "litert/vendors/nvidia/compiler/qkv_norm_rope_plugin.h"
 #include "litert/vendors/nvidia/compiler/qsa_attention_plugin.h"
 #include "litert/vendors/nvidia/compiler/quant_attention_plugin.h"
 #include "litert/vendors/nvidia/compiler/quant_linear_plugin.h"
+#include "litert/vendors/nvidia/compiler/slot_network.h"
 #include "litert/vendors/nvidia/compiler/subbyte_gemv_plugin.h"
 #include "litert/vendors/nvidia/compiler/tensorrt_rtx_plugin_compat.h"
 #include "litert/vendors/nvidia/compiler/weight_store_builder.h"
+#include "litert/vendors/nvidia/experimental/megakernel/megakernel_lowering.h"
+#include "litert/vendors/nvidia/experimental/megakernel/megakernel_plugin.h"
 #include "litert/vendors/nvidia/memory_profile.h"
 #include "litert/vendors/nvidia/tensorrt_logger.h"
 #include "NvInfer.h"
@@ -72,8 +77,10 @@
 #include "litert/vendors/nvidia/trtllm/gated_delta_net.h"
 #include "litert/vendors/nvidia/trtllm/general_attention.h"
 #include "litert/vendors/nvidia/trtllm/global_attention.h"
+#include "litert/vendors/nvidia/trtllm/hyper_connection.h"
 #include "litert/vendors/nvidia/trtllm/int2_gemv.h"
 #include "litert/vendors/nvidia/trtllm/int4_block_gemv.h"
+#include "litert/vendors/nvidia/trtllm/ple_tail.h"
 #include "litert/vendors/nvidia/trtllm/qkv_norm_rope.h"
 #include "litert/vendors/nvidia/trtllm/qsa_indexer.h"
 #include "litert/vendors/nvidia/trtllm/qsa_sparse_attention.h"
@@ -1192,12 +1199,30 @@ std::optional<SwigluGate> ParseSwiglu(const Op& op) {
   return gate;
 }
 
+// A composite's boolean attribute, false when absent.
+bool CompositeBoolAttribute(const Op& op, const char* name) {
+  CompositeOptions options;
+  if (options.InitFromOp(op.Get()) != kLiteRtStatusOk ||
+      !options.attributes_map.has_value()) {
+    return false;
+  }
+  const auto value = options.attributes_map.value()[name];
+  return value.IsBool() && value.AsBool();
+}
+
 std::optional<int32_t> SdpaTransposedGroup(const Op& op) {
-  if (op.Inputs().size() != 5 || op.Outputs().size() != 1) {
+  // q, k, v, then a bool mask and the params tensor, or the params tensor
+  // alone (ML Drift's form without a mask: the keys up to the params' active
+  // count, causal with is_causal; MaskFromSdpaParams).
+  const bool masked = op.Inputs().size() == 5;
+  if ((!masked && op.Inputs().size() != 4) || op.Outputs().size() != 1) {
+    return std::nullopt;
+  }
+  if (!masked && !TensorHasShape(op.Inputs()[3], {1, 1, 1, 7})) {
     return std::nullopt;
   }
   std::array<std::array<int32_t, 4>, 4> dims;
-  for (int i = 0; i < 4; ++i) {
+  for (int i = 0; i < (masked ? 4 : 3); ++i) {
     auto type = op.Inputs()[i].RankedTensorType();
     if (!type || type->Layout().Rank() != 4) {
       return std::nullopt;
@@ -1217,6 +1242,7 @@ std::optional<int32_t> SdpaTransposedGroup(const Op& op) {
   const auto& q = dims[0];
   const auto& k = dims[1];
   const auto& v = dims[2];
+  if (!masked) dims[3] = {1, 1, 1, k[2]};
   const auto& mask = dims[3];
   if (q[0] != 1 || k[0] != 1 || v[0] != 1 || k[1] < 1 || q[1] % k[1] != 0 ||
       k[3] != q[3] || v[1] != k[1] || v[2] != k[3] || v[3] != k[2] ||
@@ -1805,6 +1831,41 @@ struct GeneralFusedSdpa {
   bool update_cache = true;
 };
 
+// A float cache of the fused composite (no NVIDIA path has one: the float
+// caches the other paths keep in place are FP16 storage of FP32 tensors): its
+// type, scale 1.
+std::optional<GeneralCacheType> ParseGeneralFloatCacheType(
+    const Tensor& tensor) {
+  if (tensor.QTypeId() != kLiteRtQuantizationNone) return std::nullopt;
+  switch (tensor.ElementType()) {
+    case litert::ElementType::Float32:
+      return GeneralCacheType{kLiteRtNvidiaGeneralFloat32, 1.0f};
+    case litert::ElementType::Float16:
+      return GeneralCacheType{kLiteRtNvidiaGeneralFloat16, 1.0f};
+    case litert::ElementType::BFloat16:
+      return GeneralCacheType{kLiteRtNvidiaGeneralBFloat16, 1.0f};
+    default:
+      return std::nullopt;
+  }
+}
+
+// The fused composite's caches: quantized (ParseGeneralCaches) or float, the
+// key cache [1, H, S, D] and the value cache [1, H, D, S] of one type.
+std::optional<GeneralCaches> ParseGeneralFusedCaches(const Tensor& k,
+                                                     const Tensor& v) {
+  if (const auto quantized = ParseGeneralCaches(k, v)) return quantized;
+  const auto kt = ParseGeneralFloatCacheType(k);
+  const auto vt = ParseGeneralFloatCacheType(v);
+  const auto kd = StaticRank4Dims(k);
+  const auto vd = StaticRank4Dims(v);
+  if (!kt || !vt || !kd || !vd || kt->type != vt->type || (*kd)[0] != 1 ||
+      (*vd)[0] != 1 || (*vd)[1] != (*kd)[1] || (*vd)[2] != (*kd)[3] ||
+      (*vd)[3] != (*kd)[2]) {
+    return std::nullopt;
+  }
+  return GeneralCaches{kt->type, 1.0f, 1.0f, (*kd)[1], (*kd)[2], (*kd)[3]};
+}
+
 std::optional<GeneralFusedSdpa> ParseGeneralFusedSdpa(const Op& op) {
   if (!GeneralAttentionEnabled() || op.Inputs().size() != 7 ||
       (op.Outputs().size() != 3 && op.Outputs().size() != 1) ||
@@ -1813,7 +1874,7 @@ std::optional<GeneralFusedSdpa> ParseGeneralFusedSdpa(const Op& op) {
     return std::nullopt;
   }
   const auto& in = op.Inputs();
-  const auto caches = ParseGeneralCaches(in[1], in[2]);
+  const auto caches = ParseGeneralFusedCaches(in[1], in[2]);
   const auto q_scale = GeneralFloatInput(in[0]);
   const auto qd = StaticRank4Dims(in[0]);
   const auto kd = StaticRank4Dims(in[3]);
@@ -1846,7 +1907,8 @@ std::optional<GeneralFusedSdpa> ParseGeneralFusedSdpa(const Op& op) {
   const bool update_cache = op.Outputs().size() == 3;
   if (update_cache) {
     for (int i = 0; i < 2; ++i) {
-      const auto out = ParseGeneralCacheType(op.Outputs()[1 + i]);
+      auto out = ParseGeneralCacheType(op.Outputs()[1 + i]);
+      if (!out) out = ParseGeneralFloatCacheType(op.Outputs()[1 + i]);
       if (!out || out->type != caches->type ||
           out->scale != (i == 0 ? caches->k_scale : caches->v_scale) ||
           StaticRank4Dims(op.Outputs()[1 + i]) != StaticRank4Dims(in[1 + i])) {
@@ -1890,7 +1952,7 @@ std::optional<GeneralFusedSdpa> ParseGeneralFusedSdpa(const Op& op) {
 // model_dim / 32], down weights [model_dim, experts, 1, hidden] with scales
 // [model_dim, experts, 1, hidden / 32], per_expert_scale [1, 1, 1, experts];
 // a flexbuffer map of num_experts, num_active_experts, model_dim, hidden_dim,
-// activation (gelu | gelu_tanh), weight_type (int4) and
+// activation (gelu | gelu_tanh | silu | swish), weight_type (int4) and
 // renormalized_top_weights.
 struct MoeCustomOp {
   int32_t experts = 0;
@@ -1931,6 +1993,9 @@ std::optional<MoeCustomOp> ParseMoeCustomOp(const Op& op) {
     moe.gate = 1;
   } else if (activation == "gelu") {
     moe.gate = 2;
+  } else if (activation == "silu" || activation == "swish") {
+    // Qwen's experts (the GPU delegate takes both names since b32ee661b).
+    moe.gate = 3;
   } else {
     return std::nullopt;
   }
@@ -3813,6 +3878,51 @@ Expected<bool> IsFloorModSupported(const Op& op) {
          op.Outputs()[0].ElementType() == litert::ElementType::Int32;
 }
 
+// BITWISE_XOR of int32 tensors (Qwen 4's n-gram hash), as arithmetic.
+Expected<bool> IsBitwiseXorSupported(const Op& op) {
+  return IsFloorModSupported(op);
+}
+
+// The largest constant table a GATHER takes into the engine: Qwen 4's PLE
+// tables of a real export (hundreds of millions of rows) stay on LiteRT's
+// CPU, a reduced model's or an embedding of this size runs in the engine.
+constexpr size_t kMaxGatherTableBytes = size_t{256} << 20;
+
+// GATHER along one axis (batch_dims 0) of a float or int32 tensor, or of a
+// constant table up to kMaxGatherTableBytes, with int32 indices.
+Expected<bool> IsGatherSupported(const Op& op) {
+  if (op.Inputs().size() != 2 || op.Outputs().size() != 1) {
+    return false;
+  }
+  int32_t axis = 0, batch_dims = 0;
+  if (LiteRtGetGatherAxisOption(op.Get(), &axis) != kLiteRtStatusOk ||
+      LiteRtGetGatherBatchDimsOption(op.Get(), &batch_dims) !=
+          kLiteRtStatusOk ||
+      batch_dims != 0) {
+    return false;
+  }
+  const Tensor data = op.Inputs()[0];
+  const Tensor indices = op.Inputs()[1];
+  LITERT_ASSIGN_OR_RETURN(bool data_static, IsStaticTensorRtTensor(data));
+  LITERT_ASSIGN_OR_RETURN(bool indices_static, IsStaticTensorRtTensor(indices));
+  LITERT_ASSIGN_OR_RETURN(bool output_static,
+                          IsStaticTensorRtTensor(op.Outputs()[0]));
+  if (!data_static || !indices_static || !output_static ||
+      indices.ElementType() != litert::ElementType::Int32 ||
+      indices.HasWeights() ||
+      (data.ElementType() != litert::ElementType::Int32 &&
+       !IsFloatLike(data.ElementType())) ||
+      data.QTypeId() != kLiteRtQuantizationNone) {
+    return false;
+  }
+  LITERT_ASSIGN_OR_RETURN(auto type, data.RankedTensorType());
+  const int rank = static_cast<int>(type.Layout().Rank());
+  if (axis < 0) axis += rank;
+  if (axis < 0 || axis >= rank) return false;
+  return !data.HasWeights() ||
+         data.Weights().Bytes().size() <= kMaxGatherTableBytes;
+}
+
 Expected<bool> IsConv2dSupported(const Op& op) {
   if (op.Inputs().size() < 2 || op.Inputs().size() > 3 ||
       op.Outputs().size() != 1) {
@@ -4334,9 +4444,15 @@ class TensorRtGraphBuilder {
     LITERT_RETURN_IF_ERROR(FindCompositeAttentionBlocks(subgraph));
     LITERT_RETURN_IF_ERROR(FindMoeBlocks(subgraph));
     LITERT_RETURN_IF_ERROR(FindGatedDeltaNetBlocks(subgraph));
+    LITERT_RETURN_IF_ERROR(FindHcMixBlocks(subgraph));
+    LITERT_RETURN_IF_ERROR(FindPleTailBlocks(subgraph));
     LITERT_RETURN_IF_ERROR(FindQuantRegions(subgraph));
+    if (megakernel_body_) {
+      LITERT_RETURN_IF_ERROR(LowerMegakernel(subgraph));
+    }
     std::vector<Op> prefill_cache_updates;
     for (size_t i = 0; i < num_ops_to_lower; ++i) {
+      if (megakernel_body_) break;
       if (ops[i].Code() == kLiteRtOpCodeShloComposite &&
           CompositeOpName(ops[i]) == "odml.cache_update" &&
           PrefillCacheUpdateRingMode(ops[i]).has_value() &&
@@ -4449,6 +4565,25 @@ class TensorRtGraphBuilder {
     result.output_names = output_names_;
     result.trtllm_head = std::move(trtllm_head);
     LITERT_ASSIGN_OR_RETURN(result.step_feed, MatchStepFeed(subgraph));
+    // The batched engines of a decode step (one that feeds itself) or of an
+    // MTP verify step, built from its network while its constants are still
+    // alive.
+    if (const int32_t max_slots = DecodeSlotsRequested();
+        max_slots >= 2 &&
+        (result.step_feed.has_value() || IsVerifyStep(subgraph)) &&
+        !result.trtllm_head.has_value() && !megakernel_body_) {
+      for (int32_t slots = 2; slots <= max_slots; ++slots) {
+        auto plan = BuildSlotPlan(slots);
+        if (!plan) {
+          LITERT_LOG(LITERT_WARNING,
+                     "NVIDIA TensorRT-RTX builds no batched decode engine of "
+                     "%d slots: %s",
+                     slots, plan.Error().Message().c_str());
+          break;
+        }
+        result.slot_plans.push_back(std::move(*plan));
+      }
+    }
     result.is_stripped_plan = strip_plan;
     result.weight_holders = std::move(weight_holders_);
     // TensorRT-RTX has consumed every network constant at this point. Destroy
@@ -4488,6 +4623,52 @@ class TensorRtGraphBuilder {
     return name == key || (name.size() > suffix.size() &&
                            name.compare(name.size() - suffix.size(),
                                         suffix.size(), suffix) == 0);
+  }
+
+  // Whether the network is the verify signature's step (speculative
+  // decoding's): its tensors carry the signature's name in front
+  // (verify_embeddings, verify_input_pos).
+  static bool IsVerifyStep(const Subgraph& subgraph) {
+    for (const auto& input : subgraph.Inputs()) {
+      const std::string name(input.Name());
+      if (name.rfind("verify_", 0) == 0) return true;
+    }
+    return false;
+  }
+
+  // The batched decode engine of `slots` slots built from the step's network
+  // (BuildSlotDecodeNetwork), with the step's builder configuration.
+  Expected<TensorRtSlotPlanBuildData> BuildSlotPlan(int32_t slots) {
+    int32_t merged = 0;
+    std::vector<std::unique_ptr<nvinfer1::IPluginV3>> plugins;
+    LITERT_ASSIGN_OR_RETURN(
+        nvinfer1::INetworkDefinition * network_ptr,
+        BuildSlotDecodeNetwork(*builder_, *network_, slots, &merged, &plugins));
+    TrtPtr<nvinfer1::INetworkDefinition> network(network_ptr);
+    TrtPtr<nvinfer1::IHostMemory> serialized(
+        builder_->buildSerializedNetwork(*network, *config_));
+    if (!serialized) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to build the batched decode engine");
+    }
+    TensorRtSlotPlanBuildData plan;
+    plan.slots = slots;
+    for (int32_t s = 0; s < slots; ++s) {
+      for (const auto& name : input_names_) {
+        plan.input_names.push_back(SlotTensorName(name, s));
+      }
+      for (const auto& name : output_names_) {
+        plan.output_names.push_back(SlotTensorName(name, s));
+      }
+    }
+    plan.engine.assign(
+        static_cast<const uint8_t*>(serialized->data()),
+        static_cast<const uint8_t*>(serialized->data()) + serialized->size());
+    LITERT_LOG(LITERT_INFO,
+               "NVIDIA TensorRT-RTX built a batched decode engine of %d slots: "
+               "%d projections read once for the slots, plan_bytes=%zu",
+               slots, merged, plan.engine.size());
+    return plan;
   }
 
   // A decode step that feeds itself (TensorRtStepFeed): one token's
@@ -4904,12 +5085,13 @@ class TensorRtGraphBuilder {
       LITERT_ASSIGN_OR_RETURN(auto type, input.RankedTensorType());
       LITERT_ASSIGN_OR_RETURN(auto dims, ConvertDims(type));
       // A UINT8 cache of the general forms crosses as its bytes
-      // (FindGeneralCaches).
-      LITERT_ASSIGN_OR_RETURN(
-          auto data_type,
-          byte_caches_.count(input.Get()) != 0
-              ? Expected<nvinfer1::DataType>(nvinfer1::DataType::kINT8)
-              : ConvertDataType(type.ElementType()));
+      // (FindGeneralCaches). Not a conditional expression of two Expected
+      // values: MSVC builds its result through Expected's forwarding
+      // constructor, which has no conversion from an Expected.
+      nvinfer1::DataType data_type = nvinfer1::DataType::kINT8;
+      if (byte_caches_.count(input.Get()) == 0) {
+        LITERT_ASSIGN_OR_RETURN(data_type, ConvertDataType(type.ElementType()));
+      }
       std::string name = TensorName("input", input, i);
       // An INT4 cache of the composites over quantized caches is declared as
       // the INT8 bytes that hold it (FindPackedInt4Caches).
@@ -5021,11 +5203,11 @@ class TensorRtGraphBuilder {
       }
       if (Fp16ActivationsEnabled()) {
         LITERT_ASSIGN_OR_RETURN(auto type, output.RankedTensorType());
-        LITERT_ASSIGN_OR_RETURN(
-            auto boundary_type,
-            byte_caches_.count(output.Get()) != 0
-                ? Expected<nvinfer1::DataType>(nvinfer1::DataType::kINT8)
-                : ConvertDataType(type.ElementType()));
+        nvinfer1::DataType boundary_type = nvinfer1::DataType::kINT8;
+        if (byte_caches_.count(output.Get()) == 0) {
+          LITERT_ASSIGN_OR_RETURN(boundary_type,
+                                  ConvertDataType(type.ElementType()));
+        }
         if (const auto in_place = in_place_outputs_.find(output.Get());
             in_place != in_place_outputs_.end() &&
             type.ElementType() == litert::ElementType::Float32 &&
@@ -6302,7 +6484,9 @@ class TensorRtGraphBuilder {
           op_order_.find(user.Get()) == op_order_.end() ||
           op_order_[user.Get()] < op_order_[op.Get()] ||
           fused_gemv_outputs_.find(user.Get()) != fused_gemv_outputs_.end() ||
-          gated.count(user.Get()) != 0) {
+          gated.count(user.Get()) != 0 ||
+          // A fused hyper-connection mix computes its own projections.
+          hc_mix_projections_.count(user.Get()) != 0) {
         continue;
       }
       auto info = InspectSubbyteGemvWeights(user.Inputs()[1]);
@@ -7077,6 +7261,9 @@ class TensorRtGraphBuilder {
       case kLiteRtOpCodeTflLogicalAnd:
         operation = nvinfer1::ElementWiseOperation::kAND;
         break;
+      case kLiteRtOpCodeTflLogicalOr:
+        operation = nvinfer1::ElementWiseOperation::kOR;
+        break;
       default:
         return Error(kLiteRtStatusErrorUnsupported,
                      "Unsupported TensorRT comparison op");
@@ -7152,7 +7339,14 @@ class TensorRtGraphBuilder {
         operation = nvinfer1::UnaryOperation::kCOS;
         break;
       case kLiteRtOpCodeTflRsqrt:
+      case kLiteRtOpCodeTflSqrt:
         operation = nvinfer1::UnaryOperation::kSQRT;
+        break;
+      case kLiteRtOpCodeTflAbs:
+        operation = nvinfer1::UnaryOperation::kABS;
+        break;
+      case kLiteRtOpCodeTflSign:
+        operation = nvinfer1::UnaryOperation::kSIGN;
         break;
       case kLiteRtOpCodeTflExp:
         operation = nvinfer1::UnaryOperation::kEXP;
@@ -7593,8 +7787,11 @@ class TensorRtGraphBuilder {
             use.user_arg_ind == 4))) {
         continue;
       }
+      // The value of the attention composites (Qwen 4's sparse attention
+      // reads a value cache held as rows the same way: its in-place rule).
       if (user.Code() == kLiteRtOpCodeShloComposite &&
-          CompositeOpName(user) == "odml.sdpa_transposed" &&
+          (CompositeOpName(user) == "odml.sdpa_transposed" ||
+           CompositeOpName(user) == "odml.sparse_sdpa_transposed") &&
           use.user_arg_ind == 2) {
         continue;
       }
@@ -7867,6 +8064,10 @@ class TensorRtGraphBuilder {
     LiteRtTensor k_out = nullptr;  // the key cache the block reads
     LiteRtTensor v_out = nullptr;
     LiteRtTensor mask = nullptr;
+    // Without a mask: the params tensor the mask comes from, and is_causal
+    // (MaskFromSdpaParams).
+    LiteRtTensor params = nullptr;
+    bool causal = false;
     LiteRtTensor k_new = nullptr;  // the chunk's keys, for a ring cache
     LiteRtTensor v_new = nullptr;
     std::optional<Tensor> output;
@@ -7918,7 +8119,12 @@ class TensorRtGraphBuilder {
       block.q = op.Inputs()[0].Get();
       block.k_out = op.Inputs()[1].Get();
       block.v_out = op.Inputs()[2].Get();
-      block.mask = op.Inputs()[3].Get();
+      if (op.Inputs().size() == 5) {
+        block.mask = op.Inputs()[3].Get();
+      } else {
+        block.params = op.Inputs()[3].Get();
+        block.causal = CompositeBoolAttribute(op, "is_causal");
+      }
       block.output = op.Outputs()[0];
       block.fill = kSdpaTransposedFill;
       block.group = *group;
@@ -9388,6 +9594,91 @@ class TensorRtGraphBuilder {
     return concat->getOutput(0);
   }
 
+  // The bool mask [1, 1, 1 or tokens, keys] of an odml.sdpa_transposed
+  // without one, from its params [1, 1, 1, 7] as ML Drift's kernels read them
+  // (sdpa_transposed_kernel.cc, GenerateImplicitCausalBoundCode): the keys
+  // below the active count params[2] (all keys when it is out of (0, keys]),
+  // and with is_causal over several tokens, for token x, below
+  // min(active, q_start + x + 1), q_start = params[0] when in (0, active),
+  // else active - tokens; a token at or past the active count sees no key.
+  Expected<nvinfer1::ITensor*> MaskFromSdpaParams(nvinfer1::ITensor* params,
+                                                  int32_t tokens, int32_t keys,
+                                                  bool causal) {
+    if (params->getType() != nvinfer1::DataType::kINT32) {
+      return Error(kLiteRtStatusErrorUnsupported,
+                   "odml.sdpa_transposed params must be int32");
+    }
+    const auto constant = [&](const std::vector<int32_t>& values,
+                              nvinfer1::Dims dims,
+                              const char* name) -> nvinfer1::ITensor* {
+      owned_weights_.emplace_back(values.size() * sizeof(int32_t));
+      std::memcpy(owned_weights_.back().data(), values.data(),
+                  owned_weights_.back().size());
+      nvinfer1::Weights weights{nvinfer1::DataType::kINT32,
+                                owned_weights_.back().data(),
+                                static_cast<int64_t>(values.size())};
+      auto* layer = network_->addConstant(dims, weights);
+      if (layer == nullptr) return nullptr;
+      layer->getOutput(0)->setName(KeepName(UniqueName(name)));
+      return layer->getOutput(0);
+    };
+    const nvinfer1::Dims one{4, {1, 1, 1, 1}};
+    const auto binary =
+        [&](nvinfer1::ITensor* a, nvinfer1::ITensor* b,
+            nvinfer1::ElementWiseOperation operation) -> nvinfer1::ITensor* {
+      if (a == nullptr || b == nullptr) return nullptr;
+      auto* layer = network_->addElementWise(*a, *b, operation);
+      return layer == nullptr ? nullptr : layer->getOutput(0);
+    };
+    const auto select = [&](nvinfer1::ITensor* condition, nvinfer1::ITensor* a,
+                            nvinfer1::ITensor* b) -> nvinfer1::ITensor* {
+      if (condition == nullptr || a == nullptr || b == nullptr) return nullptr;
+      auto* layer = network_->addSelect(*condition, *a, *b);
+      return layer == nullptr ? nullptr : layer->getOutput(0);
+    };
+    using Op = nvinfer1::ElementWiseOperation;
+    LITERT_ASSIGN_OR_RETURN(auto* q_start,
+                            SliceTensorStatic(params, 3, 0, 1, "sdpa_q_start"));
+    LITERT_ASSIGN_OR_RETURN(auto* count,
+                            SliceTensorStatic(params, 3, 2, 1, "sdpa_active"));
+    nvinfer1::ITensor* zero = constant({0}, one, "sdpa_zero");
+    nvinfer1::ITensor* all = constant({keys}, one, "sdpa_keys");
+    nvinfer1::ITensor* active =
+        select(binary(binary(count, zero, Op::kGREATER),
+                      binary(all, count, Op::kLESS), Op::kXOR),
+               count, all);
+    // (count > 0) xor (keys < count): in range exactly when count > 0 and
+    // count <= keys, since keys < count implies count > 0.
+    std::vector<int32_t> iota(keys);
+    for (int32_t j = 0; j < keys; ++j) iota[j] = j;
+    nvinfer1::ITensor* key = constant(iota, {4, {1, 1, 1, keys}}, "sdpa_key");
+    nvinfer1::ITensor* bound = active;
+    if (causal && tokens > 1) {
+      nvinfer1::ITensor* fallback =
+          binary(active, constant({tokens}, one, "sdpa_tokens"), Op::kSUB);
+      nvinfer1::ITensor* start =
+          select(binary(binary(q_start, zero, Op::kGREATER),
+                        binary(q_start, active, Op::kLESS), Op::kAND),
+                 q_start, fallback);
+      std::vector<int32_t> rows(tokens);
+      for (int32_t x = 0; x < tokens; ++x) rows[x] = x;
+      nvinfer1::ITensor* position = binary(
+          start, constant(rows, {4, {1, 1, tokens, 1}}, "sdpa_row"), Op::kSUM);
+      nvinfer1::ITensor* causal_bound = binary(
+          active, binary(position, constant({1}, one, "sdpa_one"), Op::kSUM),
+          Op::kMIN);
+      bound = select(binary(position, active, Op::kLESS), causal_bound, zero);
+    }
+    nvinfer1::ITensor* mask = binary(key, bound, Op::kLESS);
+    if (mask == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to build the odml.sdpa_transposed mask from its "
+                   "params");
+    }
+    mask->setName(KeepName(UniqueName("sdpa_params_mask")));
+    return mask;
+  }
+
   Expected<void> LowerDecodeAttentionMember(size_t index) {
     auto& block = attention_blocks_[index];
     if (block.emitted) {
@@ -9395,7 +9686,7 @@ class TensorRtGraphBuilder {
     }
     const bool new_keys = block.k_new != nullptr;
     for (LiteRtTensor input : {block.q, block.k_out, block.v_out, block.mask,
-                               block.k_new, block.v_new}) {
+                               block.params, block.k_new, block.v_new}) {
       if (input != nullptr && tensor_map_.find(input) == tensor_map_.end()) {
         return {};
       }
@@ -9419,7 +9710,16 @@ class TensorRtGraphBuilder {
     const nvinfer1::Dims q_dims_in = q->getDimensions();
     const int32_t tokens = static_cast<int32_t>(q_dims_in.d[2]);
     const int32_t depth = static_cast<int32_t>(q_dims_in.d[3]);
-    nvinfer1::ITensor* mask_in = tensor_map_[block.mask];
+    nvinfer1::ITensor* mask_in = nullptr;
+    if (block.mask != nullptr) {
+      mask_in = tensor_map_[block.mask];
+    } else {
+      LITERT_ASSIGN_OR_RETURN(
+          mask_in, MaskFromSdpaParams(
+                       tensor_map_[block.params], tokens,
+                       static_cast<int32_t>(k_cache->getDimensions().d[2]),
+                       block.causal));
+    }
     // A windowed block keeps the full caches and mask: the plugin reads
     // `window` keys from the start it is handed as a fifth input.
     int32_t window = 0;
@@ -10462,6 +10762,88 @@ class TensorRtGraphBuilder {
     if (layer == nullptr || layer->getOutput(0) == nullptr) {
       return Error(kLiteRtStatusErrorCompilation,
                    "Failed to add TensorRT reduce-max layer");
+    }
+    return SetOutputTensor(op.Outputs()[0], layer->getOutput(0));
+  }
+
+  // a ^ b of int32 tensors bit by bit, TensorRT having no integer bitwise
+  // operation: bit k of x (k < 31) is floor(x / 2^k) - 2 floor(x / 2^(k+1)),
+  // bit 31 is x < 0, and a bit of the result is p + q - 2 p q. TensorRT fuses
+  // the elementwise layers into one kernel.
+  Expected<void> LowerBitwiseXor(const Op& op) {
+    LITERT_ASSIGN_OR_RETURN(auto* a, GetTensor(op.Inputs()[0]));
+    LITERT_ASSIGN_OR_RETURN(auto* b, GetTensor(op.Inputs()[1]));
+    LITERT_RETURN_IF_ERROR(MatchElementwiseRanks(a, b));
+    const int rank = a->getDimensions().nbDims;
+    const auto scalar = [&](int32_t value) -> nvinfer1::ITensor* {
+      owned_weights_.emplace_back(sizeof(int32_t));
+      std::memcpy(owned_weights_.back().data(), &value, sizeof(value));
+      nvinfer1::Dims dims{};
+      dims.nbDims = rank;
+      for (int i = 0; i < rank; ++i) dims.d[i] = 1;
+      auto* layer = network_->addConstant(
+          dims, nvinfer1::Weights{nvinfer1::DataType::kINT32,
+                                  owned_weights_.back().data(), 1});
+      return layer == nullptr ? nullptr : layer->getOutput(0);
+    };
+    using Ew = nvinfer1::ElementWiseOperation;
+    const auto ew = [&](nvinfer1::ITensor* x, nvinfer1::ITensor* y,
+                        Ew operation) -> nvinfer1::ITensor* {
+      if (x == nullptr || y == nullptr) return nullptr;
+      auto* layer = network_->addElementWise(*x, *y, operation);
+      return layer == nullptr ? nullptr : layer->getOutput(0);
+    };
+    const auto bit = [&](nvinfer1::ITensor* x, int k) -> nvinfer1::ITensor* {
+      if (k == 31) {
+        auto* negative = ew(x, scalar(0), Ew::kLESS);
+        if (negative == nullptr) return nullptr;
+        auto* cast = network_->addCast(*negative, nvinfer1::DataType::kINT32);
+        return cast == nullptr ? nullptr : cast->getOutput(0);
+      }
+      auto* low = ew(x, scalar(int32_t{1} << k), Ew::kFLOOR_DIV);
+      nvinfer1::ITensor* high = nullptr;
+      if (k < 30) {
+        high = ew(x, scalar(int32_t{1} << (k + 1)), Ew::kFLOOR_DIV);
+      } else {
+        // floor(x / 2^31), 2^31 not being an int32: -1 for x < 0, else 0.
+        auto* negative = ew(x, scalar(0), Ew::kLESS);
+        auto* cast =
+            negative == nullptr
+                ? nullptr
+                : network_->addCast(*negative, nvinfer1::DataType::kINT32);
+        high = cast == nullptr ? nullptr
+                               : ew(scalar(0), cast->getOutput(0), Ew::kSUB);
+      }
+      return ew(low, ew(high, scalar(2), Ew::kPROD), Ew::kSUB);
+    };
+    nvinfer1::ITensor* result = nullptr;
+    for (int k = 0; k < 32; ++k) {
+      auto* p = bit(a, k);
+      auto* q = bit(b, k);
+      auto* x = ew(ew(p, q, Ew::kSUM),
+                   ew(scalar(2), ew(p, q, Ew::kPROD), Ew::kPROD), Ew::kSUB);
+      auto* term =
+          ew(x, scalar(static_cast<int32_t>(uint32_t{1} << k)), Ew::kPROD);
+      result = result == nullptr ? term : ew(result, term, Ew::kSUM);
+      if (result == nullptr) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "Failed to add the TensorRT layers of BITWISE_XOR");
+      }
+    }
+    return SetOutputTensor(op.Outputs()[0], result);
+  }
+
+  // GATHER along `axis` (batch_dims 0, IsGatherSupported).
+  Expected<void> LowerGather(const Op& op) {
+    LITERT_ASSIGN_OR_RETURN(auto* data, GetTensor(op.Inputs()[0]));
+    LITERT_ASSIGN_OR_RETURN(auto* indices, GetTensor(op.Inputs()[1]));
+    int32_t axis = 0;
+    LITERT_RETURN_IF_ERROR(LiteRtGetGatherAxisOption(op.Get(), &axis));
+    if (axis < 0) axis += data->getDimensions().nbDims;
+    auto* layer = network_->addGather(*data, *indices, axis);
+    if (layer == nullptr || layer->getOutput(0) == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to add TensorRT gather layer");
     }
     return SetOutputTensor(op.Outputs()[0], layer->getOutput(0));
   }
@@ -12511,7 +12893,7 @@ class TensorRtGraphBuilder {
   //   y = short_conv(qkv); q, k = rms_norm(slices of y); v = slice of y
   //   beta = sigmoid(b); g = A * log(1 + exp(min(a, 50)))
   //   o = gated_delta_update(q, k, v, beta, g, state)
-  //   out = rms_norm(o) * (z * sigmoid(z))
+  //   out = rms_norm(o) * (z * sigmoid(z)), or * sigmoid(z) (Qwen 4)
   // with reshapes between the shapes, and in prefill with row/head
   // transposes, row masks on every operand and the valid length. Every
   // intermediate result has a single reader within the layer; the ops past
@@ -12670,20 +13052,27 @@ class TensorRtGraphBuilder {
     }
     const Tensor gate = product.Inputs()[1 - product_uses[0].user_arg_ind];
     const auto silu = gate.GetDefiningOp();
-    if (!silu || gate.Uses().size() != 1 ||
-        silu->Code() != kLiteRtOpCodeTflMul || silu->Inputs().size() != 2 ||
-        !HasNoFusedActivation(*silu)) {
-      return std::nullopt;
-    }
+    if (!silu || gate.Uses().size() != 1) return std::nullopt;
     std::optional<Tensor> z;
-    for (int i = 0; i < 2 && !z; ++i) {
-      const auto logistic = silu->Inputs()[i].GetDefiningOp();
-      if (logistic && logistic->Code() == kLiteRtOpCodeTflLogistic &&
-          silu->Inputs()[i].Uses().size() == 1 &&
-          logistic->Inputs()[0].Get() == silu->Inputs()[1 - i].Get() &&
-          silu->Inputs()[1 - i].Uses().size() == 2) {
-        z = silu->Inputs()[1 - i];
-        members.push_back(logistic->Get());
+    if (silu->Code() == kLiteRtOpCodeTflLogistic &&
+        silu->Inputs().size() == 1 && silu->Inputs()[0].Uses().size() == 1) {
+      // Qwen 4's output gate: rms_norm(o) * sigmoid(z).
+      z = silu->Inputs()[0];
+      block.params.sigmoid_gate = 1;
+    } else {
+      if (silu->Code() != kLiteRtOpCodeTflMul || silu->Inputs().size() != 2 ||
+          !HasNoFusedActivation(*silu)) {
+        return std::nullopt;
+      }
+      for (int i = 0; i < 2 && !z; ++i) {
+        const auto logistic = silu->Inputs()[i].GetDefiningOp();
+        if (logistic && logistic->Code() == kLiteRtOpCodeTflLogistic &&
+            silu->Inputs()[i].Uses().size() == 1 &&
+            logistic->Inputs()[0].Get() == silu->Inputs()[1 - i].Get() &&
+            silu->Inputs()[1 - i].Uses().size() == 2) {
+          z = silu->Inputs()[1 - i];
+          members.push_back(logistic->Get());
+        }
       }
     }
     if (!z) return std::nullopt;
@@ -12844,6 +13233,17 @@ class TensorRtGraphBuilder {
       concat->setAxis(parts[0]->getDimensions().nbDims - 1);
       proj = concat->getOutput(0);
       p.proj_stride = at;
+      // The lowered projections carry their biases (FinishFullyConnected),
+      // which the plugin would add again: it takes zeros instead.
+      LiteRtNvidiaGatedDeltaNetParams sized = p;
+      sized.tokens = 1;
+      const size_t biases =
+          static_cast<size_t>(2 * p.key_heads + p.value_heads) * p.head_dim +
+          static_cast<size_t>(p.value_heads) * p.head_dim + 2 * p.value_heads;
+      const size_t count = LiteRtNvidiaGatedDeltaNetConstantCount(&sized);
+      if (block.constants.size() == count && count >= biases) {
+        std::fill(block.constants.end() - biases, block.constants.end(), 0.0f);
+      }
     }
     LITERT_ASSIGN_OR_RETURN(proj,
                             AddCastTensor(proj, nvinfer1::DataType::kBF16));
@@ -12910,6 +13310,1078 @@ class TensorRtGraphBuilder {
                "NVIDIA TensorRT-RTX fused CUDA gated DeltaNet layer: state=%s "
                "rows=%d projections=%s",
                suffix.c_str(), p.tokens, grouped ? "group" : "concatenated");
+    return SetOutputTensor(*block.output, out);
+  }
+
+  // Qwen 4's hyper-connection mix (trtllm/hyper_connection.h) of the streams
+  // x [.., streams * hidden], matched from its mean over the streams
+  // (FindHcMixBlocks).
+  struct HcMixBlock {
+    LiteRtNvidiaHcMixParams params{};
+    std::optional<Tensor> x;
+    std::vector<float> norm_weight;  // [streams * hidden]
+    std::optional<Tensor> down_weights, up_weights;
+    std::optional<Tensor> output;  // the mean
+    // The tensors that hold the normed streams, in any shape; ops outside
+    // the mix may read them (the combine's injection projection does).
+    std::vector<Tensor> normed;
+    // A projection of the normed streams outside the mix that its launch
+    // computes too (FindHcMixExtra): its weights and its result.
+    std::optional<Tensor> extra_weights, extra_output;
+  };
+
+  // The op that defines `tensor` past RESHAPEs, which join `reshapes`. With
+  // `single_use`, null unless `tensor` and every reshape's input have one
+  // reader.
+  static std::optional<Op> ProducerPastReshapes(Tensor tensor, bool single_use,
+                                                std::vector<Op>& reshapes) {
+    while (true) {
+      if (single_use && tensor.Uses().size() != 1) return std::nullopt;
+      const auto producer = tensor.GetDefiningOp();
+      if (!producer) return std::nullopt;
+      if (producer->Code() != kLiteRtOpCodeTflReshape ||
+          producer->Inputs().empty() || producer->Outputs().size() != 1) {
+        return *producer;
+      }
+      reshapes.push_back(*producer);
+      tensor = producer->Inputs()[0];
+    }
+  }
+
+  // A fully connected op of a mix: [outputs, inputs] constant weights, no
+  // bias but zeros, no fused activation.
+  static bool IsHcMixProjection(const Op& op, int64_t outputs, int64_t inputs) {
+    if (op.Code() != kLiteRtOpCodeTflFullyConnected || op.Inputs().size() < 2 ||
+        op.Outputs().size() != 1 || !HasNoFusedActivation(op) ||
+        !op.Inputs()[1].HasWeights() ||
+        !TensorHasShape(op.Inputs()[1], {static_cast<int32_t>(outputs),
+                                         static_cast<int32_t>(inputs)})) {
+      return false;
+    }
+    if (op.Inputs().size() < 3) return true;
+    const Tensor bias = op.Inputs()[2];
+    if (!bias.HasWeights() || !IsUnquantizedFloat32(bias)) return false;
+    for (const uint8_t byte : bias.Weights().Bytes()) {
+      if (byte != 0) return false;
+    }
+    return true;
+  }
+
+  // The product of `op` (a MUL, or a DIV by the constant) with a constant
+  // scalar: the factor and the other operand.
+  static std::optional<std::pair<float, Tensor>> ScalarProduct(const Op& op) {
+    if (op.Inputs().size() != 2 || op.Outputs().size() != 1 ||
+        !HasNoFusedActivation(op)) {
+      return std::nullopt;
+    }
+    if (op.Code() == kLiteRtOpCodeTflMul) {
+      for (int i = 0; i < 2; ++i) {
+        if (const auto factor = ReadFloatScalar(op.Inputs()[i]);
+            factor.has_value() && !op.Inputs()[1 - i].HasWeights()) {
+          return std::make_pair(*factor, op.Inputs()[1 - i]);
+        }
+      }
+    } else if (op.Code() == kLiteRtOpCodeTflDiv) {
+      if (const auto divisor = ReadFloatScalar(op.Inputs()[1]);
+          divisor.has_value() && *divisor != 0.0f &&
+          !op.Inputs()[0].HasWeights()) {
+        return std::make_pair(1.0f / *divisor, op.Inputs()[0]);
+      }
+    }
+    return std::nullopt;
+  }
+
+  // Matches a mix from the reduction over its streams, in the spellings of
+  // the Qwen 3.8 export's recipes:
+  //   normed = rms_norm(x as [.., streams, hidden], w) [* per-stream weights]
+  //   t      = silu(scale * fully_connected(normed, down))   scale optional
+  //   u      = logistic(fully_connected(t, up))
+  //   mixed  = mean over the streams of (u * normed), or their sum times
+  //            1 / streams
+  // with reshapes between the shapes and silu as z * logistic(z). Every
+  // intermediate result has its readers within the mix, except the normed
+  // streams. The ops of the mix join `members`; `anchor` is its last op.
+  std::optional<HcMixBlock> MatchHcMix(const Op& reduce,
+                                       std::vector<LiteRtOp>& members,
+                                       LiteRtOp& anchor) {
+    const bool is_mean = reduce.Code() == kLiteRtOpCodeTflMean;
+    if ((!is_mean && reduce.Code() != kLiteRtOpCodeTflSum) ||
+        reduce.Inputs().size() != 2 || reduce.Outputs().size() != 1) {
+      return std::nullopt;
+    }
+    const auto gated_type = reduce.Inputs()[0].RankedTensorType();
+    const auto axes = ReadInt32Constant(reduce.Inputs()[1]);
+    if (!gated_type || !axes || axes->size() != 1) return std::nullopt;
+    const auto gated_dims = gated_type->Layout().Dimensions();
+    const int rank = static_cast<int>(gated_dims.size());
+    if (rank < 2 || ((*axes)[0] != rank - 2 && (*axes)[0] != -2)) {
+      return std::nullopt;
+    }
+    const int64_t streams = gated_dims[rank - 2];
+    const int64_t hidden = gated_dims[rank - 1];
+    int64_t rows = 1;
+    for (int i = 0; i + 2 < rank; ++i) rows *= gated_dims[i];
+    if (streams < 1 || hidden < 1 || rows < 1 || rows > 64) return std::nullopt;
+    const int64_t width = streams * hidden;
+    HcMixBlock block;
+    block.output = reduce.Outputs()[0];
+    anchor = reduce.Get();
+    members.push_back(reduce.Get());
+    if (!is_mean) {
+      const auto uses = block.output->Uses();
+      if (uses.size() != 1) return std::nullopt;
+      const Op& scale = uses[0].user;
+      const auto product = ScalarProduct(scale);
+      if (!product || product->second.Get() != block.output->Get() ||
+          std::fabs(product->first * static_cast<float>(streams) - 1.0f) >
+              1e-6f) {
+        return std::nullopt;
+      }
+      members.push_back(scale.Get());
+      anchor = scale.Get();
+      block.output = scale.Outputs()[0];
+    }
+    const auto join = [&](const std::vector<Op>& ops) {
+      for (const Op& op : ops) members.push_back(op.Get());
+    };
+    // u * normed.
+    std::vector<Op> reshapes;
+    const auto gated =
+        ProducerPastReshapes(reduce.Inputs()[0], /*single_use=*/true, reshapes);
+    if (!gated || gated->Code() != kLiteRtOpCodeTflMul ||
+        gated->Inputs().size() != 2 || !HasNoFusedActivation(*gated)) {
+      return std::nullopt;
+    }
+    join(reshapes);
+    members.push_back(gated->Get());
+    std::optional<Op> up;
+    std::optional<Tensor> gated_normed;
+    for (int side = 0; side < 2 && !up; ++side) {
+      reshapes.clear();
+      const auto sigmoid = ProducerPastReshapes(gated->Inputs()[side],
+                                                /*single_use=*/true, reshapes);
+      if (!sigmoid || sigmoid->Code() != kLiteRtOpCodeTflLogistic ||
+          sigmoid->Inputs().size() != 1) {
+        continue;
+      }
+      std::vector<Op> below;
+      const auto fc = ProducerPastReshapes(sigmoid->Inputs()[0],
+                                           /*single_use=*/true, below);
+      if (!fc || fc->Code() != kLiteRtOpCodeTflFullyConnected) continue;
+      join(reshapes);
+      join(below);
+      members.push_back(sigmoid->Get());
+      up = *fc;
+      gated_normed = gated->Inputs()[1 - side];
+    }
+    if (!up || up->Inputs().size() < 2) return std::nullopt;
+    const auto up_type = up->Inputs()[1].RankedTensorType();
+    if (!up_type || up_type->Layout().Rank() != 2) return std::nullopt;
+    const int64_t low_rank = up_type->Layout().Dimensions()[1];
+    if (!IsHcMixProjection(*up, width, low_rank)) return std::nullopt;
+    members.push_back(up->Get());
+    // t = z * logistic(z), z the scaled down projection.
+    reshapes.clear();
+    const auto silu =
+        ProducerPastReshapes(up->Inputs()[0], /*single_use=*/true, reshapes);
+    if (!silu || silu->Code() != kLiteRtOpCodeTflMul ||
+        silu->Inputs().size() != 2 || !HasNoFusedActivation(*silu)) {
+      return std::nullopt;
+    }
+    join(reshapes);
+    std::optional<Tensor> z;
+    for (int i = 0; i < 2 && !z; ++i) {
+      const auto logistic = silu->Inputs()[i].GetDefiningOp();
+      if (logistic && logistic->Code() == kLiteRtOpCodeTflLogistic &&
+          logistic->Inputs().size() == 1 &&
+          silu->Inputs()[i].Uses().size() == 1 &&
+          logistic->Inputs()[0].Get() == silu->Inputs()[1 - i].Get() &&
+          silu->Inputs()[1 - i].Uses().size() == 2) {
+        z = silu->Inputs()[1 - i];
+        members.push_back(logistic->Get());
+      }
+    }
+    if (!z) return std::nullopt;
+    members.push_back(silu->Get());
+    block.params.down_scale = 1.0f;
+    std::optional<Op> down;
+    if (const auto defining = z->GetDefiningOp(); defining) down = *defining;
+    if (down && down->Code() != kLiteRtOpCodeTflFullyConnected) {
+      const auto product = ScalarProduct(*down);
+      if (!product) return std::nullopt;
+      block.params.down_scale = product->first;
+      members.push_back(down->Get());
+      reshapes.clear();
+      down =
+          ProducerPastReshapes(product->second, /*single_use=*/true, reshapes);
+      join(reshapes);
+    }
+    if (!down || !IsHcMixProjection(*down, low_rank, width)) {
+      return std::nullopt;
+    }
+    members.push_back(down->Get());
+    // The normed streams that the down projection and the gates read: one
+    // value in different shapes.
+    std::vector<Op> to_down, to_gate;
+    const auto normed = ProducerPastReshapes(down->Inputs()[0],
+                                             /*single_use=*/false, to_down);
+    const auto normed_gate =
+        ProducerPastReshapes(*gated_normed, /*single_use=*/false, to_gate);
+    if (!normed || !normed_gate || normed->Get() != normed_gate->Get() ||
+        normed->Outputs().size() != 1) {
+      return std::nullopt;
+    }
+    block.normed.push_back(normed->Outputs()[0]);
+    for (const auto* path : {&to_down, &to_gate}) {
+      for (const Op& reshape : *path) {
+        bool seen = false;
+        for (LiteRtOp member : members) seen = seen || member == reshape.Get();
+        if (seen) continue;
+        members.push_back(reshape.Get());
+        block.normed.push_back(reshape.Outputs()[0]);
+      }
+    }
+    // rms_norm over each stream, then an optional weight per stream and
+    // channel.
+    std::vector<float> scale(static_cast<size_t>(width), 1.0f);
+    std::optional<Op> norm = *normed;
+    if (norm->Code() == kLiteRtOpCodeTflMul) {
+      if (norm->Inputs().size() != 2 || !HasNoFusedActivation(*norm)) {
+        return std::nullopt;
+      }
+      const int constant = norm->Inputs()[1].HasWeights() ? 1 : 0;
+      const Tensor weights = norm->Inputs()[constant];
+      const auto weights_type = weights.RankedTensorType();
+      if (!weights.HasWeights() || !IsUnquantizedFloat32(weights) ||
+          !weights_type) {
+        return std::nullopt;
+      }
+      // [.., streams, hidden], [hidden] or a scalar: the trailing dims of the
+      // normed streams.
+      const auto dims = weights_type->Layout().Dimensions();
+      const auto bytes = weights.Weights().Bytes();
+      size_t count = 1;
+      for (const auto dim : dims) count *= static_cast<size_t>(dim);
+      if (bytes.size() != count * sizeof(float) ||
+          (count != static_cast<size_t>(width) &&
+           count != static_cast<size_t>(hidden) && count != 1) ||
+          (count == static_cast<size_t>(width) &&
+           (dims.size() < 2 || dims[dims.size() - 1] != hidden)) ||
+          (count == static_cast<size_t>(hidden) && dims.back() != hidden)) {
+        return std::nullopt;
+      }
+      for (size_t i = 0; i < scale.size(); ++i) {
+        std::memcpy(&scale[i], bytes.data() + (i % count) * sizeof(float),
+                    sizeof(float));
+      }
+      members.push_back(norm->Get());
+      reshapes.clear();
+      norm = ProducerPastReshapes(norm->Inputs()[1 - constant],
+                                  /*single_use=*/true, reshapes);
+      join(reshapes);
+      if (!norm) return std::nullopt;
+    }
+    const auto norm_weights = RmsNormWeights(*norm, static_cast<int>(hidden));
+    if (!norm_weights) return std::nullopt;
+    const auto norm_input_type = norm->Inputs()[0].RankedTensorType();
+    if (!norm_input_type) return std::nullopt;
+    {
+      // The norm is over the channels of each stream.
+      const auto dims = norm_input_type->Layout().Dimensions();
+      if (dims.size() < 2 || dims[dims.size() - 1] != hidden ||
+          dims[dims.size() - 2] != streams) {
+        return std::nullopt;
+      }
+    }
+    members.push_back(norm->Get());
+    block.norm_weight.resize(static_cast<size_t>(width));
+    for (size_t i = 0; i < block.norm_weight.size(); ++i) {
+      block.norm_weight[i] =
+          norm_weights->first[i % static_cast<size_t>(hidden)] * scale[i];
+    }
+    // The streams, before the reshapes that only the norm reads.
+    Tensor x = norm->Inputs()[0];
+    while (true) {
+      const auto reshape = x.GetDefiningOp();
+      if (!reshape || reshape->Code() != kLiteRtOpCodeTflReshape ||
+          reshape->Inputs().empty() || x.Uses().size() != 1) {
+        break;
+      }
+      members.push_back(reshape->Get());
+      x = reshape->Inputs()[0];
+    }
+    if (x.HasWeights() || !IsFloatLike(x.ElementType())) return std::nullopt;
+    block.x = x;
+    const bool int4 = IsBlockwiseInt4Weights(down->Inputs()[1]) &&
+                      IsBlockwiseInt4Weights(up->Inputs()[1]);
+    if (!int4 && (!IsUnquantizedFloat32(down->Inputs()[1]) ||
+                  !IsUnquantizedFloat32(up->Inputs()[1]))) {
+      return std::nullopt;
+    }
+    block.down_weights = down->Inputs()[1];
+    block.up_weights = up->Inputs()[1];
+    block.params.rows = static_cast<int32_t>(rows);
+    block.params.streams = static_cast<int32_t>(streams);
+    block.params.hidden = static_cast<int32_t>(hidden);
+    block.params.low_rank = static_cast<int32_t>(low_rank);
+    block.params.eps = norm_weights->second;
+    block.params.int4 = int4 ? 1 : 0;
+    if (!LiteRtNvidiaHcMixSupports(&block.params)) return std::nullopt;
+    hc_mix_candidate_projections_ = {down->Get(), up->Get()};
+    return block;
+  }
+
+  // Records every hyper-connection mix matched by MatchHcMix: its ops are
+  // not lowered, and its last op emits the LiteRtNvidiaHcMix plugin
+  // (LowerHcMixBlock): one launch where the op-by-op lowering has two GEMV
+  // launches and three fused pointwise kernels. Over a few rows only (decode
+  // and verify steps), with BF16 activations and the CUDA GEMV path.
+  // LITERT_NVIDIA_TENSORRT_FUSE_HYPER_CONNECTION=0 keeps the op-by-op
+  // lowering.
+  Expected<void> FindHcMixBlocks(const Subgraph& subgraph) {
+    if (!EnvEnabled("LITERT_NVIDIA_TENSORRT_FUSE_HYPER_CONNECTION",
+                    /*default_value=*/true) ||
+        !Fp16ActivationsEnabled() ||
+        ModeFloatType() != nvinfer1::DataType::kBF16 ||
+        PredequantizeFcWeightsMode() != PredequantMode::kCudaGemv) {
+      return {};
+    }
+    size_t found = 0;
+    size_t candidates = 0;
+    for (const auto& op : subgraph.Ops()) {
+      if (op.Code() != kLiteRtOpCodeTflMean &&
+          op.Code() != kLiteRtOpCodeTflSum) {
+        continue;
+      }
+      std::vector<LiteRtOp> members;
+      LiteRtOp anchor = nullptr;
+      auto block = MatchHcMix(op, members, anchor);
+      if (!block.has_value()) continue;
+      ++candidates;
+      bool ordered = op_order_.count(anchor) != 0;
+      std::unordered_set<LiteRtOp> inside(members.begin(), members.end());
+      for (LiteRtOp member : members) {
+        ordered = ordered && op_order_.count(member) != 0 &&
+                  unlowered_ops_.count(member) == 0 &&
+                  op_order_[member] <= op_order_[anchor];
+      }
+      // What reads the normed streams outside the mix comes after the
+      // plugin; nothing outside reads the other results of its ops.
+      for (const Tensor& normed : block->normed) {
+        for (const auto& use : normed.Uses()) {
+          const LiteRtOp user = use.user.Get();
+          ordered = ordered && (inside.count(user) != 0 ||
+                                (op_order_.count(user) != 0 &&
+                                 op_order_[user] > op_order_[anchor]));
+        }
+      }
+      if (!ordered) continue;
+      if (const auto extra = FindHcMixExtra(*block, inside, anchor);
+          extra.has_value()) {
+        block->extra_weights = extra->Inputs()[1];
+        block->extra_output = extra->Outputs()[0];
+        const auto rows = extra->Inputs()[1].RankedTensorType();
+        block->params.extra = rows->Layout().Dimensions()[0];
+        members.push_back(extra->Get());
+        hc_mix_projections_.insert(extra->Get());
+      }
+      unlowered_ops_.insert(members.begin(), members.end());
+      hc_mix_projections_.insert(hc_mix_candidate_projections_.begin(),
+                                 hc_mix_candidate_projections_.end());
+      hc_mix_anchor_ops_[anchor] = hc_mix_blocks_.size();
+      hc_mix_blocks_.push_back(std::move(*block));
+      ++found;
+    }
+    if (candidates != 0) {
+      LITERT_LOG(LITERT_INFO,
+                 "NVIDIA TensorRT-RTX fused %zu of %zu hyper-connection mixes "
+                 "into the CUDA hyper-connection plugin",
+                 found, candidates);
+    }
+    return {};
+  }
+
+  // A fully connected op outside a matched mix that projects its normed
+  // streams onto a few rows (the combine's injection weights, [hc, streams *
+  // hidden]) with weights of the mix's type: the mix's launch computes it
+  // too, where it was a GEMV launch of its own for a few kilobytes. Only
+  // when everything that reads its result comes after the mix's plugin.
+  std::optional<Op> FindHcMixExtra(const HcMixBlock& block,
+                                   const std::unordered_set<LiteRtOp>& inside,
+                                   LiteRtOp anchor) {
+    if (!EnvEnabled("LITERT_NVIDIA_TENSORRT_FUSE_HYPER_CONNECTION_COMBINE",
+                    /*default_value=*/true)) {
+      return std::nullopt;
+    }
+    const int64_t width =
+        static_cast<int64_t>(block.params.streams) * block.params.hidden;
+    for (const Tensor& normed : block.normed) {
+      for (const auto& use : normed.Uses()) {
+        const Op& user = use.user;
+        if (use.user_arg_ind != 0 || inside.count(user.Get()) != 0 ||
+            user.Code() != kLiteRtOpCodeTflFullyConnected ||
+            user.Inputs().size() < 2 || op_order_.count(user.Get()) == 0 ||
+            unlowered_ops_.count(user.Get()) != 0) {
+          continue;
+        }
+        const Tensor weights = user.Inputs()[1];
+        const auto type = weights.RankedTensorType();
+        if (!type || type->Layout().Rank() != 2) continue;
+        const int64_t rows = type->Layout().Dimensions()[0];
+        LiteRtNvidiaHcMixParams with = block.params;
+        with.extra = static_cast<int32_t>(rows);
+        if (rows < 1 || rows > 16 || !IsHcMixProjection(user, rows, width) ||
+            (block.params.int4 != 0 ? !IsBlockwiseInt4Weights(weights)
+                                    : !IsUnquantizedFloat32(weights)) ||
+            !LiteRtNvidiaHcMixSupports(&with)) {
+          continue;
+        }
+        bool after = true;
+        for (const auto& reader : user.Outputs()[0].Uses()) {
+          after = after && op_order_.count(reader.user.Get()) != 0 &&
+                  op_order_[reader.user.Get()] > op_order_[anchor];
+        }
+        if (after) return user;
+      }
+    }
+    return std::nullopt;
+  }
+
+  // The weights and scales inputs of one projection of a mix's plugin: INT4
+  // blockwise weights in the weight store when there is one (the plugin then
+  // reads the segment's holder, see AddSubbyteGemvPlugin), else constants;
+  // unquantized weights as a BF16 constant.
+  struct HcMixWeights {
+    nvinfer1::ITensor* weights = nullptr;
+    nvinfer1::ITensor* scales = nullptr;  // INT4 only
+    HcMixWeightsPlace place;
+    std::optional<uint32_t> segment;
+    bool scales_in_store = false;
+  };
+
+  Expected<HcMixWeights> AddHcMixWeights(const Tensor& tensor, bool int4,
+                                         const std::string& suffix) {
+    HcMixWeights result;
+    if (!int4) {
+      const auto bytes = tensor.Weights().Bytes();
+      std::vector<float> values(bytes.size() / sizeof(float));
+      std::memcpy(values.data(), bytes.data(), values.size() * sizeof(float));
+      nvinfer1::Dims dims{};
+      dims.nbDims = 1;
+      dims.d[0] = static_cast<int64_t>(values.size());
+      LITERT_ASSIGN_OR_RETURN(
+          result.weights,
+          AddFloatConstant(values, dims, "cuda_hc_mix_weights" + suffix,
+                           nvinfer1::DataType::kBF16));
+      return result;
+    }
+    LITERT_ASSIGN_OR_RETURN(auto info, InspectSubbyteGemvWeights(tensor));
+    std::vector<float> unused;
+    std::vector<absl::Span<const uint8_t>> block_scales;
+    LITERT_RETURN_IF_ERROR(
+        AppendGemvScales(tensor, info, unused, block_scales));
+    if (info.scale_block != 32 || block_scales.size() != 1) {
+      return Error(kLiteRtStatusErrorUnsupported,
+                   "A hyper-connection mix needs blockwise INT4 weights");
+    }
+    const absl::Span<const uint8_t> packed = tensor.Weights().Bytes();
+    std::optional<TensorRtWeightLocation> location;
+    if (weight_store_ != nullptr) {
+      const bool scales_to_store =
+          EnvEnabled("LITERT_NVIDIA_TENSORRT_BLOCK_SCALES_IN_STORE",
+                     /*default_value=*/true);
+      std::vector<absl::Span<const uint8_t>> all = {packed};
+      if (scales_to_store) all.push_back(block_scales[0]);
+      auto added = weight_store_->Add(all);
+      if (added.HasValue()) {
+        location = *added;
+        result.scales_in_store = scales_to_store;
+      } else if (added.Error().Status() != kLiteRtStatusErrorNotFound) {
+        return added.Error();
+      } else if (scales_to_store) {
+        // Converted scales are not views of the file: they stay in the plan
+        // while the weights go to the store.
+        const absl::Span<const uint8_t> members[] = {packed};
+        auto weights_only = weight_store_->Add(members);
+        if (weights_only.HasValue()) {
+          location = *weights_only;
+        } else if (weights_only.Error().Status() !=
+                   kLiteRtStatusErrorNotFound) {
+          return weights_only.Error();
+        }
+      }
+    }
+    if (location.has_value()) {
+      LITERT_ASSIGN_OR_RETURN(result.weights, ProvisionalWeightHolder());
+      result.segment = location->segment;
+      result.place.granule = static_cast<int64_t>(weight_store_->granule());
+      result.place.weight_offset = static_cast<int64_t>(location->offset);
+    } else {
+      owned_weights_.emplace_back(packed.begin(), packed.end());
+      nvinfer1::Dims dims{};
+      dims.nbDims = 1;
+      dims.d[0] = static_cast<int64_t>(owned_weights_.back().size());
+      nvinfer1::Weights weights{nvinfer1::DataType::kINT8,
+                                owned_weights_.back().data(), dims.d[0]};
+      auto* constant = network_->addConstant(dims, weights);
+      if (constant == nullptr || constant->getOutput(0) == nullptr) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "Failed to add a hyper-connection mix's packed weights");
+      }
+      LITERT_RETURN_IF_ERROR(
+          RegisterRefitWeight(weights, "cuda_hc_mix_weights" + suffix));
+      result.weights = constant->getOutput(0);
+      uses_cuda_subbyte_gemv_ = true;
+    }
+    if (result.scales_in_store) {
+      // The scales follow the weights in the segment; the holder serves both
+      // inputs (AddWeightHolders).
+      result.scales = result.weights;
+      result.place.scale_offset =
+          static_cast<int64_t>(location->offset + packed.size());
+    } else {
+      owned_weights_.emplace_back(block_scales[0].begin(),
+                                  block_scales[0].end());
+      nvinfer1::Dims dims{};
+      dims.nbDims = 1;
+      dims.d[0] =
+          static_cast<int64_t>(owned_weights_.back().size() / sizeof(uint16_t));
+      nvinfer1::Weights weights{nvinfer1::DataType::kHALF,
+                                owned_weights_.back().data(), dims.d[0]};
+      auto* constant = network_->addConstant(dims, weights);
+      if (constant == nullptr || constant->getOutput(0) == nullptr) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "Failed to add a hyper-connection mix's block scales");
+      }
+      LITERT_RETURN_IF_ERROR(
+          RegisterRefitWeight(weights, "cuda_hc_mix_block_scales" + suffix));
+      result.scales = constant->getOutput(0);
+    }
+    return result;
+  }
+
+  // Emits one matched hyper-connection mix at its last op.
+  Expected<void> LowerHcMixBlock(size_t index) {
+    HcMixBlock& block = hc_mix_blocks_[index];
+    const auto& p = block.params;
+    const bool int4 = p.int4 != 0;
+    LITERT_ASSIGN_OR_RETURN(auto* x, GetTensor(*block.x));
+    LITERT_ASSIGN_OR_RETURN(x, AddCastTensor(x, nvinfer1::DataType::kBF16));
+    const std::string suffix =
+        "_" + std::to_string(block.down_weights->TensorIndex());
+    nvinfer1::Dims norm_dims{};
+    norm_dims.nbDims = 1;
+    norm_dims.d[0] = static_cast<int64_t>(block.norm_weight.size());
+    LITERT_ASSIGN_OR_RETURN(auto* norm_weight,
+                            AddFloatConstant(block.norm_weight, norm_dims,
+                                             "cuda_hc_mix_norm" + suffix,
+                                             nvinfer1::DataType::kFLOAT));
+    LITERT_ASSIGN_OR_RETURN(auto down,
+                            AddHcMixWeights(*block.down_weights, int4, suffix));
+    LITERT_ASSIGN_OR_RETURN(
+        auto up,
+        AddHcMixWeights(*block.up_weights, int4,
+                        "_" + std::to_string(block.up_weights->TensorIndex())));
+    HcMixPluginParams params;
+    params.streams = p.streams;
+    params.hidden = p.hidden;
+    params.low_rank = p.low_rank;
+    params.down_scale = p.down_scale;
+    params.eps = p.eps;
+    params.int4 = p.int4;
+    params.down = down.place;
+    params.up = up.place;
+    HcMixWeights more;
+    if (block.extra_weights.has_value()) {
+      LITERT_ASSIGN_OR_RETURN(
+          more, AddHcMixWeights(
+                    *block.extra_weights, int4,
+                    "_" + std::to_string(block.extra_weights->TensorIndex())));
+      params.extra = p.extra;
+      params.more = more.place;
+    }
+    TrtPtr<nvinfer1::IPluginV3> plugin(CreateHcMixPlugin(params));
+    if (!plugin) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to create the hyper-connection mix plugin");
+    }
+    std::vector<nvinfer1::ITensor*> inputs = {x, norm_weight, down.weights};
+    if (int4) inputs.push_back(down.scales);
+    const int32_t up_input = static_cast<int32_t>(inputs.size());
+    inputs.push_back(up.weights);
+    if (int4) inputs.push_back(up.scales);
+    const int32_t more_input = static_cast<int32_t>(inputs.size());
+    if (block.extra_weights.has_value()) {
+      inputs.push_back(more.weights);
+      if (int4) inputs.push_back(more.scales);
+    }
+    auto* layer = tensorrt_rtx_1_5_0_99::AddPluginV3(
+        *network_, inputs.data(), static_cast<int32_t>(inputs.size()), *plugin);
+    if (layer == nullptr || layer->getOutput(0) == nullptr ||
+        layer->getOutput(1) == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to add the hyper-connection mix plugin layer");
+    }
+    // The holders of the segments replace the provisional ones
+    // (AddWeightHolders): each input that reads a holder on its own.
+    if (down.segment.has_value()) {
+      holder_readers_.push_back({layer, *down.segment, false, 2});
+      if (down.scales_in_store) {
+        holder_readers_.push_back({layer, *down.segment, false, 3});
+      }
+    }
+    if (up.segment.has_value()) {
+      holder_readers_.push_back({layer, *up.segment, false, up_input});
+      if (up.scales_in_store) {
+        holder_readers_.push_back({layer, *up.segment, false, up_input + 1});
+      }
+    }
+    if (more.segment.has_value()) {
+      holder_readers_.push_back({layer, *more.segment, false, more_input});
+      if (more.scales_in_store) {
+        holder_readers_.push_back(
+            {layer, *more.segment, false, more_input + 1});
+      }
+    }
+    const std::string name = "cuda_hc_mix" + suffix;
+    layer->setName(KeepName(UniqueName(name)));
+    const int outputs = block.extra_weights.has_value() ? 3 : 2;
+    for (int o = 0; o < outputs; ++o) {
+      if (layer->getOutput(o) == nullptr) {
+        return Error(kLiteRtStatusErrorCompilation,
+                     "The hyper-connection mix plugin lacks an output");
+      }
+      layer->getOutput(o)->setName(
+          KeepName(UniqueName(name + "_" + std::to_string(o))));
+    }
+    owned_plugins_.push_back(std::move(plugin));
+    if (block.extra_output.has_value()) {
+      LITERT_ASSIGN_OR_RETURN(auto type,
+                              block.extra_output->RankedTensorType());
+      LITERT_ASSIGN_OR_RETURN(auto dims, ConvertDims(type));
+      LITERT_ASSIGN_OR_RETURN(auto* reshaped,
+                              ReshapeTensor(layer->getOutput(2), dims));
+      LITERT_RETURN_IF_ERROR(SetOutputTensor(*block.extra_output, reshaped));
+    }
+    for (const Tensor& normed : block.normed) {
+      LITERT_ASSIGN_OR_RETURN(auto type, normed.RankedTensorType());
+      LITERT_ASSIGN_OR_RETURN(auto dims, ConvertDims(type));
+      LITERT_ASSIGN_OR_RETURN(auto* reshaped,
+                              ReshapeTensor(layer->getOutput(1), dims));
+      LITERT_RETURN_IF_ERROR(SetOutputTensor(normed, reshaped));
+    }
+    LITERT_ASSIGN_OR_RETURN(auto out_type, block.output->RankedTensorType());
+    LITERT_ASSIGN_OR_RETURN(auto out_dims, ConvertDims(out_type));
+    LITERT_ASSIGN_OR_RETURN(auto* out,
+                            ReshapeTensor(layer->getOutput(0), out_dims));
+    LITERT_LOG(LITERT_INFO,
+               "NVIDIA TensorRT-RTX fused CUDA hyper-connection mix: rows=%d "
+               "streams=%d hidden=%d low_rank=%d extra=%d weights=%s%s",
+               p.rows, p.streams, p.hidden, p.low_rank, p.extra,
+               int4 ? "int4" : "bf16",
+               down.segment.has_value() ? " (weight store)" : "");
+    return SetOutputTensor(*block.output, out);
+  }
+
+  // Qwen 4's per-layer embedding past its key and value projections
+  // (trtllm/ple_tail.h), matched around its short convolution
+  // (FindPleTailBlocks).
+  struct PleTailBlock {
+    LiteRtNvidiaPleTailParams params{};
+    std::optional<Tensor> key, value, x, state, state_out, output;
+    std::vector<float> constants;  // ple_tail.h's order
+  };
+
+  // The tensor that `tensor` is a RESHAPE of (through any number of them);
+  // the reshapes join `reshapes`. With `single_use`, only through reshapes
+  // whose result has one reader.
+  static Tensor PastReshapes(Tensor tensor, bool single_use,
+                             std::vector<LiteRtOp>& reshapes) {
+    while (true) {
+      const auto producer = tensor.GetDefiningOp();
+      if (!producer || producer->Code() != kLiteRtOpCodeTflReshape ||
+          producer->Inputs().empty() || producer->Outputs().size() != 1 ||
+          (single_use && tensor.Uses().size() != 1)) {
+        return tensor;
+      }
+      reshapes.push_back(producer->Get());
+      tensor = producer->Inputs()[0];
+    }
+  }
+
+  // A norm over each stream's channels with a weight per stream and channel:
+  // `normed` = rms_norm(source as [.., streams, hidden], w) [* weights], with
+  // reshapes of one reader in between. The source (before the reshapes that
+  // only the norm reads), the weights [streams * hidden] and the epsilon; the
+  // norm's ops join `members`.
+  struct GroupedNorm {
+    std::optional<Tensor> source;
+    std::vector<float> weight;
+    float eps = 0.0f;
+    int64_t streams = 0;
+    int64_t hidden = 0;
+  };
+
+  static std::optional<GroupedNorm> MatchGroupedNorm(
+      const Tensor& normed, std::vector<LiteRtOp>& members) {
+    std::vector<LiteRtOp> found;
+    Tensor value = PastReshapes(normed, /*single_use=*/true, found);
+    if (value.Uses().size() != 1) return std::nullopt;
+    auto norm = value.GetDefiningOp();
+    if (!norm) return std::nullopt;
+    std::optional<Tensor> weights;
+    if (norm->Code() == kLiteRtOpCodeTflMul) {
+      if (norm->Inputs().size() != 2 || !HasNoFusedActivation(*norm)) {
+        return std::nullopt;
+      }
+      const int constant = norm->Inputs()[1].HasWeights() ? 1 : 0;
+      weights = norm->Inputs()[constant];
+      if (!weights->HasWeights() || !IsUnquantizedFloat32(*weights)) {
+        return std::nullopt;
+      }
+      found.push_back(norm->Get());
+      value = PastReshapes(norm->Inputs()[1 - constant], /*single_use=*/true,
+                           found);
+      if (value.Uses().size() != 1) return std::nullopt;
+      norm = value.GetDefiningOp();
+      if (!norm) return std::nullopt;
+    }
+    if (norm->Inputs().size() != 2) return std::nullopt;
+    const auto input_type = norm->Inputs()[0].RankedTensorType();
+    if (!input_type || input_type->Layout().Rank() < 2) return std::nullopt;
+    const auto dims = input_type->Layout().Dimensions();
+    GroupedNorm result;
+    result.hidden = dims[dims.size() - 1];
+    result.streams = dims[dims.size() - 2];
+    if (result.hidden < 1 || result.streams < 1) return std::nullopt;
+    const auto norm_weights =
+        RmsNormWeights(*norm, static_cast<int>(result.hidden));
+    if (!norm_weights) return std::nullopt;
+    found.push_back(norm->Get());
+    const size_t width = static_cast<size_t>(result.streams * result.hidden);
+    result.weight.assign(width, 1.0f);
+    if (weights.has_value()) {
+      // [.., streams, hidden], [hidden] or a scalar.
+      const auto weights_type = weights->RankedTensorType();
+      if (!weights_type) return std::nullopt;
+      const auto shape = weights_type->Layout().Dimensions();
+      const auto bytes = weights->Weights().Bytes();
+      size_t count = 1;
+      for (const auto dim : shape) count *= static_cast<size_t>(dim);
+      if (bytes.size() != count * sizeof(float) ||
+          (count != width && count != static_cast<size_t>(result.hidden) &&
+           count != 1) ||
+          (count == width &&
+           (shape.size() < 2 || shape[shape.size() - 1] != result.hidden)) ||
+          (count == static_cast<size_t>(result.hidden) && count != 1 &&
+           shape.back() != result.hidden)) {
+        return std::nullopt;
+      }
+      for (size_t i = 0; i < width; ++i) {
+        std::memcpy(&result.weight[i],
+                    bytes.data() + (i % count) * sizeof(float), sizeof(float));
+      }
+    }
+    for (size_t i = 0; i < width; ++i) {
+      result.weight[i] *=
+          norm_weights->first[i % static_cast<size_t>(result.hidden)];
+    }
+    result.eps = norm_weights->second;
+    result.source = PastReshapes(norm->Inputs()[0], /*single_use=*/true, found);
+    members.insert(members.end(), found.begin(), found.end());
+    return result;
+  }
+
+  // The single reader of `tensor` when it is an op of `code` with one input
+  // (or two for a binary op) and no fused activation.
+  static std::optional<Op> SoleProducer(const Tensor& tensor, LiteRtOpCode code,
+                                        size_t inputs) {
+    const auto op = tensor.GetDefiningOp();
+    if (!op || tensor.Uses().size() != 1 || op->Code() != code ||
+        op->Inputs().size() != inputs || op->Outputs().size() != 1) {
+      return std::nullopt;
+    }
+    return *op;
+  }
+
+  // Matches a per-layer embedding's tail around its convolution, in decode
+  // (no row mask, no valid length), in the reference's ops:
+  //   g      = scale * sum over the channels of
+  //            (grouped_norm(key) * grouped_norm(x))        scale optional
+  //   gate   = logistic(sign(g) * sqrt(maximum(abs(g), floor)))
+  //   gv     = gate [.., streams, 1] * value [.., 1, hidden]
+  //   y      = short_conv_step(grouped_norm(gv) as [.., streams * hidden])
+  //   result = x + (gv + y)
+  // with reshapes between the shapes. Every intermediate result has its
+  // readers within the layer. Its ops join `members`; `anchor` is the last
+  // add.
+  std::optional<PleTailBlock> MatchPleTail(const Op& conv,
+                                           std::vector<LiteRtOp>& members,
+                                           LiteRtOp& anchor) {
+    const auto parsed = ParseShortConvStep(conv);
+    if (!parsed || parsed->has_valid_len) return std::nullopt;
+    PleTailBlock block;
+    members.push_back(conv.Get());
+    // y + gv, then + x.
+    const Tensor y = conv.Outputs()[0];
+    if (y.Uses().size() != 1) return std::nullopt;
+    const Op add_value = y.Uses()[0].user;
+    if (add_value.Code() != kLiteRtOpCodeTflAdd ||
+        add_value.Inputs().size() != 2 || !HasNoFusedActivation(add_value) ||
+        add_value.Outputs()[0].Uses().size() != 1) {
+      return std::nullopt;
+    }
+    const auto residual_use = add_value.Outputs()[0].Uses()[0];
+    const Op add_streams = residual_use.user;
+    if (add_streams.Code() != kLiteRtOpCodeTflAdd ||
+        add_streams.Inputs().size() != 2 ||
+        !HasNoFusedActivation(add_streams)) {
+      return std::nullopt;
+    }
+    members.push_back(add_value.Get());
+    members.push_back(add_streams.Get());
+    anchor = add_streams.Get();
+    block.x = add_streams.Inputs()[1 - residual_use.user_arg_ind];
+    block.output = add_streams.Outputs()[0];
+    // The convolution's input: the grouped norm of the gated value, which
+    // the first add reads too.
+    const auto conv_norm = MatchGroupedNorm(conv.Inputs()[0], members);
+    if (!conv_norm) return std::nullopt;
+    const Tensor gated = *conv_norm->source;
+    if (PastReshapes(add_value.Inputs()[1 - y.Uses()[0].user_arg_ind],
+                     /*single_use=*/true, members)
+                .Get() != gated.Get() ||
+        gated.Uses().size() != 2) {
+      return std::nullopt;
+    }
+    const int64_t streams = conv_norm->streams;
+    const int64_t hidden = conv_norm->hidden;
+    const auto product = gated.GetDefiningOp();
+    if (!product || product->Code() != kLiteRtOpCodeTflMul ||
+        product->Inputs().size() != 2 || !HasNoFusedActivation(*product)) {
+      return std::nullopt;
+    }
+    members.push_back(product->Get());
+    std::optional<Op> logistic;
+    for (int side = 0; side < 2 && !logistic; ++side) {
+      std::vector<LiteRtOp> reshapes;
+      const Tensor gate = PastReshapes(product->Inputs()[side],
+                                       /*single_use=*/true, reshapes);
+      logistic = SoleProducer(gate, kLiteRtOpCodeTflLogistic, 1);
+      if (!logistic) continue;
+      members.insert(members.end(), reshapes.begin(), reshapes.end());
+      block.value = PastReshapes(product->Inputs()[1 - side],
+                                 /*single_use=*/true, members);
+    }
+    if (!logistic) return std::nullopt;
+    members.push_back(logistic->Get());
+    // sign(g) * sqrt(maximum(abs(g), floor)).
+    const auto root_product =
+        SoleProducer(logistic->Inputs()[0], kLiteRtOpCodeTflMul, 2);
+    if (!root_product || !HasNoFusedActivation(*root_product)) {
+      return std::nullopt;
+    }
+    members.push_back(root_product->Get());
+    std::optional<Tensor> g;
+    for (int side = 0; side < 2 && !g; ++side) {
+      const auto sign =
+          SoleProducer(root_product->Inputs()[side], kLiteRtOpCodeTflSign, 1);
+      const auto root = SoleProducer(root_product->Inputs()[1 - side],
+                                     kLiteRtOpCodeTflSqrt, 1);
+      if (!sign || !root) continue;
+      const auto largest =
+          SoleProducer(root->Inputs()[0], kLiteRtOpCodeTflMaximum, 2);
+      if (!largest) continue;
+      for (int operand = 0; operand < 2 && !g; ++operand) {
+        const auto floor = ReadFloatScalar(largest->Inputs()[operand]);
+        const auto magnitude = SoleProducer(largest->Inputs()[1 - operand],
+                                            kLiteRtOpCodeTflAbs, 1);
+        if (!floor || !magnitude ||
+            magnitude->Inputs()[0].Get() != sign->Inputs()[0].Get() ||
+            sign->Inputs()[0].Uses().size() != 2) {
+          continue;
+        }
+        block.params.floor = *floor;
+        g = sign->Inputs()[0];
+        members.push_back(sign->Get());
+        members.push_back(root->Get());
+        members.push_back(largest->Get());
+        members.push_back(magnitude->Get());
+      }
+    }
+    if (!g) return std::nullopt;
+    // g = scale * sum(key_n * query_n) over the channels.
+    block.params.dot_scale = 1.0f;
+    auto sum = g->GetDefiningOp();
+    if (sum && sum->Code() != kLiteRtOpCodeTflSum) {
+      const auto scaled = ScalarProduct(*sum);
+      if (!scaled || scaled->second.Uses().size() != 1) return std::nullopt;
+      block.params.dot_scale = scaled->first;
+      members.push_back(sum->Get());
+      sum = scaled->second.GetDefiningOp();
+    }
+    if (!sum || sum->Code() != kLiteRtOpCodeTflSum ||
+        sum->Inputs().size() != 2) {
+      return std::nullopt;
+    }
+    const auto dot_type = sum->Inputs()[0].RankedTensorType();
+    const auto axes = ReadInt32Constant(sum->Inputs()[1]);
+    if (!dot_type || !axes || axes->size() != 1) return std::nullopt;
+    const int rank = static_cast<int>(dot_type->Layout().Rank());
+    if ((*axes)[0] != rank - 1 && (*axes)[0] != -1) return std::nullopt;
+    members.push_back(sum->Get());
+    const auto dot = SoleProducer(sum->Inputs()[0], kLiteRtOpCodeTflMul, 2);
+    if (!dot || !HasNoFusedActivation(*dot)) return std::nullopt;
+    members.push_back(dot->Get());
+    const auto first = MatchGroupedNorm(dot->Inputs()[0], members);
+    const auto second = MatchGroupedNorm(dot->Inputs()[1], members);
+    if (!first || !second) return std::nullopt;
+    // The query is the norm of the streams the layer's result adds to.
+    const bool first_is_query = first->source->Get() == block.x->Get();
+    if (!first_is_query && second->source->Get() != block.x->Get()) {
+      return std::nullopt;
+    }
+    const GroupedNorm& query = first_is_query ? *first : *second;
+    const GroupedNorm& key = first_is_query ? *second : *first;
+    block.key = *key.source;
+    if (key.streams != streams || key.hidden != hidden ||
+        query.streams != streams || query.hidden != hidden ||
+        streams * hidden != parsed->params.channels) {
+      return std::nullopt;
+    }
+    const int32_t width = static_cast<int32_t>(streams * hidden);
+    const int32_t rows = parsed->params.tokens;
+    if (!TensorHasShape(*block.x, {1, rows, width}) ||
+        !TensorHasShape(*block.key, {1, rows, width}) ||
+        !TensorHasShape(*block.value,
+                        {1, rows, static_cast<int32_t>(hidden)}) ||
+        block.key->HasWeights() || block.value->HasWeights() ||
+        block.x->HasWeights()) {
+      return std::nullopt;
+    }
+    block.params.rows = rows;
+    block.params.streams = static_cast<int32_t>(streams);
+    block.params.hidden = static_cast<int32_t>(hidden);
+    block.params.taps = parsed->params.taps;
+    block.params.eps_key = key.eps;
+    block.params.eps_query = query.eps;
+    block.params.eps_conv = conv_norm->eps;
+    block.params.silu = parsed->params.silu;
+    if (!LiteRtNvidiaPleTailSupports(&block.params)) return std::nullopt;
+    block.state = conv.Inputs()[1];
+    block.state_out = conv.Outputs()[1];
+    block.constants = key.weight;
+    block.constants.insert(block.constants.end(), query.weight.begin(),
+                           query.weight.end());
+    block.constants.insert(block.constants.end(), conv_norm->weight.begin(),
+                           conv_norm->weight.end());
+    const auto taps = conv.Inputs()[2].Weights().Bytes();
+    const size_t before = block.constants.size();
+    block.constants.resize(before + taps.size() / sizeof(float));
+    std::memcpy(block.constants.data() + before, taps.data(), taps.size());
+    if (block.constants.size() !=
+        LiteRtNvidiaPleTailConstantCount(&block.params)) {
+      return std::nullopt;
+    }
+    return block;
+  }
+
+  // Records every per-layer embedding tail matched by MatchPleTail: its ops
+  // are not lowered, and its last add emits the LiteRtNvidiaPleTail plugin
+  // (LowerPleTailBlock): one launch where the op-by-op lowering has three
+  // fused pointwise kernels and the convolution's two. With BF16
+  // activations. LITERT_NVIDIA_TENSORRT_FUSE_PLE=0 keeps the op-by-op
+  // lowering.
+  Expected<void> FindPleTailBlocks(const Subgraph& subgraph) {
+    if (!EnvEnabled("LITERT_NVIDIA_TENSORRT_FUSE_PLE",
+                    /*default_value=*/true) ||
+        !Fp16ActivationsEnabled() ||
+        ModeFloatType() != nvinfer1::DataType::kBF16) {
+      return {};
+    }
+    size_t found = 0;
+    for (const auto& op : subgraph.Ops()) {
+      if (op.Code() != kLiteRtOpCodeShloComposite ||
+          CompositeOpName(op) != "odml.short_conv_step") {
+        continue;
+      }
+      std::vector<LiteRtOp> members;
+      LiteRtOp anchor = nullptr;
+      auto block = MatchPleTail(op, members, anchor);
+      if (!block.has_value()) continue;
+      bool ordered = op_order_.count(anchor) != 0;
+      for (LiteRtOp member : members) {
+        ordered = ordered && op_order_.count(member) != 0 &&
+                  unlowered_ops_.count(member) == 0 &&
+                  op_order_[member] <= op_order_[anchor];
+      }
+      if (!ordered) continue;
+      unlowered_ops_.insert(members.begin(), members.end());
+      ple_tail_anchor_ops_[anchor] = ple_tail_blocks_.size();
+      ple_tail_blocks_.push_back(std::move(*block));
+      ++found;
+    }
+    if (found != 0) {
+      LITERT_LOG(LITERT_INFO,
+                 "NVIDIA TensorRT-RTX fused %zu per-layer embedding tails "
+                 "into the CUDA plugin",
+                 found);
+    }
+    return {};
+  }
+
+  // Emits one matched per-layer embedding tail at its last add.
+  Expected<void> LowerPleTailBlock(size_t index) {
+    PleTailBlock& block = ple_tail_blocks_[index];
+    std::vector<nvinfer1::ITensor*> inputs;
+    for (const Tensor* tensor : {&*block.key, &*block.value, &*block.x}) {
+      LITERT_ASSIGN_OR_RETURN(auto* input, GetTensor(*tensor));
+      LITERT_ASSIGN_OR_RETURN(input,
+                              AddCastTensor(input, nvinfer1::DataType::kBF16));
+      inputs.push_back(input);
+    }
+    LITERT_ASSIGN_OR_RETURN(auto* state, GetFp32StateInput(*block.state));
+    inputs.push_back(state);
+    const std::string suffix = std::to_string(block.state->TensorIndex());
+    nvinfer1::Dims constant_dims{};
+    constant_dims.nbDims = 1;
+    constant_dims.d[0] = static_cast<int64_t>(block.constants.size());
+    LITERT_ASSIGN_OR_RETURN(
+        auto* constants, AddFloatConstant(block.constants, constant_dims,
+                                          "cuda_ple_tail_constants_" + suffix,
+                                          nvinfer1::DataType::kFLOAT));
+    inputs.push_back(constants);
+    TrtPtr<nvinfer1::IPluginV3> plugin(CreatePleTailPlugin(block.params));
+    if (!plugin) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to create the per-layer embedding plugin");
+    }
+    auto* layer = tensorrt_rtx_1_5_0_99::AddPluginV3(
+        *network_, inputs.data(), static_cast<int32_t>(inputs.size()), *plugin);
+    if (layer == nullptr || layer->getOutput(0) == nullptr ||
+        layer->getOutput(1) == nullptr) {
+      return Error(kLiteRtStatusErrorCompilation,
+                   "Failed to add the per-layer embedding plugin layer");
+    }
+    const std::string name = "cuda_ple_tail_" + suffix;
+    layer->setName(KeepName(UniqueName(name)));
+    for (int o = 0; o < 2; ++o) {
+      layer->getOutput(o)->setName(
+          KeepName(UniqueName(name + "_" + std::to_string(o))));
+    }
+    owned_plugins_.push_back(std::move(plugin));
+    raw_output_map_[block.state_out->Get()] = layer->getOutput(1);
+    LITERT_RETURN_IF_ERROR(
+        SetOutputTensor(*block.state_out, layer->getOutput(1)));
+    LITERT_ASSIGN_OR_RETURN(auto out_type, block.output->RankedTensorType());
+    LITERT_ASSIGN_OR_RETURN(auto out_dims, ConvertDims(out_type));
+    LITERT_ASSIGN_OR_RETURN(auto* out,
+                            ReshapeTensor(layer->getOutput(0), out_dims));
+    LITERT_LOG(LITERT_INFO,
+               "NVIDIA TensorRT-RTX fused CUDA per-layer embedding tail: "
+               "state=%s rows=%d streams=%d hidden=%d taps=%d",
+               suffix.c_str(), block.params.rows, block.params.streams,
+               block.params.hidden, block.params.taps);
     return SetOutputTensor(*block.output, out);
   }
 
@@ -15616,6 +17088,14 @@ class TensorRtGraphBuilder {
         gdn != gdn_anchor_ops_.end()) {
       return LowerGatedDeltaNetBlock(gdn->second);
     }
+    if (auto mix = hc_mix_anchor_ops_.find(op.Get());
+        mix != hc_mix_anchor_ops_.end()) {
+      return LowerHcMixBlock(mix->second);
+    }
+    if (auto ple = ple_tail_anchor_ops_.find(op.Get());
+        ple != ple_tail_anchor_ops_.end()) {
+      return LowerPleTailBlock(ple->second);
+    }
     if (auto region = quant_regions_.find(op.Get());
         region != quant_regions_.end()) {
       return LowerQuantRegion(region->second);
@@ -15637,7 +17117,12 @@ class TensorRtGraphBuilder {
       case kLiteRtOpCodeTflNotEqual:
       case kLiteRtOpCodeTflEqual:
       case kLiteRtOpCodeTflLogicalAnd:
+      case kLiteRtOpCodeTflLogicalOr:
         return LowerComparison(op);
+      case kLiteRtOpCodeTflBitwiseXor:
+        return LowerBitwiseXor(op);
+      case kLiteRtOpCodeTflGather:
+        return LowerGather(op);
       case kLiteRtOpCodeTflRelu:
       case kLiteRtOpCodeTflRelu6:
       case kLiteRtOpCodeTflReluN1To1:
@@ -15649,6 +17134,9 @@ class TensorRtGraphBuilder {
       case kLiteRtOpCodeTflLogistic:
       case kLiteRtOpCodeTflExp:
       case kLiteRtOpCodeTflLog:
+      case kLiteRtOpCodeTflSqrt:
+      case kLiteRtOpCodeTflAbs:
+      case kLiteRtOpCodeTflSign:
         return LowerUnary(op);
       case kLiteRtOpCodeTflGelu:
         return LowerGelu(op);
@@ -15805,6 +17293,17 @@ class TensorRtGraphBuilder {
   // (FindGatedDeltaNetBlocks).
   std::vector<GatedDeltaNetBlock> gdn_blocks_;
   std::unordered_map<LiteRtOp, size_t> gdn_anchor_ops_;
+  // The hyper-connection mixes fused into one plugin each, by their last op
+  // (FindHcMixBlocks), and their two projections.
+  std::vector<HcMixBlock> hc_mix_blocks_;
+  std::unordered_map<LiteRtOp, size_t> hc_mix_anchor_ops_;
+  std::unordered_set<LiteRtOp> hc_mix_projections_;
+  // The projections of the mix that MatchHcMix matched last.
+  std::array<LiteRtOp, 2> hc_mix_candidate_projections_{};
+  // The per-layer embedding tails fused into one plugin each, by their last
+  // add (FindPleTailBlocks).
+  std::vector<PleTailBlock> ple_tail_blocks_;
+  std::unordered_map<LiteRtOp, size_t> ple_tail_anchor_ops_;
   // The statically quantized products (FindQuantRegions): the INT8 values
   // the quant layers produced, by model tensor; the regions, by the op that
   // emits them; the INT8 tensors the product regions will produce and read.
@@ -15822,6 +17321,10 @@ class TensorRtGraphBuilder {
   std::vector<QuantGlue> quant_glues_;
   std::vector<QuantQkvRope> quant_qkv_ropes_;
   std::vector<QuantHead> quant_heads_;
+
+  // Experimental, inert unless LITERT_NVIDIA_MEGAKERNEL is set: the decode
+  // megakernel's lowering, as members of this builder.
+#include "litert/vendors/nvidia/experimental/megakernel/megakernel_lowering.inc"
 };
 
 }  // namespace
@@ -15863,7 +17366,14 @@ bool IsTensorRtOpSupported(const Op& op) {
       result = IsComparisonSupported(op);
       break;
     case kLiteRtOpCodeTflLogicalAnd:
+    case kLiteRtOpCodeTflLogicalOr:
       result = IsLogicalAndSupported(op);
+      break;
+    case kLiteRtOpCodeTflBitwiseXor:
+      result = IsBitwiseXorSupported(op);
+      break;
+    case kLiteRtOpCodeTflGather:
+      result = IsGatherSupported(op);
       break;
     case kLiteRtOpCodeTflRelu:
     case kLiteRtOpCodeTflRelu6:
@@ -15877,6 +17387,9 @@ bool IsTensorRtOpSupported(const Op& op) {
     case kLiteRtOpCodeTflLogistic:
     case kLiteRtOpCodeTflExp:
     case kLiteRtOpCodeTflLog:
+    case kLiteRtOpCodeTflSqrt:
+    case kLiteRtOpCodeTflAbs:
+    case kLiteRtOpCodeTflSign:
       result = IsUnaryActivationSupported(op);
       break;
     case kLiteRtOpCodeTflGelu:
@@ -15974,6 +17487,17 @@ Expected<TensorRtBuildResult> BuildTensorRtEngine(
   }();
   memory_profiler.Log("graph_builder_destroyed");
   return result;
+}
+
+// Experimental (experimental/megakernel/megakernel_lowering.h).
+Expected<TensorRtBuildResult> BuildMegakernelEngine(
+    const Subgraph& subgraph,
+    absl::Span<const std::string> read_only_value_cache_inputs,
+    TensorRtWeightStoreBuilder* weight_store,
+    absl::Span<const std::string> shared_cache_inputs) {
+  TensorRtGraphBuilder builder;
+  return builder.BuildMegakernel(subgraph, read_only_value_cache_inputs,
+                                 weight_store, shared_cache_inputs);
 }
 
 }  // namespace litert::nvidia

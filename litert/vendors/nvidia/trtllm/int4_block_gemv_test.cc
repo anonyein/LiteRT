@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -128,6 +129,7 @@ std::vector<uint16_t> MakeScales(int n, int k, int seed) {
 }
 
 float Gelu(float x, int gate) {
+  if (gate == 3) return x / (1.0f + std::exp(-x));
   if (gate == 1) {
     return 0.5f * x *
            (1.0f +
@@ -161,9 +163,16 @@ float Reference(const std::vector<uint16_t>& activation,
 TEST(Int4BlockGemvTest, MatchesCpuReference) {
   // Every row count, over the input sizes of the 26B model's projections
   // (the expert down projection of 22 blocks runs on one warp) and a short
-  // odd case; 44 channels end in a partial tile of 4.
-  constexpr int kN = 44;
-  for (const int k : {64, 704, 2112, 2816}) {
+  // odd case; 44 channels end in a partial tile of 4. 10240 inputs run 44
+  // CTAs of sixteen warps, a row each (Qwen 4's hyper-connection down
+  // projection's form); 320 inputs into 8200 outputs run 32 rows a CTA in
+  // decode, ending in a partial tile (its up projection's form).
+  for (const auto [k, kN] : {std::pair<int, int>{64, 44},
+                             {704, 44},
+                             {2112, 44},
+                             {2816, 44},
+                             {10240, 44},
+                             {320, 8200}}) {
     const std::vector<uint8_t> weights = MakeInt4Weights(kN, k, 1);
     const std::vector<uint16_t> scales = MakeScales(kN, k, 1);
     for (int rows = 1; rows <= kLiteRtNvidiaInt4BlockGemvMaxRows; ++rows) {
@@ -783,6 +792,9 @@ TEST(Int4BlockGemvTest, MoeDecodeMatchesCpuReference) {
   RunMoeCase({1, 8, 16, 256, 64, 1});
   RunMoeCase({3, 4, 12, 2816, 704, 1});
   RunMoeCase({8, 2, 5, 128, 96, 2});
+  // SiLU experts (Qwen's).
+  RunMoeCase({1, 8, 16, 256, 64, 3});
+  RunMoeCase({4, 8, 64, 512, 128, 3});
 }
 
 TEST(Int4BlockGemvTest, MoePrefillMatchesCpuReference) {
@@ -792,6 +804,7 @@ TEST(Int4BlockGemvTest, MoePrefillMatchesCpuReference) {
   RunMoeCase({256, 8, 16, 704, 128, 2});
   RunMoeCase({130, 8, 128, 2816, 704, 1});
   RunMoeCase({1024, 8, 128, 2816, 704, 1});
+  RunMoeCase({256, 8, 64, 512, 128, 3});
 }
 
 // The fused block (router norm, router GEMV, softmax, top-k, renormalized
@@ -1004,6 +1017,8 @@ TEST(Int4BlockGemvTest, MoeRejectsInvalidShapes) {
   EXPECT_TRUE(supports({4, 8, 16, 256, 96, 1}));
   EXPECT_FALSE(supports({64, 8, 16, 256, 96, 1}));
   EXPECT_FALSE(supports({1, 8, 128, 2816, 704, 0}));
+  EXPECT_TRUE(supports({1, 8, 128, 2816, 704, 3}));
+  EXPECT_FALSE(supports({1, 8, 128, 2816, 704, 4}));
   EXPECT_FALSE(supports({1, 8, 2048, 2816, 704, 1}));
   EXPECT_FALSE(LiteRtNvidiaMoeSupports(nullptr));
   EXPECT_EQ(LiteRtNvidiaMoeWorkspaceBytes(nullptr), 0u);
@@ -1042,6 +1057,15 @@ TEST(Int4BlockGemvTest, TimesDecodeShapes) {
       {"gate+up, 5 rows", 5, 4224, 2816, 0},
       {"down, 5 rows", 5, 2816, 2112, 0},
       {"head, 5 rows", 5, 262144, 2816, 0},
+      // Qwen 4 at its widths (hidden 2560, hc 4, low rank 320): a
+      // hyper-connection mix's two projections, a PLE layer's key and value,
+      // a Gated DeltaNet layer's in and out projections.
+      {"Qwen 4 HC down [320 x 10240]", 1, 320, 10240, 0},
+      {"Qwen 4 HC up [10240 x 320]", 1, 10240, 320, 0},
+      {"Qwen 4 PLE key [10240 x 2560]", 1, 10240, 2560, 0},
+      {"Qwen 4 PLE value [2560 x 2560]", 1, 2560, 2560, 0},
+      {"Qwen 4 GDN qkvz [12288 x 2560]", 1, 12288, 2560, 0},
+      {"Qwen 4 GDN out [2560 x 4096]", 1, 2560, 4096, 0},
   };
   cudaEvent_t start, stop;
   cudaEventCreate(&start);
