@@ -473,3 +473,134 @@ cc_test(
         "@local_cuda//:cuda_runtime",
     ],
 )
+
+# Qwen 4's sparse attention (QSA): the indexer and the sparse attention of
+# odml.qsa_indexer_update and odml.sparse_sdpa_transposed. Their own archive,
+# so the kernels above do not rebuild with them.
+cuda_library(
+    name = "qsa_kernels_cuda",
+    srcs = [
+        "general_attention.cu",
+        "qsa_indexer.cu",
+        "qsa_sparse_attention.cu",
+    ],
+    hdrs = [
+        "general_attention.h",
+        "qsa_common.cuh",
+        "qsa_indexer.h",
+        "qsa_sparse_attention.h",
+    ],
+    # copybara:uncomment_begin(google-only)
+    # copts = [
+    # "--no-cuda-gpu-arch=sm_60",
+    # "--no-cuda-gpu-arch=sm_70",
+    # "--cuda-gpu-arch=sm_120",
+    # ],
+    # copybara:uncomment_end
+    linkstatic = 1,
+    tags = ["manual"],
+    deps = [
+        "@local_cuda//:cuda_runtime",
+    ],
+)
+
+cc_import(
+    name = "qsa_kernels_archive",
+    static_library = ":qsa_kernels_cuda",
+    tags = ["manual"],
+    alwayslink = 1,
+)
+
+cc_library(
+    name = "qsa_kernels",
+    hdrs = [
+        "general_attention.h",
+        "qsa_indexer.h",
+        "qsa_sparse_attention.h",
+    ],
+    tags = ["manual"],
+    deps = [
+        ":qsa_kernels_archive",
+        "@local_cuda//:cuda_headers",
+    ],
+)
+
+# Host references of the QSA kernels, for tests.
+cc_library(
+    name = "qsa_reference",
+    testonly = 1,
+    hdrs = [
+        "general_attention_reference.h",
+        "qsa_reference.h",
+    ],
+    tags = ["manual"],
+)
+
+cc_test(
+    name = "qsa_kernels_test",
+    srcs = ["qsa_kernels_test.cc"],
+    tags = [
+        "exclusive",
+        "manual",
+        "requires-gpu",
+    ],
+    target_compatible_with = select({
+        "//litert:linux_x86_64": [],
+        "//litert:windows": [],
+        "//litert:linux_aarch64": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":qsa_kernels",
+        ":qsa_reference",
+        "@com_google_googletest//:gtest_main",
+        "@local_cuda//:cuda_headers",
+        "@local_cuda//:cuda_runtime",
+    ],
+)
+
+cc_test(
+    name = "qsa_benchmark_test",
+    srcs = ["qsa_benchmark_test.cc"],
+    tags = [
+        "exclusive",
+        "manual",
+        "requires-gpu",
+    ],
+    target_compatible_with = select({
+        "//litert:linux_x86_64": [],
+        "//litert:windows": [],
+        "//litert:linux_aarch64": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":gemma4_head_kernels",
+        ":qsa_kernels",
+        "@com_google_googletest//:gtest_main",
+        "@local_cuda//:cuda_headers",
+        "@local_cuda//:cuda_runtime",
+    ],
+)
+
+cc_test(
+    name = "general_attention_test",
+    srcs = ["general_attention_test.cc"],
+    tags = [
+        "exclusive",
+        "manual",
+        "requires-gpu",
+    ],
+    target_compatible_with = select({
+        "//litert:linux_x86_64": [],
+        "//litert:windows": [],
+        "//litert:linux_aarch64": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":qsa_kernels",
+        ":qsa_reference",
+        "@com_google_googletest//:gtest_main",
+        "@local_cuda//:cuda_headers",
+        "@local_cuda//:cuda_runtime",
+    ],
+)

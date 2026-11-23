@@ -126,6 +126,32 @@ float Fp16ToFloat(uint16_t half) {
   return value;
 }
 
+TEST(TensorRtGraphBuilderTest, SharedWeightsFollowTheWeightStoreByDefault) {
+  // The target sets LITERT_NVIDIA_TENSORRT_SHARED_WEIGHTS=0; the default is
+  // checked unset and the setting restored at the end.
+  unsetenv("LITERT_NVIDIA_TENSORRT_SHARED_WEIGHTS");
+  unsetenv("LITERT_NVIDIA_TENSORRT_AOT_CACHE_DIR");
+  unsetenv("LITERT_NVIDIA_TENSORRT_AOT_MODEL_PATH");
+  unsetenv("LITERT_NVIDIA_TENSORRT_WEIGHT_STORE");
+  unsetenv("G4MODEL");
+  EXPECT_FALSE(litert::nvidia::TensorRtSharedWeightsEnabled());
+  setenv("LITERT_NVIDIA_TENSORRT_AOT_CACHE_DIR", "/aot", 1);
+  EXPECT_FALSE(litert::nvidia::TensorRtSharedWeightsEnabled());
+  setenv("LITERT_NVIDIA_TENSORRT_AOT_MODEL_PATH", "/model.litertlm", 1);
+  EXPECT_TRUE(litert::nvidia::TensorRtSharedWeightsEnabled());
+  setenv("LITERT_NVIDIA_TENSORRT_WEIGHT_STORE", "0", 1);
+  EXPECT_FALSE(litert::nvidia::TensorRtSharedWeightsEnabled());
+  unsetenv("LITERT_NVIDIA_TENSORRT_WEIGHT_STORE");
+  setenv("LITERT_NVIDIA_TENSORRT_SHARED_WEIGHTS", "0", 1);
+  EXPECT_FALSE(litert::nvidia::TensorRtSharedWeightsEnabled());
+  unsetenv("LITERT_NVIDIA_TENSORRT_AOT_CACHE_DIR");
+  unsetenv("LITERT_NVIDIA_TENSORRT_AOT_MODEL_PATH");
+  // Without a store, shared weights mean weight-stripped plans: only asked.
+  setenv("LITERT_NVIDIA_TENSORRT_SHARED_WEIGHTS", "1", 1);
+  EXPECT_TRUE(litert::nvidia::TensorRtSharedWeightsEnabled());
+  setenv("LITERT_NVIDIA_TENSORRT_SHARED_WEIGHTS", "0", 1);
+}
+
 TEST(TensorRtGraphBuilderTest, Int4FullyConnectedBlockScales) {
   // K=128 selects the block-scaled encoding (block 64); K=80 has no block
   // candidate and keeps the per-channel dequantize. Both must reproduce the
@@ -312,7 +338,7 @@ TEST(TensorRtGraphBuilderTest, CudaSubbyteGemvGroupSharesOneLaunch) {
     const auto* compiler_context = LrtGetCompilerContext();
     auto built = litert::nvidia::BuildTensorRtEngine(
         litert::compiler::Subgraph(compiler_context, &graph));
-    unsetenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS");
+    setenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS", "0", 1);
     unsetenv("LITERT_NVIDIA_TENSORRT_FUSE_GEMV_GROUPS");
     ASSERT_TRUE(built.HasValue()) << built.Error().Message();
     ASSERT_EQ(built->output_names.size(), rows.size());
@@ -440,7 +466,7 @@ TEST(TensorRtGraphBuilderTest, Int8PerChannelProjectionRunsOnTheGemv) {
   const auto* compiler_context = LrtGetCompilerContext();
   auto built = litert::nvidia::BuildTensorRtEngine(
       litert::compiler::Subgraph(compiler_context, &graph));
-  unsetenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS");
+  setenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS", "0", 1);
   ASSERT_TRUE(built.HasValue()) << built.Error().Message();
   ASSERT_EQ(built->output_names.size(), 1u);
 
@@ -567,7 +593,7 @@ TEST(TensorRtGraphBuilderTest, FewRowsRunOnTheBatchedGemv) {
 
   auto built = litert::nvidia::BuildTensorRtEngine(
       litert::compiler::Subgraph(LrtGetCompilerContext(), &graph));
-  unsetenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS");
+  setenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS", "0", 1);
   ASSERT_TRUE(built.HasValue()) << built.Error().Message();
   ASSERT_EQ(built->output_names.size(), rows.size());
 
@@ -731,7 +757,7 @@ TEST(TensorRtGraphBuilderTest, WeightStoreKeepsPluginWeightsOutOfThePlan) {
   const auto* compiler_context = LrtGetCompilerContext();
   auto built = litert::nvidia::BuildTensorRtEngine(
       litert::compiler::Subgraph(compiler_context, &graph), {}, store->get());
-  unsetenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS");
+  setenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS", "0", 1);
   ASSERT_TRUE(built.HasValue()) << built.Error().Message();
 
   // One launch reads both projections: one segment of one granule, made of
@@ -909,7 +935,7 @@ TEST(TensorRtGraphBuilderTest, WeightsOutsideTheModelFileStayInThePlan) {
   const auto* compiler_context = LrtGetCompilerContext();
   auto built = litert::nvidia::BuildTensorRtEngine(
       litert::compiler::Subgraph(compiler_context, &graph), {}, store->get());
-  unsetenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS");
+  setenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS", "0", 1);
   ASSERT_TRUE(built.HasValue()) << built.Error().Message();
   EXPECT_TRUE(built->weight_holders.empty());
   EXPECT_TRUE((*store)->segments().empty());
@@ -1067,7 +1093,7 @@ TEST(TensorRtGraphBuilderTest, CudaGemmForManyActivationRows) {
     }
     auto built = litert::nvidia::BuildTensorRtEngine(
         litert::compiler::Subgraph(LrtGetCompilerContext(), &graph));
-    unsetenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS");
+    setenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS", "0", 1);
     unsetenv("LITERT_NVIDIA_TENSORRT_CUDA_GEMM");
     ASSERT_TRUE(built.HasValue()) << built.Error().Message();
     ASSERT_EQ(built->input_names.size(), 2u);
@@ -1252,7 +1278,7 @@ TEST(TensorRtGraphBuilderTest, CudaGemmReadsThePrefillPositions) {
     setenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS", "cuda_gemv", 1);
     auto built = litert::nvidia::BuildTensorRtEngine(
         litert::compiler::Subgraph(LrtGetCompilerContext(), &graph));
-    unsetenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS");
+    setenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS", "0", 1);
     ASSERT_TRUE(built.HasValue()) << built.Error().Message();
     ASSERT_EQ(built->input_names.size(), positions ? 2u : 1u);
     litert::nvidia::TensorRtLogger logger;
@@ -1449,7 +1475,7 @@ TEST(TensorRtGraphBuilderTest, NormBehindCastsFusesOnlyWhenAsked) {
     setenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS", "cuda_gemv", 1);
     auto built = litert::nvidia::BuildTensorRtEngine(
         litert::compiler::Subgraph(LrtGetCompilerContext(), &graph));
-    unsetenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS");
+    setenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS", "0", 1);
     unsetenv("LITERT_NVIDIA_TENSORRT_NORM_THROUGH_CASTS");
     ASSERT_TRUE(built.HasValue()) << built.Error().Message();
     litert::nvidia::TensorRtLogger logger;
@@ -1595,7 +1621,7 @@ TEST(TensorRtGraphBuilderTest, Fp16SoftCapAfterCudaSubbyteGemv) {
   }
   auto built = litert::nvidia::BuildTensorRtEngine(
       litert::compiler::Subgraph(compiler_context, &graph));
-  unsetenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS");
+  setenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS", "0", 1);
   ASSERT_TRUE(built.HasValue()) << built.Error().Message();
 
   litert::nvidia::TensorRtLogger logger;
@@ -5594,7 +5620,7 @@ TEST(TensorRtGraphBuilderTest, SwigluCompositeAppliesItsActivation) {
     setenv("LITERT_NVIDIA_TENSORRT_FUSE_SWIGLU", test_case.fuse ? "1" : "0", 1);
     auto built = litert::nvidia::BuildTensorRtEngine(
         litert::compiler::Subgraph(compiler_context, &graph));
-    unsetenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS");
+    setenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS", "0", 1);
     unsetenv("LITERT_NVIDIA_TENSORRT_FUSE_SWIGLU");
     ASSERT_TRUE(built.HasValue()) << built.Error().Message();
     ASSERT_EQ(built->input_names.size(), 1u);
@@ -6056,7 +6082,7 @@ TEST(TensorRtGraphBuilderTest, MoeLayerBlockOfTheFusedExport) {
     setenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS", "cuda_gemv", 1);
     auto built = litert::nvidia::BuildTensorRtEngine(
         litert::compiler::Subgraph(compiler_context, &graph), {}, store->get());
-    unsetenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS");
+    setenv("LITERT_NVIDIA_TENSORRT_PREDEQUANTIZE_FC_WEIGHTS", "0", 1);
     ASSERT_TRUE(built.HasValue()) << built.Error().Message();
     litert::nvidia::TensorRtLogger logger;
     std::unique_ptr<nvinfer1::IRuntime> runtime(
