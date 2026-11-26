@@ -52,12 +52,15 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
+#include "absl/base/attributes.h"  // from @com_google_absl
+#include "absl/base/thread_annotations.h"  // from @com_google_absl
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/container/inlined_vector.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "absl/types/source_location.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "tensor/buffer.h"
@@ -184,9 +187,11 @@ class ZeroPoints {
   }
 
   // Returns the underlying vector if stored as `T` (`int64_t` or `float`), or
-  // `absl::NotFoundError` otherwise.
+  // `absl::NotFoundError` otherwise. The returned reference points into `*this`
+  // and must not outlive this `ZeroPoints` object.
   template <class T>
-  absl::StatusOr<const std::vector<T>&> Data() const {
+  absl::StatusOr<const std::vector<T>&> Data() const
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
     if constexpr (std::is_same_v<T, int64_t> || std::is_same_v<T, float>) {
       if (const auto* values = std::get_if<std::vector<T>>(&data_)) {
         return *values;
@@ -457,6 +462,15 @@ struct PerChannelAffineQuantization : Quantization {
 // Dequantization formula for element `i` in block `b`:
 //   w = scales[b] * (q_signed[i] - zp[b])
 struct BlockwiseQuantization : Quantization {
+  struct CpuSymmetricFallback {
+    Type type = Type::kUnknown;
+    int rows = 0;
+    int cols = 0;
+    std::shared_ptr<OwningCpuBuffer> data;
+    std::vector<float> scales;
+    std::shared_ptr<const std::vector<bf16_t>> bf16_scales;
+  };
+
   BlockwiseQuantization() = default;
 
   BlockwiseQuantization(std::vector<float> scales, ZeroPoints zero_points,
@@ -473,10 +487,49 @@ struct BlockwiseQuantization : Quantization {
     return id == internal::TypeId::Get<BlockwiseQuantization>();
   }
 
+  // Returns a thread-safe cached BF16 representation of `scales` so multi-pass
+  // backends (such as XNNPACK prepack + prefill + decode) do not re-allocate or
+  // re-convert hundreds of millions of blockwise scales on every pass.
+  std::shared_ptr<const std::vector<bf16_t>> GetOrCreateBf16Scales() const;
+
+  bool HasCachedBf16Scales() const;
+
+  // Returns a thread-safe cached symmetric quantized representation for CPU
+  // backends (`XNNPACK`) that do not natively execute blockwise INT8 (`Q8_0`)
+  // or affine blockwise INT4 (`Q4_1` / `Q4_K`):
+  //   * `Type::kI8` -> per-channel symmetric `qcint8` (`[rows]` scales).
+  //   * `Type::kI4` -> block-32 symmetric `qbint4` (`[rows * blocks_per_row]`
+  //     `bf16_scales`).
+  absl::StatusOr<std::shared_ptr<const CpuSymmetricFallback>>
+  GetOrCreateCpuSymmetricFallback(Type type, int rows, int cols,
+                                  const void* raw_data, size_t raw_bytes) const;
+
+  bool HasCachedCpuSymmetricFallback() const;
+  void InvalidateBf16ScalesCache();
+
+  // Per-block quantization scales. Any caller that mutates `scales` in-place
+  // after `GetOrCreateBf16Scales()` has been called must invoke
+  // `InvalidateBf16ScalesCache()` to keep the cached BF16 scales coherent.
   std::vector<float> scales;
   ZeroPoints zero_points;
   int block_size = 0;
   int quantized_dimension = 0;
+
+ private:
+  struct CachedBf16Scales {
+    CachedBf16Scales() = default;
+    CachedBf16Scales(const CachedBf16Scales& other);
+    CachedBf16Scales& operator=(const CachedBf16Scales& other);
+    CachedBf16Scales(CachedBf16Scales&& other) noexcept;
+    CachedBf16Scales& operator=(CachedBf16Scales&& other) noexcept;
+
+    mutable absl::Mutex mu;
+    std::shared_ptr<const std::vector<bf16_t>> scales ABSL_GUARDED_BY(mu);
+    std::shared_ptr<const CpuSymmetricFallback> cpu_fallback
+        ABSL_GUARDED_BY(mu);
+  };
+
+  mutable CachedBf16Scales bf16_cache_;
 };
 
 using Shape = std::vector<int32_t>;
